@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>emitrust</title>
+<meta name="description" content="A C and C++ to Rust transpiler whose output is safe, readable Rust — no unsafe, no static mut, no raw pointers — with every result byte-diffed against the clang-built native binary.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;0,800;1,400&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&display=swap">
+<link rel="stylesheet" href="/style.css">
+<style>
+  /* Page-local composition. Shared primitives live in style.css. */
+
+  .hero { padding-block: clamp(3rem, 8vw, 6.5rem) clamp(2rem, 5vw, 4rem); }
+
+  .hero__head {
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+    gap: clamp(1.5rem, 4vw, 4rem);
+    align-items: end;
+    margin-bottom: clamp(2rem, 5vw, 3.5rem);
+  }
+  @media (max-width: 900px) { .hero__head { grid-template-columns: 1fr; align-items: start; } }
+
+  .hero h1 {
+    font-size: var(--step-4);
+    margin-block: 0.6rem 0;
+  }
+  .hero h1 .arrow { color: var(--accent); }
+
+  .hero__claims {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    margin-top: 1.4rem;
+  }
+
+  .verdict {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    padding: 0.85rem 1rem;
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--sig-ok);
+    border-radius: var(--radius);
+    background: var(--surface);
+    font-family: var(--font-code);
+    font-size: var(--step--1);
+    margin-top: 1.6rem;
+  }
+  .verdict strong { color: var(--sig-ok); }
+
+  /* Sections -------------------------------------------------------- */
+
+  .section { padding-block: clamp(2.5rem, 6vw, 4.5rem); }
+  .section + .section { border-top: 1px solid var(--rule); }
+
+  .section__head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+    gap: clamp(1rem, 3vw, 3rem);
+    align-items: start;
+    margin-bottom: 2.2rem;
+  }
+  @media (max-width: 820px) { .section__head { grid-template-columns: 1fr; } }
+
+  .section__head h2 { font-size: var(--step-3); margin-top: 0.5rem; }
+
+  /* The pipeline is a genuine ordered sequence, so it is numbered.
+     Nothing else on this page is. */
+  .pipeline {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+  }
+
+  .stage {
+    background: var(--surface);
+    padding: 1.1rem 1rem 1.3rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+
+  .stage__n {
+    font-family: var(--font-code);
+    font-size: var(--step--1);
+    font-weight: 800;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+  }
+  .stage__name { font-family: var(--font-code); font-weight: 700; font-size: var(--step-0); letter-spacing: -0.02em; }
+  .stage__note { color: var(--ink-muted); font-size: var(--step--1); line-height: 1.5; }
+
+  /* Claim grid ------------------------------------------------------ */
+
+  .claims {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(255px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border-block: 1px solid var(--rule);
+  }
+
+  .claim {
+    background: var(--bg);
+    padding: 1.5rem 1.3rem 1.7rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+  .claim h3 { font-size: var(--step-1); }
+  .claim p { color: var(--ink-muted); font-size: var(--step--1); line-height: 1.6; }
+  .claim__tag {
+    font-family: var(--font-code);
+    font-size: var(--step--1);
+    color: var(--accent);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  /* Honesty section ------------------------------------------------- */
+
+  .limits {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 1.1rem;
+  }
+  .limit {
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--sig-warn);
+    border-radius: var(--radius);
+    padding: 1rem 1.1rem 1.2rem;
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+  .limit h3 { font-size: var(--step-0); font-family: var(--font-code); letter-spacing: -0.01em; }
+  .limit p { color: var(--ink-muted); font-size: var(--step--1); line-height: 1.55; }
+
+  /* Trial ----------------------------------------------------------- */
+
+  .trial {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+  }
+  .lane { background: var(--surface); padding: 1.4rem 1.25rem 1.6rem; display: flex; flex-direction: column; gap: 0.6rem; }
+  .lane h3 { font-size: var(--step-1); }
+  .lane p { color: var(--ink-muted); font-size: var(--step--1); line-height: 1.6; }
+  .lane ul { margin: 0.3rem 0 0; padding-left: 1.1rem; color: var(--ink-muted); font-size: var(--step--1); line-height: 1.7; }
+
+  .cta-row { display: flex; flex-wrap: wrap; gap: 0.7rem; align-items: center; margin-top: 1.8rem; }
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap masthead__inner">
+    <a class="brand" href="/">emitrust<span class="brand__arrow">→</span>rs</a>
+    <nav class="navlinks">
+      <a href="#how">Pipeline</a>
+      <a href="#proof">Proof</a>
+      <a href="#limits">Limits</a>
+      <a href="/playground">Playground</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+  <!-- Hero: the thesis is the transformation itself, shown not described. -->
+  <section class="hero wrap">
+    <div class="hero__head">
+      <div>
+        <p class="eyebrow">C &amp; C++ &rarr; Rust</p>
+        <h1>Not a port.<br>A <span class="arrow">translation</span> you can read.</h1>
+        <div class="hero__claims">
+          <span class="chip chip--free">no unsafe</span>
+          <span class="chip chip--free">no static mut</span>
+          <span class="chip chip--free">no raw pointers</span>
+        </div>
+      </div>
+      <div class="stack stack-4">
+        <p class="lede">
+          Most C&nbsp;&rarr;&nbsp;Rust tools hand you the same program with Rust
+          syntax: raw pointers, <code>static mut</code>, <code>unsafe</code> on
+          every block. emitrust proves what each pointer can name and what each
+          global is really shared with, then emits Rust a person would review.
+        </p>
+        <div class="verdict">
+          <span>Correctness oracle</span>
+          <strong>1013/1013</strong>
+          <span style="color:var(--ink-muted)">byte-diffed against clang</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- The recurring device, introduced here with real compiler output. -->
+    <div class="ledger">
+      <div class="codepane">
+        <div class="codepane__bar">
+          <span class="codepane__name">counter.c</span>
+          <span>two mutable globals</span>
+        </div>
+        <pre class="codepane__body"><code><span class="ln">1</span><span class="tok-key">static</span> <span class="tok-type">int</span> counter    = <span class="tok-num">0</span>;
+<span class="ln">2</span><span class="tok-key">static</span> <span class="tok-type">int</span> high_water = <span class="tok-num">0</span>;
+<span class="ln">3</span>
+<span class="ln">4</span><span class="tok-key">static</span> <span class="tok-type">void</span> <span class="tok-fn">bump</span>(<span class="tok-type">int</span> by) {
+<span class="ln">5</span>    counter += by;
+<span class="ln">6</span>    <span class="tok-key">if</span> (counter &gt; high_water)
+<span class="ln">7</span>        high_water = counter;
+<span class="ln">8</span>}
+<span class="ln">9</span>
+<span class="ln">10</span><span class="tok-key">static</span> <span class="tok-type">void</span> <span class="tok-fn">drain</span>(<span class="tok-type">void</span>) {
+<span class="ln">11</span>    counter = <span class="tok-num">0</span>;
+<span class="ln">12</span>}</code></pre>
+      </div>
+
+      <div class="ledger__gutter" aria-hidden="true">
+        <span class="ledger__rule"></span>
+        <span class="ledger__label">ownership lift</span>
+        <span class="ledger__rule"></span>
+      </div>
+
+      <div class="codepane">
+        <div class="codepane__bar">
+          <span class="codepane__name">src/main.rs</span>
+          <span class="chip chip--free">0 unsafe</span>
+        </div>
+        <pre class="codepane__body"><code><span class="ln">1</span><span class="tok-com">// the globals became state someone owns</span>
+<span class="ln">2</span><span class="tok-key">struct</span> <span class="tok-type">CounterActor</span> {
+<span class="ln">3</span>    counter: <span class="tok-type">i32</span>,
+<span class="ln">4</span>    high_water: <span class="tok-type">i32</span>,
+<span class="ln">5</span>}
+<span class="ln">6</span><span class="tok-key">impl</span> <span class="tok-type">CounterActor</span> {
+<span class="ln">7</span>    <span class="tok-key">fn</span> <span class="tok-fn">bump</span>(&amp;<span class="tok-key">mut</span> <span class="tok-key">self</span>, by: <span class="tok-type">i32</span>) {
+<span class="ln">8</span>        <span class="tok-key">self</span>.counter += by;
+<span class="ln">9</span>        <span class="tok-key">if</span> <span class="tok-key">self</span>.counter &gt; <span class="tok-key">self</span>.high_water {
+<span class="ln">10</span>            <span class="tok-key">self</span>.high_water = <span class="tok-key">self</span>.counter;
+<span class="ln">11</span>        }
+<span class="ln">12</span>    }</code></pre>
+      </div>
+    </div>
+
+    <div class="cta-row">
+      <a class="btn" href="/playground">Open the playground</a>
+      <a class="btn btn--ghost" href="#proof">How it's verified</a>
+      <span style="color:var(--ink-faint); font-size:var(--step--1)">
+        Every example runs free — no account.
+      </span>
+    </div>
+  </section>
+
+  <!-- Pipeline. Numbered because it is a real ordered sequence. -->
+  <section class="section wrap" id="how">
+    <div class="section__head">
+      <div>
+        <p class="eyebrow">how it works</p>
+        <h2>An MLIR pipeline, not a pattern matcher.</h2>
+      </div>
+      <p class="lede">
+        Syntax-directed translators cannot answer &ldquo;what can this pointer
+        name?&rdquo;, so they fall back to raw pointers. emitrust lowers C
+        through a real compiler middle-end and makes ownership a
+        <em>decision</em>, taken with the whole translation unit in view.
+      </p>
+    </div>
+
+    <div class="pipeline">
+      <div class="stage">
+        <span class="stage__n">01</span>
+        <span class="stage__name">clang AST</span>
+        <span class="stage__note">The real C and C++ front end. No custom parser to disagree with your compiler.</span>
+      </div>
+      <div class="stage">
+        <span class="stage__n">02</span>
+        <span class="stage__name">import</span>
+        <span class="stage__note">Types, places and effects become MLIR. Anything it cannot model is refused here, with a location.</span>
+      </div>
+      <div class="stage">
+        <span class="stage__n">03</span>
+        <span class="stage__name">planning</span>
+        <span class="stage__note">Storage bases, borrow shapes and co-access clusters. This is where pointers stop being pointers.</span>
+      </div>
+      <div class="stage">
+        <span class="stage__n">04</span>
+        <span class="stage__name">lift</span>
+        <span class="stage__note">Control flow becomes structured Rust; mutable globals become owned state.</span>
+      </div>
+      <div class="stage">
+        <span class="stage__n">05</span>
+        <span class="stage__name">emit</span>
+        <span class="stage__note">A crate with a Cargo.toml, renamed to Rust convention so it passes the standard lints.</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Claims -->
+  <section class="section" id="what">
+    <div class="wrap section__head">
+      <div>
+        <p class="eyebrow">what you get</p>
+        <h2>Output that survives review.</h2>
+      </div>
+      <p class="lede">
+        The test is not &ldquo;does it compile&rdquo;. It is whether a Rust
+        engineer who has never seen the C would accept the file in a pull
+        request.
+      </p>
+    </div>
+
+    <div class="claims">
+      <article class="claim">
+        <span class="claim__tag">borrows</span>
+        <h3>Pointers become slices</h3>
+        <p>A pointer parameter is lowered to a borrow or a slice once the analysis proves which object it names. Where it cannot prove it, you get a diagnostic — never a silent raw pointer.</p>
+      </article>
+      <article class="claim">
+        <span class="claim__tag">ownership</span>
+        <h3>Globals get an owner</h3>
+        <p>Mutable file-scope state is clustered by co-access and lifted into a struct owned by <code>main</code>. The functions that touch it become <code>&amp;mut self</code> methods. Nothing becomes <code>static mut</code>.</p>
+      </article>
+      <article class="claim">
+        <span class="claim__tag">concurrency</span>
+        <h3>Then it can be a thread</h3>
+        <p>Because the state is genuinely owned, the runtime shape becomes a flag. The same actor can be lifted onto a thread or a task behind a mailbox, with effect order preserved.</p>
+      </article>
+      <article class="claim">
+        <span class="claim__tag">naming</span>
+        <h3>Idiomatic by default</h3>
+        <p>Functions and fields to <code>snake_case</code>, types to <code>UpperCamelCase</code>, constants to <code>SCREAMING_SNAKE_CASE</code> — so the crate is clean under the standard naming lints on the first build.</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- Proof -->
+  <section class="section wrap" id="proof">
+    <div class="section__head">
+      <div>
+        <p class="eyebrow">proof</p>
+        <h2>Compiling clean proves nothing.</h2>
+      </div>
+      <p class="lede">
+        A miscompile builds perfectly. So the load-bearing test is not the Rust
+        compiler — it is running both binaries and comparing their bytes.
+      </p>
+    </div>
+
+    <div class="ledger">
+      <div class="codepane">
+        <div class="codepane__bar"><span class="codepane__name">the oracle</span></div>
+        <pre class="codepane__body"><code><span class="ln">1</span><span class="tok-com"># build the C natively</span>
+<span class="ln">2</span>clang -O0 input.c -o native
+<span class="ln">3</span>
+<span class="ln">4</span><span class="tok-com"># build the emitted crate</span>
+<span class="ln">5</span>emitrust-cc --emit=crate input.c
+<span class="ln">6</span>cargo build --manifest-path out/Cargo.toml
+<span class="ln">7</span>
+<span class="ln">8</span><span class="tok-com"># the only test that counts</span>
+<span class="ln">9</span>diff &lt;(./native) &lt;(./out/target/debug/out)</code></pre>
+      </div>
+      <div class="ledger__gutter" aria-hidden="true">
+        <span class="ledger__rule"></span>
+        <span class="ledger__label">must match</span>
+        <span class="ledger__rule"></span>
+      </div>
+      <div class="codepane">
+        <div class="codepane__bar"><span class="codepane__name">what that caught</span></div>
+        <div style="padding:1rem; display:flex; flex-direction:column; gap:0.7rem;">
+          <p class="diag diag--error">printf("%c") on a byte &ge; 0x80 emitted two bytes, not one — <code>Display for char</code> writes UTF-8. 256 native bytes vs 384 emitted.</p>
+          <p class="diag diag--error">Unary minus on a float emitted as <code>0.0 - x</code>, losing the sign of zero and flipping NaN's sign bit.</p>
+          <p class="diag diag--warn">Statements before a <code>break</code> ran after a loop-local's destructor. Refused rather than reordered.</p>
+          <p style="font-family:var(--font-code); font-size:var(--step--1); color:var(--ink-faint); margin-top:0.2rem;">
+            Every one of these compiled without a single warning.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Limits. Stated plainly, because overclaiming is how tools like this lose trust. -->
+  <section class="section wrap" id="limits">
+    <div class="section__head">
+      <div>
+        <p class="eyebrow">limits</p>
+        <h2>What it will refuse to do.</h2>
+      </div>
+      <p class="lede">
+        The rule is that a construct it cannot model correctly must never be
+        emitted wrongly. Refusal is a feature, and these are the edges you will
+        actually hit.
+      </p>
+    </div>
+
+    <div class="limits">
+      <article class="limit">
+        <h3>A subset of C, not all of C</h3>
+        <p><code>setjmp</code>/<code>longjmp</code>, most of the standard library, and constructs with no faithful Rust image are refused with a file:line:col diagnostic. <code>--recover</code> turns a refusal into a typed stub so the rest still builds.</p>
+      </article>
+      <article class="limit">
+        <h3>Aliasing it cannot disprove</h3>
+        <p>Two pointers into one object, or a pointer argument that aliases its receiver, are rejected rather than given <code>&amp;mut</code> borrows that Rust would reject anyway — or worse, accept unsoundly.</p>
+      </article>
+      <article class="limit">
+        <h3>One translation unit at a time</h3>
+        <p>Multi-file projects go through a link step over per-TU shards. It works, but whole-program ownership across that boundary is more conservative than within one file.</p>
+      </article>
+      <article class="limit">
+        <h3>Known divergences are written down</h3>
+        <p><code>long double</code> maps to <code>f64</code>. For code that does real 80-bit arithmetic that is observable, and it is recorded as a divergence rather than hidden.</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- Trial -->
+  <section class="section wrap" id="trial">
+    <div class="section__head">
+      <div>
+        <p class="eyebrow">access</p>
+        <h2>Free to read. Sign in to compile.</h2>
+      </div>
+      <p class="lede">
+        Every example on the playground is already compiled and cached, so you
+        can explore the whole feature set without an account. Compiling
+        <em>your</em> code is real work on our machine, and that is what the
+        trial meters.
+      </p>
+    </div>
+
+    <div class="trial">
+      <div class="lane">
+        <span class="chip chip--free">no account</span>
+        <h3>Cached results</h3>
+        <p>Anything already compiled comes straight from cache.</p>
+        <ul>
+          <li>Every worked example, every option</li>
+          <li>All emit modes: Rust, crate, MLIR</li>
+          <li>Unlimited, no sign-in, no meter</li>
+        </ul>
+      </div>
+      <div class="lane">
+        <span class="chip chip--live">google sign-in</span>
+        <h3>Limited free trial</h3>
+        <p>Paste your own C and compile it live.</p>
+        <ul>
+          <li>25 live compiles per day</li>
+          <li>Your source, your options</li>
+          <li>Results are cached, so a repeat is free</li>
+        </ul>
+      </div>
+      <div class="lane">
+        <span class="chip chip--warn">self-host</span>
+        <h3>Or run it yourself</h3>
+        <p>It is a normal compiler. Nothing here is locked behind the service.</p>
+        <ul>
+          <li>Build from source with meson</li>
+          <li>No network calls, no telemetry</li>
+          <li>Same binary this site runs</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="cta-row">
+      <a class="btn" href="/playground">Start with the examples</a>
+      <span style="color:var(--ink-faint); font-size:var(--step--1)">
+        You will only be asked to sign in when you compile something new.
+      </span>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="wrap" style="display:flex; flex-wrap:wrap; gap:1rem; justify-content:space-between;">
+    <span>emitrust — C and C++ to readable Rust.</span>
+    <span><a href="/playground">Playground</a> · <a href="/api/health">Service status</a></span>
+  </div>
+</footer>
+
+</body>
+</html>

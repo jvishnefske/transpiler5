@@ -1,0 +1,68 @@
+# systemd unit for the emitrust web service on 192.168.1.202.
+#
+# The service runs as its own user with a hardened sandbox. That matters more
+# than usual here: this process runs a clang-based front end over source that
+# arrives from the internet, so the unit -- not the in-process rlimits -- is
+# the real isolation boundary.
+#
+#   install: /etc/systemd/system/emitrust-web.service
+#   secrets: /etc/emitrust-web.env  (root:emitrust 0640)
+
+[Unit]
+Description=emitrust web service (C/C++ to Rust transpiler)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=emitrust
+Group=emitrust
+WorkingDirectory=/opt/emitrust
+
+# GOOGLE_CLIENT_ID and any overrides live here, not in this unit.
+EnvironmentFile=/etc/emitrust-web.env
+Environment=EMITRUST_STATE_DIR=/var/lib/emitrust-web
+Environment=PYTHONUNBUFFERED=1
+
+# The transpiler links the nix devshell's LLVM/clang dylibs, so the service
+# runs inside `nix develop`. Set EMITRUST_NIX_DEVELOP="" if you instead build
+# against system LLVM.
+ExecStart=/usr/bin/env nix develop /opt/emitrust#default -c \
+    python3 -m uvicorn web.server.main:app \
+    --host 127.0.0.1 --port 8080 --proxy-headers --forwarded-allow-ips='*'
+
+Restart=on-failure
+RestartSec=3s
+
+# --- sandbox ---------------------------------------------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+
+ReadWritePaths=/var/lib/emitrust-web
+StateDirectory=emitrust-web
+
+# Bound the blast radius of a compiler bomb the per-request rlimits miss.
+MemoryMax=6G
+TasksMax=256
+CPUQuota=400%
+
+[Install]
+WantedBy=multi-user.target
