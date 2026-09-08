@@ -1602,6 +1602,8 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
             .getResult();
   }
 
+  if (failed(checkGotoLabelChain(func->getBody())))
+    return failure();
   if (failed(emitStmt(func->getBody())))
     return failure();
   if (failed(finalizeFunction(funcOp, loc)))
@@ -1610,6 +1612,43 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   // emitter's per-function state is single-occupancy, so they had to
   // wait for this function's own emission to finish.
   return importPendingLiftedLambdas();
+}
+
+LogicalResult CImporter::checkGotoLabelChain(const clang::Stmt *body) {
+  // FR-197's last residual. FR-198 bounded the plain switch path and FR-207
+  // the dispatch path; a `goto` ladder reaches the SAME duplicating
+  // structurization with neither bound in the way, because its switch (when
+  // it has one at all) has a fall-through chain of 1 -- every arm is
+  // `goto Lk;`, which terminates the section.
+  //
+  // The measurement and the two controls that make this a CHAIN bound rather
+  // than a label-count bound are recorded on
+  // `kMaxGotoLabelFallThroughChain`. The short form: cubic emitted output,
+  // 47.76s at a chain of 60 and no output and no diagnostic at all at 100,
+  // against an exactly linear 4N + 18 for the same labels and gotos with
+  // every section terminated.
+  //
+  // `currentHasLabels` is `containsLabelStmt(body)`, already computed by this
+  // function's per-function reset; no label means no chain, so the common
+  // case costs nothing.
+  if (!currentHasLabels)
+    return success();
+  const clang::LabelStmt *first = nullptr;
+  const clang::LabelStmt *last = nullptr;
+  unsigned longest = gotoLabelFallThroughChain(body, first, last);
+  if (longest <= kMaxGotoLabelFallThroughChain)
+    return success();
+  InFlightDiagnostic diagnostic =
+      emitError(translateLoc(first->getIdentLoc()))
+      << "unsupported: goto ladder of " << longest
+      << " labels that fall into one another (limit "
+      << kMaxGotoLabelFallThroughChain
+      << "); structurizing it duplicates the tail into every entry and does "
+         "not finish";
+  diagnostic.attachNote(translateLoc(last->getIdentLoc()))
+      << "the chain ends at this label; ending a section with 'return', "
+         "'break' or 'goto' splits it";
+  return diagnostic;
 }
 
 LogicalResult CImporter::importLiftedLambda(
@@ -1808,6 +1847,8 @@ CImporter::importLiftedLambdaBody(const PendingLiftedLambda &pending) {
     funcOp->setAttr(emitrust::kParamNamesAttrName,
                     builder.getArrayAttr(paramNameSlots));
 
+  if (failed(checkGotoLabelChain(body)))
+    return failure();
   if (failed(emitStmt(body)))
     return failure();
   return finalizeFunction(funcOp, loc);
@@ -2334,6 +2375,8 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   currentVaCursorCell =
       createEntryAlloca(loc, builder.getIntegerType(64));
 
+  if (failed(checkGotoLabelChain(func->getBody())))
+    return failure();
   if (failed(emitStmt(func->getBody())))
     return failure();
   return finalizeFunction(funcOp, loc);
@@ -3131,6 +3174,49 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             ".unwrap_or(s.len().min(n as usize));\n"
             "    let bytes: Vec<u8> = s[..end].iter().map(|&b| b as u8)"
             ".collect();\n"
+            "    std::io::stdout().write_all(&bytes)"
+            ".expect(\"stdout write failed\");\n"
+            "}"));
+  }
+  if (needsCStrPadOutHelper && !cStrPadOutHelperEmitted) {
+    cStrPadOutHelperEmitted = true;
+    // FR-193 item 2: the FIELD WIDTH twin of `__emitrust_cstr_out`. FR-191
+    // kept a width-bearing `%s` on the Latin-1 `__emitrust_cstr` Display
+    // funnel because "a raw `write_all` cannot pad" — which double-encoded
+    // every payload byte >= 0x80 (measured: native `20 20 20 20 20 81 8e 9b
+    // a8 7a` for `%10s`, emitted `20 20 20 20 20 c2 81 c2 8e c2 9b c2 a8
+    // 7a`). The pad is not actually beyond a raw write: C pads to the BYTE
+    // length of the converted run, which is exactly the length the NUL scan
+    // already produces, so the helper computes it and writes padding and
+    // payload as one raw run. Padding is always spaces — C99 7.19.6.1p6
+    // leaves the '0' flag undefined on `%s`, and the importer rejects it.
+    // A negative `prec` means "no precision"; flag bit 1 is '-' (left
+    // align), matching the `__emitrust_fmt_int` flag bitmask. Emitted once
+    // per module, after all imported items.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_cstr_pad_out(s: &[i8], prec: i32, width: i32,\n"
+            "                           flags: i32) {\n"
+            "    use std::io::Write;\n"
+            "    let limit = if prec < 0 { s.len() } "
+            "else { (prec as usize).min(s.len()) };\n"
+            "    let end = s[..limit].iter().position(|&b| b == 0)"
+            ".unwrap_or(limit);\n"
+            "    let text: Vec<u8> = s[..end].iter().map(|&b| b as u8)"
+            ".collect();\n"
+            "    let pad = if width > text.len() as i32 "
+            "{ width as usize - text.len() } else { 0 };\n"
+            "    let mut bytes: Vec<u8> = "
+            "Vec::with_capacity(text.len() + pad);\n"
+            "    if flags & 1 == 0 {\n"
+            "        bytes.resize(pad, b' ');\n"
+            "    }\n"
+            "    bytes.extend_from_slice(&text);\n"
+            "    if flags & 1 != 0 {\n"
+            "        bytes.resize(bytes.len() + pad, b' ');\n"
+            "    }\n"
             "    std::io::stdout().write_all(&bytes)"
             ".expect(\"stdout write failed\");\n"
             "}"));

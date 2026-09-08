@@ -12,7 +12,16 @@
 // twin (RejectionLedger.cpp `{"use of main's argv", "argv"}`) for the
 // non-admitted shapes: pointer arithmetic (`argv++`), a bare `*argv`,
 // storing `argv[i]` to a local, taking `&argv[i]`, and a `%s` with an
-// explicit field width (which the raw `*_out` helper cannot pad).
+// explicit field width.
+//
+// The width case's ORIGINAL reason -- "the raw `*_out` helper cannot pad" --
+// stopped being true with FR-193 item 2, which added the padding raw helper
+// `__emitrust_cstr_pad_out` for char REGIONS. The argv admission grammar
+// (`admittedPrintfStringArg`) was deliberately NOT widened with it: widening
+// it changes whether `main` gets an argv table at all, which is a planning
+// decision with a corpus-ratchet blast radius, and the current behaviour is a
+// LOCATED rejection rather than a silent width drop. So this stays pinned --
+// as a capability gap now, not as a representation limit.
 
 // CHECK: error: unsupported: use of main's argv parameter (command-line argument values are not modeled)
 

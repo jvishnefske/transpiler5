@@ -7,8 +7,13 @@
 // bytes -- a measured miscompile, not a theoretical one (native `ff fe 81 7a`
 // vs emitted `c3 bf c3 be c2 81 7a`). The bypass already existed for argv
 // (C99-43 C3); this pins the widening to every stdout `%s` region shape, the
-// `print!` segment flushing around the raw write, and the three shapes that
+// `print!` segment flushing around the raw write, and the two shapes that
 // deliberately KEEP the Display funnel.
+//
+// FR-193 item 2 moved one of those pins FORWARD: a FIELD WIDTH used to be a
+// third KEEP case here, on the reasoning that "a raw `write_all` cannot pad".
+// It is now `__emitrust_cstr_pad_out` at the bottom of @raw_bytes -- see the
+// comment there for why the reasoning was true and the conclusion wrong.
 //
 // The helper request gating is part of the contract: a module whose every
 // `%s` takes the bypass must stop emitting `__emitrust_cstr` (an unused
@@ -70,6 +75,23 @@ void raw_bytes(void) {
   puts(buf);
   // CHECK: emitrust.call_opaque "__emitrust_cstr_out"
   // CHECK: emitrust.call_opaque "println!"() {args = []}
+
+  // FR-193 item 2 MOVED THIS PIN FORWARD. This file used to assert, under
+  // `keeps_display_funnel`, that a FIELD WIDTH kept the Latin-1 funnel
+  // because "the raw write cannot pad". It cannot pad on its own -- but C
+  // pads to the BYTE length of the converted run, which is exactly the
+  // length the helper's NUL scan already computes, so the padding and the
+  // payload go out as one raw run through `__emitrust_cstr_pad_out`.
+  // Leaving it on the funnel was a silent miscompile, measured: for
+  // `%10s` over `81 8e 9b a8 7a` the native writes five pad bytes then
+  // five payload bytes, the funnel wrote five pad bytes then NINE.
+  printf("[%10s]\n", buf);
+  // CHECK: emitrust.call_opaque "print!"() {args = ["["]}
+  // CHECK: %[[P0:.*]] = arith.constant -1 : i32
+  // CHECK: %[[W0:.*]] = arith.constant 10 : i32
+  // CHECK: %[[F0:.*]] = arith.constant 0 : i32
+  // CHECK: emitrust.call_opaque "__emitrust_cstr_pad_out"(%{{.*}}, %[[P0]], %[[W0]], %[[F0]]) : (!emitrust.ref<!emitrust.slice<i8>>, i32, i32, i32) -> ()
+  // CHECK: emitrust.call_opaque "println!"() {args = ["]"]}
 }
 
 // CHECK-LABEL: func.func @keeps_display_funnel
@@ -78,14 +100,6 @@ void keeps_display_funnel(void) {
   char out[16];
   buf[0] = 'a';
   buf[1] = 0;
-
-  // A FIELD WIDTH pads to a byte count that only the formatter knows; the
-  // raw write cannot pad, so a width-bearing `%s` keeps the Display funnel
-  // (exactly the restriction the argv planner already applies). Its
-  // non-ASCII behaviour is unchanged -- see design.md FR-191.
-  printf("[%10s]\n", buf);
-  // CHECK: emitrust.call_opaque "__emitrust_cstr"({{.*}}) : (!emitrust.ref<!emitrust.slice<i8>>) -> !emitrust.opaque<"String">
-  // CHECK: emitrust.call_opaque "println!"({{.*}}) {args = ["[{:>10}]", 0 : index]}
 
   // A LATER argument with side effects: C evaluates every argument before
   // printf writes anything, so flushing a segment mid-directive-scan would
