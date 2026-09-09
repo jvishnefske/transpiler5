@@ -79,14 +79,24 @@ static long lift_shape(char *s, unsigned long avail, unsigned long len) {
   return off;
 }
 
-// The same defect WITHOUT the second-order lift: the arms are a `switch`, and
-// the if-expression lift only ever fires on an `if`. The two-program-point
-// rendering therefore survives, which makes this arm the isolated pin on the
-// `mut` decision itself -- the reproducer above cannot distinguish "the `mut`
-// went away" from "the whole binding was rewritten into an if-expression".
+// This arm USED to be the isolated pin on the `mut` decision, on the reasoning
+// that "the if-expression lift only ever fires on an `if`", so the
+// two-program-point rendering survived here and could not be confused with the
+// whole binding being rewritten into an if-expression.
+//
+// FR-215 GENERALISED THAT LIFT TO `emitrust.switch`, so that reasoning is now
+// false BY DESIGN and this arm renders as a match-expression binding. The
+// FR-142 `mut` invariant is NOT lost -- it moved, deliberately, to
+// `test/Target/Rust/deferred-mut-slice-index.mlir`, where
+// `@index_two_point_mut` pins the two-program-point spelling byte-for-byte
+// (`let v4: i64;`, never `let mut v4: i64;`). That leg stays two-point because
+// its first arm DIVERGES, which FR-215 refuses outright, so it is a stable home
+// for the pin rather than one more shape the fold will later absorb.
+// What THIS arm still pins is the switch fold itself, and that the merged
+// binding is not `mut`.
 // CHECK-LABEL: fn tu0_switch_index
-// CHECK:         let [[SOFF:v[0-9]+]]: i64;
-// CHECK-NEXT:    match
+// CHECK-NOT:     let mut [[SOFFM:v[0-9]+]]: i64
+// CHECK:         let [[SOFF:v[0-9]+]]: i64 = match
 static long switch_index(char *s, unsigned long avail, unsigned long len) {
   long off;
   printf("[gap %d]\n", (int)len);

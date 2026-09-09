@@ -114,6 +114,34 @@
           "last_changed": "a69b8eb 2026-09-03 fix(importer): FR-188 -- a unique_ptr payload by mutable reference emitted broken code, and one spelling emitted WRONG code"
         }
       ]
+    },
+    "6": {
+      "epoch_id": 6,
+      "closed_at": "2026-09-09T16:03:34",
+      "closed_at_rev": "34c9ff7acbe8bada28f540f3dff5f023b1ad8112",
+      "reason": "three pinned EndToEnd tests were legitimately edited by FR-216 (the 46 late-init merges): late-init-merge.c and fnptr-literal-unwrap.c had the CHECK blocks FR-213 identified as the sole blocker on 46 sound merges, and deferred-mut-slice-index.c's switch leg lifted once FR-61b's cond-expression fold was generalised to emitrust.switch; a delta measured over a moved population is attributable to nothing",
+      "note": "the FR-142 mut invariant that deferred-mut-slice-index.c's switch leg used to pin in isolation was relocated, not dropped: Target/Rust/deferred-mut-slice-index.mlir @index_two_point_mut pins the two-program-point spelling byte-for-byte and stays two-point because its first arm diverges, which the fold refuses outright",
+      "corpus_root": "test/EndToEnd",
+      "corpus_hash": "sha256:5e1c3576c3377f0892e068ec4be3d30ee1dc6fb1ab5dd33d72f993a2ac1671f5",
+      "file_count": 268,
+      "drifted": true,
+      "drifted_files": [
+        {
+          "path": "test/EndToEnd/deferred-mut-slice-index.c",
+          "state": "CONTENT-CHANGED",
+          "last_changed": "f734fed 2026-08-29 feat(import): FR-61f-c slices 1+2 -- hoist a body-invariant pointer cell"
+        },
+        {
+          "path": "test/EndToEnd/fnptr-literal-unwrap.c",
+          "state": "CONTENT-CHANGED",
+          "last_changed": "0574ccd 2026-08-29 feat(emitter): FR-133 -- drop the Option on a literal-Some fn-ptr local"
+        },
+        {
+          "path": "test/EndToEnd/late-init-merge.c",
+          "state": "CONTENT-CHANGED",
+          "last_changed": "df432a2 2026-08-26 feat(emitter): FR-132 -- the late-init merge"
+        }
+      ]
     }
   }
 }

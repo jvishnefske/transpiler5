@@ -361,6 +361,23 @@ def main():
     corpus = args.corpus or (doc["corpus_root"] if doc else "test/EndToEnd")
     paired = doc is not None
 
+    # BINDING-ONLY exclusions: measurable files that belong in the clippy
+    # epoch but are machine-generated stress inputs pinning a compiler bound,
+    # not specimens of emitted style. At epoch-7 two such files were 64% of the
+    # statements. See nix/clippy-eval/binding-exclude.txt for the rationale and
+    # the bar for adding one.
+    excl_path = os.path.join(HERE, "binding-exclude.txt")
+    excluded = []
+    if file_list is not None and os.path.exists(excl_path):
+        drop = set(epoch_mod.read_path_list(excl_path))
+        excluded = sorted(f for f in file_list if f in drop)
+        if excluded:
+            file_list = [f for f in file_list if f not in drop]
+            print(f"binding-only exclusions: {len(excluded)} "
+                  f"(machine-generated bound tests; see binding-exclude.txt)")
+            for f in excluded:
+                print(f"  excluded  {f}")
+
     report = measure(corpus, file_list=file_list,
                      sites_cap=args.sites_cap)
     print_report(report, doc, args.top, args.sites)

@@ -1,0 +1,78 @@
+{
+  "_comment": "Clippy baseline pinned to epoch-7 (nix/harness/epoch-7.json): the UNION corpus test/EndToEnd x {.c,.cpp}, measurable files only -- 294 files, 32 exclusions. Epoch-6 was CLOSED when FR-216 legitimately edited three pinned EndToEnd tests. Like epoch-4 and epoch-5 before it, epoch-6's baseline document stays byte-untouched as history and the totals are NOT a trajectory across the boundary: the population grew 268 -> 294. THREE consumers must name this same document -- clippy_eval.py's DEFAULT_BASELINE, signals.py's DEFAULT_CLIPPY, and controller.py's CLIPPY_BASELINE, which --updates and COMMITS it. If they diverge, the controller commits a file the ratchet never reads.",
+  "epoch_id": 7,
+  "corpus": "test/EndToEnd",
+  "corpus_roots": [
+    "test/EndToEnd"
+  ],
+  "extensions": [
+    ".c",
+    ".cpp"
+  ],
+  "corpus_hash": "sha256:743f40b7d9bbdb0f6a6a55ef62b62685fd6ba3bd00e00298a6c450503cf61447",
+  "split": {
+    "seed": 7,
+    "held_out_frac": 0.25
+  },
+  "emitter_rev": "34c9ff7acbe8bada28f540f3dff5f023b1ad8112",
+  "crates_linted": 294,
+  "crates_skipped": 0,
+  "total_warnings": 57,
+  "by_lint": {
+    "clippy::needless_late_init": 7,
+    "clippy::bool_comparison": 7,
+    "clippy::approx_constant": 5,
+    "clippy::explicit_auto_deref": 5,
+    "clippy::if_same_then_else": 4,
+    "clippy::unnecessary_literal_unwrap": 4,
+    "clippy::type_complexity": 4,
+    "clippy::single_match": 3,
+    "clippy::borrow_deref_ref": 3,
+    "clippy::assign_op_pattern": 3,
+    "clippy::needless_else": 3,
+    "clippy::too_many_arguments": 2,
+    "clippy::manual_range_contains": 2,
+    "clippy::field_reassign_with_default": 1,
+    "clippy::manual_swap": 1,
+    "clippy::collapsible_if": 1,
+    "clippy::useless_format": 1,
+    "clippy::ptr_arg": 1
+  },
+  "train": {
+    "crates_linted": 220,
+    "crates_skipped": 0,
+    "total_warnings": 46,
+    "by_lint": {
+      "clippy::bool_comparison": 7,
+      "clippy::needless_late_init": 4,
+      "clippy::if_same_then_else": 4,
+      "clippy::unnecessary_literal_unwrap": 4,
+      "clippy::approx_constant": 4,
+      "clippy::single_match": 3,
+      "clippy::borrow_deref_ref": 3,
+      "clippy::needless_else": 3,
+      "clippy::too_many_arguments": 2,
+      "clippy::type_complexity": 2,
+      "clippy::manual_range_contains": 2,
+      "clippy::assign_op_pattern": 2,
+      "clippy::explicit_auto_deref": 2,
+      "clippy::field_reassign_with_default": 1,
+      "clippy::manual_swap": 1,
+      "clippy::collapsible_if": 1,
+      "clippy::useless_format": 1
+    }
+  },
+  "held_out": {
+    "crates_linted": 74,
+    "crates_skipped": 0,
+    "total_warnings": 11,
+    "by_lint": {
+      "clippy::needless_late_init": 3,
+      "clippy::explicit_auto_deref": 3,
+      "clippy::type_complexity": 2,
+      "clippy::approx_constant": 1,
+      "clippy::ptr_arg": 1,
+      "clippy::assign_op_pattern": 1
+    }
+  }
+}

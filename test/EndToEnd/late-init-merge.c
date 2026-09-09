@@ -105,13 +105,26 @@ int struct_loop(int n) {
   return acc;
 }
 
-// REFUSES: every write is inside a `switch` arm while the read is after it.
-// Sinking the declaration into an arm would move the binding out of scope for
-// that read. The bare declaration must survive -- this residual shape is
-// explicitly out of the fold's reach.
+// MOVED FORWARD BY FR-215, deliberately; the invariant is unchanged and is now
+// pinned harder. Under FR-132 alone this REFUSED: every write is inside a
+// `switch` arm while the read is after it, so FR-132's merge -- which renders
+// the `let` AT THE WRITE -- would have sunk the declaration INTO an arm and
+// moved the binding out of scope for that read. FR-215 folds the shape a
+// different way: the whole `switch` becomes a match EXPRESSION bound in the
+// outer block, so the declaration never enters an arm at all and the residual
+// `needless_late_init` goes with it.
+//
+// The property FR-132's refusal protected is therefore still the property
+// under test -- the binding must be live AFTER the region -- and the CHECK
+// below now pins it by NAME: the `let` is bound at the `match`, at the outer
+// indentation, and both reads of it follow the closing `};`. If a future
+// change ever did sink the declaration into an arm, those reads would not
+// resolve and this leg fails. (The runtime byte-diff above is the oracle for
+// the values themselves.)
 // CHECK-LABEL: fn region_write
-// CHECK:         let {{v[0-9]+}}: i32;
-// CHECK:         match
+// CHECK-NEXT:    let [[R:v[0-9]+]]: i32 = match
+// CHECK:         };
+// CHECK-NEXT:    [[R]] * 2i32 + [[R]]
 int region_write(int n) {
   int r;
   switch (n % 3) {

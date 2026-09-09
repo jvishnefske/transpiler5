@@ -55,7 +55,7 @@ import epoch as epoch_mod  # noqa: E402  (the epoch/drift authority is shared)
 
 EMITRUST_CC = os.environ.get("EMITRUST_CC", "./build/tools/emitrust-cc")
 
-# The authoritative ratchet baseline. Pinned to epoch-6 (the union corpus
+# The authoritative ratchet baseline. Pinned to epoch-7 (the union corpus
 # test/EndToEnd x {.c,.cpp}, measurability-filtered, re-probed at the FR-188
 # rev: 268 files, 30 exclusions).
 # Epoch-5 was CLOSED when FR-188 legitimately edited a pinned EndToEnd test
@@ -67,7 +67,7 @@ EMITRUST_CC = os.environ.get("EMITRUST_CC", "./build/tools/emitrust-cc")
 # name this same document -- this default, signals.py's DEFAULT_CLIPPY, and
 # controller.py's CLIPPY_BASELINE, which `--update`s and COMMITS it. If they
 # diverge, the controller commits a file the ratchet never reads.
-DEFAULT_BASELINE = os.path.join(HERE, "clippy-baseline-epoch6.json")
+DEFAULT_BASELINE = os.path.join(HERE, "clippy-baseline-epoch7.json")
 
 
 class PinError(Exception):

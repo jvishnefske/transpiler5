@@ -1,0 +1,19 @@
+# Files excluded from the BINDING-HYGIENE population only.
+#
+# These are measurable and belong in the clippy epoch -- they are real emitted
+# crates and clippy has a genuine opinion about them. But they are MACHINE-
+# GENERATED STRESS INPUTS that exist to pin a compiler BOUND, not specimens of
+# the emitted style this metric is trying to measure, and at epoch-7 the two of
+# them contributed 30,663 of 47,654 statements -- 64% of the population from
+# 2 of 296 files. Left in, the metric mostly measures a synthetic ladder:
+# free_per_100_stmts fell 11.83 -> 4.88 and depth_max rose 12 -> 67, neither
+# because emitted-code hygiene changed.
+#
+# The depth_max 67 statement is literally
+#   ((((((((sel * 2i32 + 1i32) * 2i32 + 2i32) * 2i32 + 3i32) ...
+# i.e. the generated scrutinee chain, at main.rs:14742.
+#
+# Add a file here only when it is machine-generated at a bound. A large
+# HAND-WRITTEN test belongs in the population.
+test/EndToEnd/goto-ladder-chain.c
+test/EndToEnd/switch-dispatch-chain.c
