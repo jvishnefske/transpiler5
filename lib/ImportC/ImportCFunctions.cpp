@@ -1119,6 +1119,76 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
     if (!verbatim.empty() && verbatim != name)
       funcOp->setAttr(emitrust::kCSymbolAttrName,
                       builder.getStringAttr(verbatim));
+    // FR-209: record WHY a parameter is a slice when the cause is a
+    // DELEGATION and not anything the signature shows. Same gate as the
+    // FR-208 spelling above, and for the same reason: `--c-abi-exports` only
+    // ever looks at an externally visible C-linkage function, so attaching
+    // it anywhere else would move modules for a message nothing can read.
+    //
+    // The index is read off the FUNCTION TYPE ALREADY BUILT, never off the
+    // C parameter list, and the record is written only where that type
+    // really does carry a slice there. Both clauses were forced by measured
+    // counter-examples on the shipping suite, and skipping either produces a
+    // record that describes the wrong argument:
+    //
+    //   * an FR-62 owner method (`unite` in EndToEnd/array-self-ref-member-
+    //     cross-param.c) has a SYNTHESIZED RECEIVER prepended, so C
+    //     parameter i is type input i+1;
+    //   * and in that same function the two `struct node *` parameters
+    //     classify `Slice` and are then emitted as i64 CURSORS into the
+    //     promoted array -- the slice classification is not the last word on
+    //     the emitted type, so a record keyed off `ParamKind` alone would
+    //     claim a slice where the signature has an integer.
+    //
+    // Anchoring on the type makes the record self-consistent by
+    // construction and fails CLOSED: anything the shift or the shape test
+    // rejects simply keeps FR-139's sentence, which is the pre-FR-209
+    // behavior.
+    if (const clang::FunctionDecl *body = func->getDefinition();
+        body && body->hasBody()) {
+      // Primes the FR-100 fixpoint, which is what FILLS the delegation map,
+      // so the first function in a TU cannot read it empty. Cached by
+      // canonical decl, so this is a lookup and not a second analysis.
+      (void)classifyPointerParams(func);
+      FunctionType built = funcOp.getFunctionType();
+      size_t cParams = body->getNumParams();
+      SmallVector<Attribute> records;
+      if (built.getNumInputs() >= cParams) {
+        // The receiver shift, derived rather than assumed: a variadic or
+        // otherwise repacked signature that does not line up leaves the loop
+        // finding no slice and writing nothing.
+        size_t shift = built.getNumInputs() - cParams;
+        for (auto [index, param] : llvm::enumerate(body->parameters())) {
+          auto note = forwardSliceDelegations.find(param);
+          if (note == forwardSliceDelegations.end() || !note->second.callee ||
+              !note->second.soleReason)
+            continue;
+          Type input = built.getInput(index + shift);
+          Type pointee;
+          if (auto mutRef = dyn_cast<emitrust::MutRefType>(input))
+            pointee = mutRef.getPointee();
+          else if (auto ref = dyn_cast<emitrust::RefType>(input))
+            pointee = ref.getPointee();
+          if (!pointee || !isa<emitrust::SliceType>(pointee))
+            continue;
+          records.push_back(builder.getDictionaryAttr({
+              builder.getNamedAttr("index",
+                                   builder.getI64IntegerAttr(
+                                       static_cast<int64_t>(index + shift))),
+              builder.getNamedAttr("param",
+                                   builder.getStringAttr(param->getName())),
+              builder.getNamedAttr(
+                  "callee",
+                  builder.getStringAttr(note->second.callee->getName())),
+              builder.getNamedAttr(
+                  "site", mlir::LocationAttr(translateLoc(note->second.site))),
+          }));
+        }
+      }
+      if (!records.empty())
+        funcOp->setAttr(emitrust::kSliceParamDelegationAttrName,
+                        builder.getArrayAttr(records));
+    }
   }
   functions[name] = funcOp;
   // Recovery stub retry (FR-42): the signature above is the one the real

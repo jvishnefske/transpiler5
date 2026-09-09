@@ -4806,6 +4806,11 @@ struct CAbiVerdict {
   uint64_t sliceBound = 0;
   /// For `SliceBound`: the slice's element type, for the `*const T` spelling.
   Type sliceElemType;
+  /// FR-209: for a `Refused` verdict whose slice parameter is DELEGATION-
+  /// induced, the forwarding call site, so the warning can hang a located
+  /// note on the line that actually decided it. Empty for every other shape,
+  /// including a slice that some other analysis demanded.
+  std::optional<mlir::Location> delegationSite;
 };
 } // namespace
 
@@ -5092,6 +5097,56 @@ static CAbiVerdict classifyCAbiSignature(Operation *from, FunctionType type) {
   // over the structural cap below; either refusal is correct and this one is
   // the pinned one.)
   if (sliceCount != 0 || sawOther) {
+    // FR-209: FR-139's sentence is accurate for a signature that really is
+    // unscalar, and it stays VERBATIM for every one of them. It is not
+    // accurate for the shape below, which is why this arm exists: the C
+    // author wrote `int outer(Ctx *c) { return helper(c); }` -- a signature
+    // with nothing wrong with it -- and was told only that the signature is
+    // not all-scalar. The slice is not in the C at all; it is what the
+    // importer MADE of the parameter because the body delegates it, and
+    // FR-100's forwarding fixpoint keeps a reference across a forward only
+    // for an arithmetic pointee. Naming the delegation and the pointee-kind
+    // rule is the difference between an actionable diagnostic and a riddle.
+    if (sliceCount != 0)
+      if (auto records = from->getAttrOfType<ArrayAttr>(
+              emitrust::kSliceParamDelegationAttrName))
+        for (Attribute record : records) {
+          auto entry = dyn_cast<DictionaryAttr>(record);
+          if (!entry)
+            continue;
+          auto index = entry.getAs<IntegerAttr>("index");
+          auto param = entry.getAs<StringAttr>("param");
+          auto callee = entry.getAs<StringAttr>("callee");
+          if (!index || !param || !callee)
+            continue;
+          // The record is a REASON, not a claim about the type: only
+          // believe it against a parameter this signature really does
+          // carry as a slice, so a stale or mismatched attribute degrades
+          // to FR-139's wording rather than describing the wrong argument.
+          uint64_t position = index.getValue().getZExtValue();
+          if (position >= type.getNumInputs())
+            continue;
+          Type input = type.getInput(position);
+          Type pointee;
+          if (auto mutRef = dyn_cast<emitrust::MutRefType>(input))
+            pointee = mutRef.getPointee();
+          else if (auto ref = dyn_cast<emitrust::RefType>(input))
+            pointee = ref.getPointee();
+          if (!pointee || !isa<emitrust::SliceType>(pointee))
+            continue;
+          verdict.blocker =
+              ("its parameter '" + param.getValue() +
+               "' is a slice rather than a reference because the body "
+               "forwards the whole pointer to '" +
+               callee.getValue() +
+               "', and forwarding keeps a reference only for an arithmetic "
+               "pointee; a slice is a two-register fat pointer with no C "
+               "spelling")
+                  .str();
+          if (auto site = entry.getAs<mlir::LocationAttr>("site"))
+            verdict.delegationSite = mlir::Location(site);
+          return verdict;
+        }
     verdict.blocker = kCAbiNotAllScalarBlocker.str();
     return verdict;
   }
@@ -6411,14 +6466,26 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
       cAbiPointerWrapper = cAbiVerdict.kind == CAbiClass::StructPointer ||
                            cAbiVerdict.kind == CAbiClass::SliceBound;
       cAbiExport = !cAbiPointerWrapper;
-    } else if (!blocker.empty())
+    } else if (!blocker.empty()) {
       // On the LOCATION, not the op: this is a message for the person who
       // wrote the C, and attaching it to the operation makes MLIR dump the
       // whole `emitrust.func` after it.
-      mlir::emitWarning(op->getLoc())
+      mlir::InFlightDiagnostic warning =
+          mlir::emitWarning(op->getLoc())
           << "--c-abi-exports: no C-ABI export for '" << symbol
           << "': " << blocker
           << "; it stays a plain 'pub fn' and is not reachable by dlsym";
+      // FR-209: the refusal names the delegation; the NOTE points at the
+      // line that performed it, which is somewhere else in the file and is
+      // the only place the author can act. Nothing else in this diagnostic
+      // has a second location to offer, so the note rides exactly this one
+      // shape.
+      if (cAbiVerdict.delegationSite)
+        warning.attachNote(*cAbiVerdict.delegationSite)
+            << "the forwarding call is here; pass the helper what it "
+               "actually needs, or give it a pointee the forwarding "
+               "analysis tracks, and the parameter stays a reference";
+    }
   }
   if (cAbiExport) {
     // FR-208: `#[no_mangle]` exports the ITEM's name, and the item's name is

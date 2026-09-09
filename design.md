@@ -13577,6 +13577,64 @@ piece and becomes FR-45.
   storage, conversion, passing and printing. A real 80-bit type is not
   available -- Rust has no `f80`.
 
+- [x] FR-219 (opened and LANDED 2026-09-09; implements FR-209, found by the
+  FR-178 re-measurement spike): **THE REFUSAL NOW NAMES THE DELEGATION -- AND
+  THE PAIRED SWEEP CAUGHT TWO WAYS THE FIRST VERSION WOULD HAVE LIED.**
+  `--c-abi-exports` refused an exported facade that delegates its struct
+  pointer with only *"its signature is not all-scalar"* -- factually true and
+  completely uninformative, naming neither the delegation nor the pointee-kind
+  rule that actually decided it. Cause: FR-100's forwarding fixpoint
+  (`CImporterInternal.h:9620-9626`) records an edge only for an ARITHMETIC
+  pointee, so a struct pointee falls through to the conservative
+  `sliceParams.insert` and the parameter becomes `&mut [T]`.
+  **+0 items and +0 TRACTOR by construction** -- this changes wording, not
+  admission, and the emitted Rust is byte-identical.
+  THE LOCATED NOTE WAS REACHABLE: the emitter cannot see the C, so the two
+  facts cross on a discardable `emitrust.func` array attribute (the
+  `kAbiUnfaithfulReasonAttrName` precedent) carrying a `LocationAttr`, which
+  round-trips through `emitrust-opt`. The refusal now names the callee and
+  points a note at the forwarding call itself.
+  **TWO DEFECTS THE SPEC DID NOT PREDICT, both surfaced by the paired sweep
+  rather than by review:**
+   1. **INDEX MISALIGNMENT.** Keying the record on the C parameter position
+      and on `ParamKind::Slice` described the WRONG ARGUMENT on
+      `array-self-ref-member-cross-param.c` and `union-find.c`: an FR-62 owner
+      method carries a synthesized receiver (a shift of one), and in those
+      same functions parameters classify `Slice` but are emitted as **i64
+      cursors** -- so **`ParamKind` is not the last word on the emitted
+      type**. Fixed by anchoring on the built `FunctionType` and requiring a
+      real slice there, failing closed to FR-139's wording. MLIR churn fell
+      from 6 files to 2.
+   2. **THE SENTENCE COULD LIE.** `int both(Ctx *c) { return helper(c) +
+      c[1].a; }` forwards AND subscripts -- delete the call and it is *still*
+      a slice, so blaming the delegation would be false. The walker now
+      suspends the forward's demand, asks the fixpoint `soleReason`, then
+      **restores the demand wholesale** (identical set, no signature moves),
+      and only sole-reason records are surfaced. Verified independently:
+      `outer` gets the new wording plus the located note, `both` keeps the
+      original "not all-scalar" sentence.
+  **A SECOND REAL INSTANCE WAS FOUND IN THE SHIPPING SUITE**, not just in the
+  synthetic differential: `do_indexing` in
+  `flexible-array-member-tail-local.c`, whose own source comment already read
+  `/* slice-classifies hse */`. Its refusal now names `get_input_offset`.
+  ON WIDENING THE FORWARDING EDGE (reported, deliberately NOT implemented, and
+  **not costed**): across 785 sweep files exactly ONE pre-existing function is
+  a sole-reason delegation-induced slice on an externally-visible C function
+  -- rarer than FR-215's write-up implies. **But that is NOT a blast-radius
+  measurement, and the entry says so:** the attachment gate excludes
+  internal-linkage functions, which a widening would INCLUDE. Anyone costing
+  it must re-measure with the gate removed. TRACTOR is separately +0 -- no
+  slice-parameter reason appears in the EMIT_FAIL tally at all, where the
+  front is `aliasing mutable pointer arguments` at 80/252.
+  Gate **1035/1035**; paired sweep over 758 emitted-Rust files **0 byte-diffs**
+  and over 785 MLIR files 2 diffs, both intended; clippy 57 -> 57 (+0) at the
+  epoch-7 pin; binding both axes flat; both corpus ratchets unmoved; TRACTOR
+  41/252. **No existing test was edited and no Driver pin moved** -- entirely
+  additive, so epoch-7 stays open.
+  ONE SPEC CASE DROPPED as wrong: a planned `takes_double` regression guard,
+  because a `double` parameter IS C-ABI scalar and exports. `both` replaced it
+  and is the sharper guard.
+
 - [x] FR-218 (opened and LANDED 2026-09-09; FR-167 PHASE 2, the last of its
   two phases): **THE UNION-DECLARATION FRONTIER IS CLOSED TO TWO DELIBERATE
   SOUNDNESS EXCLUSIONS -- AND THE SPIKE THAT RANKED THIS WORK FELL INTO THE
@@ -14383,7 +14441,8 @@ piece and becomes FR-45.
   uppercase-symbol cases are still EMIT_FAIL, so this fix scores +0 today
   exactly as predicted.
 
-- [ ] FR-209 (opened 2026-09-08 by the FR-178 re-measurement spike; a NAMED
+- [x] FR-209 (opened 2026-09-08 by the FR-178 re-measurement spike; LANDED
+  2026-09-09 as FR-219; a NAMED
   CONSTRAINT that was previously invisible): **FR-100'S FORWARDING FIXPOINT
   RECORDS AN EDGE ONLY FOR ARITHMETIC POINTEES, SO ANY ENTRY POINT THAT
   DELEGATES ITS STRUCT POINTER TO A HELPER BECOMES `&mut [T]` AND IS REFUSED
@@ -14415,6 +14474,11 @@ piece and becomes FR-45.
   signatures repo-wide and would move goldens. Recorded here as a named
   constraint so the next person measuring a C-ABI export lever does not
   rediscover it from scratch.
+  **LANDED 2026-09-09 as FR-219**, which implements the diagnostic half: the
+  refusal now names the delegation and its callee and points a located note at
+  the forwarding call. The edge itself was deliberately NOT widened -- that
+  remains uncosted, and FR-219 records why the one measurement it could take
+  is not a blast-radius measurement.
 
 - [x] FR-207 (opened and LANDED 2026-09-08; closes FR-197's SECOND residual,
   the unbounded `emitDispatchSwitch` path): **THE WORST DISPATCH SHAPE IS NOT
