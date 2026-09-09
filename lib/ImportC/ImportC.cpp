@@ -3742,6 +3742,22 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
       return emitError(loc)
              << "unsupported: locale ctype table lookup through '" << accessor
              << "' (the <ctype.h> classifiers are macros over a locale table)";
+    // FR-217: name the padded string table rather than the cast kind. A
+    // row of an admitted table is an i8-array place, not a pointer VALUE:
+    // the padded lowering gives it no address to compare, test against
+    // NULL, or store into a `const char *`. This rejection is what keeps
+    // `while (t[i])` and `t[i] == t[j]` from silently answering against
+    // padding instead of against pointers.
+    if (const clang::ArraySubscriptExpr *row =
+            stringTableRow(cast->getSubExpr()))
+      return emitError(loc)
+             << "unsupported: row of string table '"
+             << llvm::cast<clang::DeclRefExpr>(
+                    row->getBase()->IgnoreParenImpCasts())
+                    ->getDecl()
+                    ->getName()
+             << "' used as a pointer value (the padded lowering gives its "
+                "rows no address)";
     return emitError(loc) << "unsupported pointer cast ("
                           << cast->getCastKindName() << ")";
   }
@@ -6973,7 +6989,11 @@ CImporter::emitSubscriptLValue(const clang::ArraySubscriptExpr *subscript,
                                              subscript->getIdx(), loc,
                                              "vector index");
       }
-  if (!base->getType().getCanonicalType()->isArrayType()) {
+  // FR-217: `t[i][j]` over a padded string table. The inner `t[i]` has C
+  // POINTER type but is an i8-array lvalue in the padded lowering, so the
+  // second subscript is an ordinary array subscript, not a pointer walk.
+  if (!base->getType().getCanonicalType()->isArrayType() &&
+      !stringTableRow(base)) {
     // Subscript through a pointer: decompose it into (base, cursor) and
     // subscript the base object at cursor+index. A subscripted pointer
     // parameter classifies as a slice and decomposes like a local; the
