@@ -1,0 +1,1228 @@
+{
+  "epoch_id": 7,
+  "corpus_root": "test/EndToEnd",
+  "corpus_roots": [
+    "test/EndToEnd"
+  ],
+  "extensions": [
+    ".c",
+    ".cpp"
+  ],
+  "recursive": false,
+  "created_rev": "34c9ff7acbe8bada28f540f3dff5f023b1ad8112",
+  "corpus_hash": "sha256:743f40b7d9bbdb0f6a6a55ef62b62685fd6ba3bd00e00298a6c450503cf61447",
+  "file_count": 294,
+  "excluded_count": 32,
+  "excluded": [
+    "test/EndToEnd/actor-link-lift.c",
+    "test/EndToEnd/actor-partition-lift.c",
+    "test/EndToEnd/cpp-cross-tu-record-odr.cpp",
+    "test/EndToEnd/fn-symbol-collision-fnptr.c",
+    "test/EndToEnd/fn-symbol-collision-recover.c",
+    "test/EndToEnd/fnptr-extern-def.c",
+    "test/EndToEnd/fnptr-undefined-recover.c",
+    "test/EndToEnd/incremental-builds.cpp",
+    "test/EndToEnd/incremental-leaked-stub-containment.cpp",
+    "test/EndToEnd/link-fnptr-table-order-e2e.c",
+    "test/EndToEnd/link-merge-e2e.c",
+    "test/EndToEnd/link-module-sink-e2e.c",
+    "test/EndToEnd/link-module-sink-name-e2e.c",
+    "test/EndToEnd/link-module-sink-root-type-e2e.c",
+    "test/EndToEnd/link-orphan-extern-global-e2e.c",
+    "test/EndToEnd/link-reimport-e2e.c",
+    "test/EndToEnd/link-slice-model-e2e.c",
+    "test/EndToEnd/link-slice-order-e2e.c",
+    "test/EndToEnd/link-slice-out-param-e2e.c",
+    "test/EndToEnd/link-workspace-cycle-e2e.c",
+    "test/EndToEnd/link-workspace-e2e.c",
+    "test/EndToEnd/multi-tu-gate-g1-fnptr-result-erasure.c",
+    "test/EndToEnd/multi-tu-gate-g3-owner-fallback.c",
+    "test/EndToEnd/multi-tu-gate-g5-region-api.c",
+    "test/EndToEnd/multi-tu-gate-g6-cellslice-fn-external.c",
+    "test/EndToEnd/multi-tu-gate-g8-ptr-global-external.c",
+    "test/EndToEnd/multi-tu-gate-g8-shared-header.c",
+    "test/EndToEnd/multi-tu.c",
+    "test/EndToEnd/planner-rejection-builds.c",
+    "test/EndToEnd/recover-partial.cpp",
+    "test/EndToEnd/rust-module-fnptr-e2e.c",
+    "test/EndToEnd/test-entry-partition.c"
+  ],
+  "files": [
+    {
+      "path": "test/EndToEnd/actor-lib-export.c",
+      "sha256": "7d3b2542c8298db6e9bd9c0b0e259e0274a0877da1a14499bdec4419e1e0b193"
+    },
+    {
+      "path": "test/EndToEnd/actor-lib-struct-global.c",
+      "sha256": "c412372b5d1ac63962b50dc77c54e0aa9d4aef4c490273ab6ec4c7529c494b9c"
+    },
+    {
+      "path": "test/EndToEnd/actor-lift-cross.c",
+      "sha256": "8277743c4b07f7c423998621a43d955c219dc57eb9d56cf2aad3197e3709180f"
+    },
+    {
+      "path": "test/EndToEnd/actor-lift-fnptr.c",
+      "sha256": "eec59ed54ac775d81cebda751e696c7fdc3e10c1d0a8e9bd23db534059262758"
+    },
+    {
+      "path": "test/EndToEnd/actor-lift-globals.c",
+      "sha256": "f085fba826bc77092d0a9aa5dbe73737048bc9f3cc2be38dbf7e28954ccebbc9"
+    },
+    {
+      "path": "test/EndToEnd/actor-lift-threading.c",
+      "sha256": "a15846058d37961afa62c3988bc3e5abfa28cad69d2cfeea879f6277611f3d56"
+    },
+    {
+      "path": "test/EndToEnd/actor-lift-variadic.c",
+      "sha256": "e544218ba568232804b04211adf6bbe00be0bc470c24ef7888e5c97438a2df5d"
+    },
+    {
+      "path": "test/EndToEnd/actor-mode-async-globals.c",
+      "sha256": "8bb7ba974651f597e60e1eb545a673fbfb87b13e867802a71fff786714b35bb0"
+    },
+    {
+      "path": "test/EndToEnd/actor-mode-async-panic.c",
+      "sha256": "1da1d3b7051c0d3b5df7207b2da12417ba042ab1f5497adcb9c3080c5f083121"
+    },
+    {
+      "path": "test/EndToEnd/actor-mode-map-mixed.c",
+      "sha256": "78e1553546cf7135f9261fbb91c1c55b19bb0c009abfed0b164737e2732157dc"
+    },
+    {
+      "path": "test/EndToEnd/actor-mode-threaded-globals.c",
+      "sha256": "35efa27a206d9fe7b1b8ec725bf55de9d3ca8529842fe3bddfb62a33a3020b93"
+    },
+    {
+      "path": "test/EndToEnd/actor-mode-threaded-mixed.c",
+      "sha256": "11de0489b5f24900d1aba1909cf44e39272da63332bb2462b259fb8951d83d45"
+    },
+    {
+      "path": "test/EndToEnd/actor-mode-threaded-panic.c",
+      "sha256": "f193dc6ad4b96c23e4976d1e4a401ef2e9bc2ac660f1a44887a12683260cb286"
+    },
+    {
+      "path": "test/EndToEnd/aggregate-init.c",
+      "sha256": "cb02d6189f4940f345d450a5bcc5b430c1b20fa58ff2d72fcf30ea3dbd51d144"
+    },
+    {
+      "path": "test/EndToEnd/argv-echo.c",
+      "sha256": "57dd23da146f0ee1fd144d659cb2072818696f9b7bea5df641b33776a538c563"
+    },
+    {
+      "path": "test/EndToEnd/array-2d-pointer.c",
+      "sha256": "02c4b73eb20a48412759ff14a85108e2b0cb6e8dab4bac5ce2dd2a34efa2e684"
+    },
+    {
+      "path": "test/EndToEnd/array-params.c",
+      "sha256": "732766fa1f546374414d123696d490674434dc8628fcb70876da33ac9cb74312"
+    },
+    {
+      "path": "test/EndToEnd/array-self-ref-member-chain.c",
+      "sha256": "6320b2552d7007b49c68e36da925fe29f063f4021f15dcf7601c51cc302d405d"
+    },
+    {
+      "path": "test/EndToEnd/array-self-ref-member-cross-param.c",
+      "sha256": "01423c67e36241b76da60bea1685a9b82497250ed7c6d682ab1a4704fb79ec24"
+    },
+    {
+      "path": "test/EndToEnd/array-self-ref-member.c",
+      "sha256": "d165fb34d2e7fb0a63e05abbeeecca61635b55a1a62b24d7e301fa9f121c9de1"
+    },
+    {
+      "path": "test/EndToEnd/arrays-multidim.c",
+      "sha256": "c515ae9f883d90da6a6cfbeffd9447fe2e3c8dc07761d829bf731ed98746ec83"
+    },
+    {
+      "path": "test/EndToEnd/bitfields-flags.c",
+      "sha256": "1ac6eef07b90c5b7a2bf618bdd2c11210354eee6be3b2879d4b318f2bc448a5b"
+    },
+    {
+      "path": "test/EndToEnd/bitfields-zeroextend.c",
+      "sha256": "b91072bdce435345b7785c567e4b50a4b2b975fc0bb1dc17196e04d36006e74e"
+    },
+    {
+      "path": "test/EndToEnd/bitwise.c",
+      "sha256": "c0056fc6308f74ddf1f5e701c79c3cf9c39f480e57da77d76dc45c4241ccfe87"
+    },
+    {
+      "path": "test/EndToEnd/bool-to-floating.c",
+      "sha256": "cee944a61d80cb51a3d4f41ec9fbdb2ffd46d5d26493c3136835ffc9e658aec9"
+    },
+    {
+      "path": "test/EndToEnd/borrow-bundle-scalarize.c",
+      "sha256": "d79a7e04caa631181d73c5917289c2bb20f5aac6a5fdd2851a35fcce646a222e"
+    },
+    {
+      "path": "test/EndToEnd/byte-region-cbc-walk.c",
+      "sha256": "4a59f1ef79edad1fc209142cee2f993c0ceae279172c48d2889f2d00309e9c53"
+    },
+    {
+      "path": "test/EndToEnd/byte-region-member-window.c",
+      "sha256": "4e1cc5ce1f3644934356a6be6e114a0f5e2cbe1dff63a5e7e53e5883486107cf"
+    },
+    {
+      "path": "test/EndToEnd/byte-region-walk.c",
+      "sha256": "66dba0c7f8ab78f3685eaf93fb4c171ad5017dd1406c2a93ad40743c8a3f1c97"
+    },
+    {
+      "path": "test/EndToEnd/c-abi-exports-actor-dlopen.c",
+      "sha256": "7868d05432e9dde813b38a252c03357246203c7bd841dd9c4e76c7980060e9a2"
+    },
+    {
+      "path": "test/EndToEnd/c-abi-exports-dlopen.c",
+      "sha256": "265880cb4f339eb277c2e43bbff0659013b0a06a749e7231cbf5894058aa45b5"
+    },
+    {
+      "path": "test/EndToEnd/c-abi-exports-mixed-case-dlopen.c",
+      "sha256": "8f6af87156141614a0214f13070b0612ca3a84a519ea576eb9d40497fbad86e0"
+    },
+    {
+      "path": "test/EndToEnd/c-abi-exports-slice-dlopen.c",
+      "sha256": "5e9fde1cd305bbda5737f13df74344a22d90f8f8992b5579a817e0c4e8753cee"
+    },
+    {
+      "path": "test/EndToEnd/c-abi-exports-structs-dlopen.c",
+      "sha256": "064bf09806ab553021f0862dd39aa0ae4605da268d98b59d4a7fbfdb6f4d1eda"
+    },
+    {
+      "path": "test/EndToEnd/char-constants.c",
+      "sha256": "4a7d51bfba4127c25f3db9604fcbb6e3597703d2b8e347de3188d7e933393baa"
+    },
+    {
+      "path": "test/EndToEnd/compound-literals.c",
+      "sha256": "3f24d955a6c022ea1e272f71585103fa5e2c1a4312d994f31ea0557ebd71f907"
+    },
+    {
+      "path": "test/EndToEnd/compound-promote.c",
+      "sha256": "4cfb56e0befabab2fa4e205be0d754a54dd58fa0794e95465020243d3ad6be44"
+    },
+    {
+      "path": "test/EndToEnd/cond-expr-binding.c",
+      "sha256": "6cda608c558902d5ad53b28c6f06b52ab8b8d652c4aca560748f329a2a2733d3"
+    },
+    {
+      "path": "test/EndToEnd/const-byte-arg.c",
+      "sha256": "0c13702bbb445e09cca00fcc046220f84a06dd42bd3be67571b3e6bd79fb246f"
+    },
+    {
+      "path": "test/EndToEnd/cpp-basics.cpp",
+      "sha256": "020e1925eefe925b2ed1ce1a1ced54549743e21555b1820c66c426e8369ccf83"
+    },
+    {
+      "path": "test/EndToEnd/cpp-byvalue-struct.cpp",
+      "sha256": "54a57a47aa94d1b4dadd6c0bffce5807fb41fdceef4df6c986c3ba15eb608851"
+    },
+    {
+      "path": "test/EndToEnd/cpp-class-template.cpp",
+      "sha256": "72a98379900352fa4c356a15d4f9626ad213af9e914c973892d37048b0233e63"
+    },
+    {
+      "path": "test/EndToEnd/cpp-contained-member.cpp",
+      "sha256": "01a5158bc57e91be58579aa196a577133e957d4f362c5361b3d974866a3ee964"
+    },
+    {
+      "path": "test/EndToEnd/cpp-conversion-function.cpp",
+      "sha256": "ac5629413aae6cdc9399201a5d6d3c3f9449774795800cc871de1ed600324aa1"
+    },
+    {
+      "path": "test/EndToEnd/cpp-copy-ctor.cpp",
+      "sha256": "11d8da83a222fee52fea2cbb85ef706e3f62a54428161d9280bd8eb47ec311c9"
+    },
+    {
+      "path": "test/EndToEnd/cpp-copy-dtor.cpp",
+      "sha256": "07fed25911d5cc5d831d003bb9ebeda70809f557609f2dd3c472042af6aa9b6f"
+    },
+    {
+      "path": "test/EndToEnd/cpp-ctor-overload.cpp",
+      "sha256": "146efe384bb4d3ede729636e1f33bfdd17d49986ab728bdc33e8a455becaa0a1"
+    },
+    {
+      "path": "test/EndToEnd/cpp-default-arg.cpp",
+      "sha256": "a6a6a2058e323e81fa1955e168bbf65a53a168cd30acfb81155e6f65f48ba312"
+    },
+    {
+      "path": "test/EndToEnd/cpp-defaulted-ctor.cpp",
+      "sha256": "e6344941fda262c3244cbde718651bbc93133f355bb07a5d65d4cd8638ab2e7c"
+    },
+    {
+      "path": "test/EndToEnd/cpp-derive-copy-fixpoint.cpp",
+      "sha256": "81d5edf10a0401b49c61889022b0a264fdf5443339c890bf45cb86022e8ddebf"
+    },
+    {
+      "path": "test/EndToEnd/cpp-destructor-deadstore.cpp",
+      "sha256": "7b3710b50fda314fd416785627e94f7d5d65d52f107931dc7b9cb8f11593a23f"
+    },
+    {
+      "path": "test/EndToEnd/cpp-destructor.cpp",
+      "sha256": "f518c183e4e12482cf90e5129edb0d1b6791984763e74dcd809804bcfec0c0fb"
+    },
+    {
+      "path": "test/EndToEnd/cpp-devirt-base-pointer.cpp",
+      "sha256": "83926e38c4bd58a121682d919db913ab153c180a6b8790628d8211da9a132e90"
+    },
+    {
+      "path": "test/EndToEnd/cpp-dtor-field-init-fuse.cpp",
+      "sha256": "f66013e0fa2333f96f5b262be8883552dc5066f0380a6791193e346d6ebf35af"
+    },
+    {
+      "path": "test/EndToEnd/cpp-dtor-loop-exit-order.cpp",
+      "sha256": "a57ea299d6229e91967e784a2627bb036557c2c249eee1257bd68e79395607df"
+    },
+    {
+      "path": "test/EndToEnd/cpp-enum-branchy.cpp",
+      "sha256": "2303adedcfa75de55013b5f7c97d19748c3bdf50497c70702507cf2f23377a09"
+    },
+    {
+      "path": "test/EndToEnd/cpp-enum-narrow-underlying.cpp",
+      "sha256": "a2a55346ac7256ece99e99b5ffa6f2b04e32a378e5bc6f05b5409a4ae4d023ee"
+    },
+    {
+      "path": "test/EndToEnd/cpp-enum-scoped.cpp",
+      "sha256": "12612c142f83864197d402e4922761cc13c7ad35cb77a51b9e1b8832c3b9f59f"
+    },
+    {
+      "path": "test/EndToEnd/cpp-enum-u32-fixed-underlying.cpp",
+      "sha256": "a1d2826824e7b217c4f719fdd73117b7af510db0dbd8400759c506e670280ebc"
+    },
+    {
+      "path": "test/EndToEnd/cpp-exceptions-drop.cpp",
+      "sha256": "14c6379be3fd7b837dfcf869a2896f3c0c076fa65263aa496000d3f8615a5298"
+    },
+    {
+      "path": "test/EndToEnd/cpp-exceptions.cpp",
+      "sha256": "4aab173fe0a6bd983fe74fb5431e4d86c2c96e8afe159f333333084810c1b042"
+    },
+    {
+      "path": "test/EndToEnd/cpp-free-overload.cpp",
+      "sha256": "399853c2d2774466a1b7a5d050875240009a42cb9b1e0021e296d064e0e9ed54"
+    },
+    {
+      "path": "test/EndToEnd/cpp-function-template.cpp",
+      "sha256": "94d7ef9f8da767cbd82fa57c347d82a19365e60577905643780d894ac2e30c87"
+    },
+    {
+      "path": "test/EndToEnd/cpp-inheritance-drop.cpp",
+      "sha256": "fc35ccadedff27176146a8d5c06d106f99f4d20318bc7bb408d4354667f82f79"
+    },
+    {
+      "path": "test/EndToEnd/cpp-inheritance.cpp",
+      "sha256": "a24b5f06f9fecb54579ac92e0177d02fc57b52ee68775a9c9673824c0a193c98"
+    },
+    {
+      "path": "test/EndToEnd/cpp-init-statements.cpp",
+      "sha256": "3789d813dba3424b9a73c2cba2c882fb9871ecd73ffba9c32c30505f60befd8f"
+    },
+    {
+      "path": "test/EndToEnd/cpp-iostream.cpp",
+      "sha256": "64ab0dfe0c9f0e784a7809b7cba6d21d86aef74df64ac08b6dac97598c3c78b1"
+    },
+    {
+      "path": "test/EndToEnd/cpp-lambda-capture-range-for.cpp",
+      "sha256": "6d0c8bbe2b3618a60b849f1af3171ae52d126284b0a9fee76bcde393fec95075"
+    },
+    {
+      "path": "test/EndToEnd/cpp-method-chain.cpp",
+      "sha256": "6fdbbccec32fa64c531dbc35ab943fddfebcaac079a450208ac3987e57f552bc"
+    },
+    {
+      "path": "test/EndToEnd/cpp-method-chains.cpp",
+      "sha256": "a061c721d45fc8bba74e07877157a0a3e77cad3a0a46f7793d518b4a3d7963c3"
+    },
+    {
+      "path": "test/EndToEnd/cpp-method-global-arm.cpp",
+      "sha256": "439c7a09bc191d73afdd1ad69de90596680aefdc9e15f6ccdea35364fadffd19"
+    },
+    {
+      "path": "test/EndToEnd/cpp-method-global.cpp",
+      "sha256": "c253b7845b0d9c81389147c0e3d679ed3c11cb4aa0108d4f31276cbda614e9f4"
+    },
+    {
+      "path": "test/EndToEnd/cpp-method-names.cpp",
+      "sha256": "ad78a94c0f52bc4a49f2527d0c4553943a8f046d0e8c6093d445c5f7ef7aeee7"
+    },
+    {
+      "path": "test/EndToEnd/cpp-method-pointer-arg.cpp",
+      "sha256": "d82b4dcbafa3658f0398674cc1492edb0d63640b3d6fa3b11869e5560f828cd5"
+    },
+    {
+      "path": "test/EndToEnd/cpp-methods-overload.cpp",
+      "sha256": "00c67e3b8d8485d8f96e7d89785d6295da851ca03398d9d8ee5d55a099bb367a"
+    },
+    {
+      "path": "test/EndToEnd/cpp-methods.cpp",
+      "sha256": "6de0c79f0a05b0cb3a30111801d5b888eaae7075e701de04e860192a94943ada"
+    },
+    {
+      "path": "test/EndToEnd/cpp-modern-syntax.cpp",
+      "sha256": "cde28d50ef619b17382a494f868eb31e6a6a4b693cad23f06637bf3f153cd1d4"
+    },
+    {
+      "path": "test/EndToEnd/cpp-namespace-camelcase.cpp",
+      "sha256": "76f61fa0a6f0ced5a59a600a53b746581063c42998b153b223fbef35c5b9e8ed"
+    },
+    {
+      "path": "test/EndToEnd/cpp-namespace-class-template.cpp",
+      "sha256": "c2ca00905fdb38fed83cc32fcd56ed351d8c61badb241c20eb416b98324912bc"
+    },
+    {
+      "path": "test/EndToEnd/cpp-namespace-records.cpp",
+      "sha256": "e1cc884b97995383b27b443ed9c4e9797bcf387b2402f3e7211142d06c49cfec"
+    },
+    {
+      "path": "test/EndToEnd/cpp-nsdmi.cpp",
+      "sha256": "84563048bfae7ec145be71383e7caf8360390cd651fe0332ac17eb67587a172a"
+    },
+    {
+      "path": "test/EndToEnd/cpp-operator-copy-ctor.cpp",
+      "sha256": "4be1a4fd91b17915b6f3ec23ca2406b7fc2b09afe6be8f18a4e82d76f6ebb47c"
+    },
+    {
+      "path": "test/EndToEnd/cpp-operator-free.cpp",
+      "sha256": "0b0824e5e7d717cdc558ee0efe9271eef87eaca8fb345ff5c3ce050bedd5032d"
+    },
+    {
+      "path": "test/EndToEnd/cpp-operator-friend.cpp",
+      "sha256": "3c9fe6bf9a78c8b4bbf022fd21c0cd1ddff254a35b3efbfae4406e8e3c39a931"
+    },
+    {
+      "path": "test/EndToEnd/cpp-operator-member.cpp",
+      "sha256": "2e812be26a697e8dc7dcaa7af957d1de699660245e3f0f835386b00001d9fbaf"
+    },
+    {
+      "path": "test/EndToEnd/cpp-references.cpp",
+      "sha256": "566d367ceb0ac34d9eac2646d3d7ea43ee15bb337b5610094e0187b3998b669b"
+    },
+    {
+      "path": "test/EndToEnd/cpp-rejected-class-no-trace.cpp",
+      "sha256": "bb2c9b1cd5447b066fb2d2786580ebb6e863e1ed48bfe62d9219a845b5dc307c"
+    },
+    {
+      "path": "test/EndToEnd/cpp-stl-combined.cpp",
+      "sha256": "e588b1f9ff6e2a732a7cba9a2c83cd1fb1eb6d571843f3fc0adaafed00f6549c"
+    },
+    {
+      "path": "test/EndToEnd/cpp-struct-pointer-methods.cpp",
+      "sha256": "fc9c673f4167e0e940539c102e2373f3ab8bf39337139b667cb2fc06f3ebace0"
+    },
+    {
+      "path": "test/EndToEnd/cpp-structured-bindings.cpp",
+      "sha256": "dad1161be6988dc60bb69cd3f0b55b334121bb81064b4e7b3cdf87c4b307254d"
+    },
+    {
+      "path": "test/EndToEnd/cpp-template-explicit-spec.cpp",
+      "sha256": "965726bd18af01d406df69abb251461a5abd4aa17ce0bff64826eaead517460e"
+    },
+    {
+      "path": "test/EndToEnd/cpp-template-nttp.cpp",
+      "sha256": "135a6041436ecb80b22947134c1d66554392c9846515428d2042420d802b0b0d"
+    },
+    {
+      "path": "test/EndToEnd/cpp-template-partial-spec.cpp",
+      "sha256": "85fae933ce85754637f4d6759c3e1d63fcbef44a1a758d332bb50876679ad6c9"
+    },
+    {
+      "path": "test/EndToEnd/cpp-this-fields.cpp",
+      "sha256": "998ea049c1579c2645e3f2fd1ec1b39368caa9b181fb9d42ed7bdf1ad717d116"
+    },
+    {
+      "path": "test/EndToEnd/cpp-unused-assignment-allow.cpp",
+      "sha256": "bc3777f3df374d719c9f6861f28fa83f796bee7d51feebda2f3698b7e4b7c133"
+    },
+    {
+      "path": "test/EndToEnd/cpp-upcast-pointer.cpp",
+      "sha256": "8551542310c20b3e6cd3dba9efb77cd9f2b47e9992b60bbc92c661a558d0260e"
+    },
+    {
+      "path": "test/EndToEnd/cpp-virtual-methods-values.cpp",
+      "sha256": "056deb055dd83f43d4b652a5c72a61e0e78a00cce4f8e2a356ec34479c9e281d"
+    },
+    {
+      "path": "test/EndToEnd/ctype-classifiers.c",
+      "sha256": "30d73810afbb5c5a1167639b42a81e7db89f38e25773d7f7901fb2dc8d9563ba"
+    },
+    {
+      "path": "test/EndToEnd/cursor-param-global-or-null.c",
+      "sha256": "2718d6ec5644e2185bf8ff7b65309516cdf9b56e89b1c23a6a3473264d7252a7"
+    },
+    {
+      "path": "test/EndToEnd/cursor-param-paired.c",
+      "sha256": "65e3593d06ce015389bcf8d220e25ba4c967489311f91fd22bb27170cedd2e6d"
+    },
+    {
+      "path": "test/EndToEnd/cursor-region-demand-mut-literal.c",
+      "sha256": "e7bd2ac5c1c57d8f0fd70d97f12d7b56a1b2b4ae86d2b188ac668104e117cc54"
+    },
+    {
+      "path": "test/EndToEnd/cursor-region-demand-mut-param.c",
+      "sha256": "6f018cbe6a45785e1ff959a6dc334507b44228aa052a9815a657ca3e87f96f7c"
+    },
+    {
+      "path": "test/EndToEnd/cursor-region-demand-mut.c",
+      "sha256": "373bd949e9b54d66266c23c3a17da6194bd3b4fdc4ecdb8ea79d4b874c232b29"
+    },
+    {
+      "path": "test/EndToEnd/dead-binding-impure-rhs.c",
+      "sha256": "5535aec77a43667caeee3df7e3463794294999d1ea644c990331d65fd37c44e3"
+    },
+    {
+      "path": "test/EndToEnd/deferred-mut-slice-index.c",
+      "sha256": "98448f6bef5d396b3353f1e0816a518f91d073891a293d743a06e1b6cc17a40a"
+    },
+    {
+      "path": "test/EndToEnd/double-underscore-names.c",
+      "sha256": "70d7480fda7d7caddaaec177482d68f01f08733b68fb3cef960f7e3885f78fe3"
+    },
+    {
+      "path": "test/EndToEnd/enum-array-index.c",
+      "sha256": "5caa38a51b5f043a9fa723543733d66069eebe41c0beb5fedf82f9f180562c1d"
+    },
+    {
+      "path": "test/EndToEnd/enum-duplicate-value.c",
+      "sha256": "b05180540c75d08ef6f4d0c45fd089a9cfe6e33733679876483c79ed7998dc1e"
+    },
+    {
+      "path": "test/EndToEnd/enum-flag-bit31.c",
+      "sha256": "e3150bf755f34659404ae42ca1ff276cd6b204ae92dba933becb3320fea1e4f9"
+    },
+    {
+      "path": "test/EndToEnd/enum-from-int.c",
+      "sha256": "f0fe7d19867b55f27bd135422698838251dd1533b89f61e99831a6001af2b531"
+    },
+    {
+      "path": "test/EndToEnd/enum-int.c",
+      "sha256": "cda667d0ef634561a844074f475b56340795a3e9c553acc180c1e7f6b9748a90"
+    },
+    {
+      "path": "test/EndToEnd/enum-object-above-int-range.c",
+      "sha256": "52fc9186dedeb9cc93e4dbbfb8fbf5f69c884af966aab1d26ed4773017065bd4"
+    },
+    {
+      "path": "test/EndToEnd/enum-to-floating.c",
+      "sha256": "701c84cc7d2009945b8a1587186e8ec23237ac1adfa60e47d0df40b201b57c35"
+    },
+    {
+      "path": "test/EndToEnd/enum-u32-enumerator-range.c",
+      "sha256": "32b0b3303ed186d83bc8630b72ca618df108a9520cff6f3065b0bf11bec8fb0a"
+    },
+    {
+      "path": "test/EndToEnd/enum-unsigned-object-relational.c",
+      "sha256": "91a2f3008e72d98ac6f5ff70f7bfc52dd401c9dfd43353836de94271256cfe56"
+    },
+    {
+      "path": "test/EndToEnd/enum-wide-array-index.c",
+      "sha256": "0884369ff3c6b254b8852fa500b7e2ca84692a76e0718681b5ff30115490e26f"
+    },
+    {
+      "path": "test/EndToEnd/enum-wide-underlying.c",
+      "sha256": "9ff61a455554fa1e9b1228ba1409b11b920cf86a5d4e61f0203620a0116b71b1"
+    },
+    {
+      "path": "test/EndToEnd/flexible-array-member-tail-local.c",
+      "sha256": "09f8c2341be976b26616ad73412ce10d09bf39f15484064509de5b00a3dc574f"
+    },
+    {
+      "path": "test/EndToEnd/flexible-array-nullable-return.c",
+      "sha256": "c84541a1b16ab6a9b1ebcdfbae177ac5df2257909c14d33314c77d01abb5ee1b"
+    },
+    {
+      "path": "test/EndToEnd/flexible-array-owned-member.c",
+      "sha256": "8273ea00c362321d861aeb4f4d02e2e30d702b0fa5a465d5e91c09b898031971"
+    },
+    {
+      "path": "test/EndToEnd/flexible-array-owned-tail.c",
+      "sha256": "9723e0ed0b17c2cd49b39d01f02946e2df37241e021fdb26826b11087ecf2486"
+    },
+    {
+      "path": "test/EndToEnd/flexible-array-owned-typed-tail.c",
+      "sha256": "a7fadf42d42bc5e5fe415d5f165e4a375cf2726d551688eaec226c7f32cfc3d0"
+    },
+    {
+      "path": "test/EndToEnd/float-literals.c",
+      "sha256": "5115ac4e0ffdc29e4265bc16c510671501343d31b61f3a28cec95580d9eae0cf"
+    },
+    {
+      "path": "test/EndToEnd/float-negation-signed-zero.c",
+      "sha256": "64eab1a44db904ff19c9d8198205add5a6ab3650b2ab3c1e731c71aae4dc6e22"
+    },
+    {
+      "path": "test/EndToEnd/float-negation.c",
+      "sha256": "7bb4475c47be1a6f23b47f25e8dc9262183b174b1e8051f64f5ecf998a167168"
+    },
+    {
+      "path": "test/EndToEnd/float-nonfinite.c",
+      "sha256": "12dbb51ea22e7962616414d790bfe7ac8a87fa3ce7f0c2b4f9d78a85e37382b3"
+    },
+    {
+      "path": "test/EndToEnd/float.c",
+      "sha256": "89149d68e4df0bee105d5329b24b447d54210a801f9475140943eef3e0615964"
+    },
+    {
+      "path": "test/EndToEnd/fn-pointers.c",
+      "sha256": "a751d46b92c65253f5445aa9610b350520d29e14f78febd913da65bf958019e5"
+    },
+    {
+      "path": "test/EndToEnd/fnptr-devirt.c",
+      "sha256": "c924ff578b1ae2cf3238bfec382b569a604ebf7d14ddecceef4c7addcb28cc5d"
+    },
+    {
+      "path": "test/EndToEnd/fnptr-eq.c",
+      "sha256": "9d479781d0882191da586379307ed74d48ccc1e4dc1ce07fd7f4cd19133760cd"
+    },
+    {
+      "path": "test/EndToEnd/fnptr-literal-unwrap.c",
+      "sha256": "c605299f83386ac9327ca2071eb3662e6e1a7d8490510c2eb481e29c81303072"
+    },
+    {
+      "path": "test/EndToEnd/fnptr-noproto-infer.c",
+      "sha256": "1077f1e4b160c95d3e05f31c23ed16ed58240058da98128d563a051529ced4d4"
+    },
+    {
+      "path": "test/EndToEnd/fnptr-slice-components.c",
+      "sha256": "0ff325d0326693900d15d294ed7edb752d224f4329111027cdb68dff702bc458"
+    },
+    {
+      "path": "test/EndToEnd/fnptr-struct-components.c",
+      "sha256": "be7ea4737879729492aa83c02fc298876c4088518b68c05be61d79d8ff84051a"
+    },
+    {
+      "path": "test/EndToEnd/fnptr-void-local.c",
+      "sha256": "37c09a8aeb053f0daab9b9bdbeec33fc80401e972e2d538d0c8a18acec6749b9"
+    },
+    {
+      "path": "test/EndToEnd/func-name.c",
+      "sha256": "5656da462402c4601a0200ce5bf07914a9b36b096c67b6dd125f9b84b3905fe5"
+    },
+    {
+      "path": "test/EndToEnd/global-in-owner-impl.c",
+      "sha256": "8e1704c49ef4d26038ca447fe80f507e52b60feec6c97d5ad7f77c7096abc4d7"
+    },
+    {
+      "path": "test/EndToEnd/globals-pointer-extern-redecl.c",
+      "sha256": "1e4d7f8eb20b2e77f29f6e9bccf26ba8642bc0ba22e03ceecbad8b1d2960a0cc"
+    },
+    {
+      "path": "test/EndToEnd/globals-string.c",
+      "sha256": "a18e75aa1a199688586ca33f4cd277fb9edc8c4c54cfb5851e197fb4f5cf9d1f"
+    },
+    {
+      "path": "test/EndToEnd/globals-writeback-order.c",
+      "sha256": "07669279c8126976d65ba98dfe7c34ba04795b80a8766c4710f44105a90b22be"
+    },
+    {
+      "path": "test/EndToEnd/globals.c",
+      "sha256": "0d064ed1a3991e9bf27aac96ddcc7aa2667ae8c8f3859be3a97bc1e0b3923119"
+    },
+    {
+      "path": "test/EndToEnd/goto-ladder-chain.c",
+      "sha256": "1ef43d21b8fd7f133cfcb3fe1e8edfbfe03fc2018b3f3c97f8baeab0fdedaee4"
+    },
+    {
+      "path": "test/EndToEnd/goto.c",
+      "sha256": "abcd12678f958c0fa5eba881b72e91f4483b11d48ffde09bc6488cab2e86887e"
+    },
+    {
+      "path": "test/EndToEnd/inline.c",
+      "sha256": "da93fff53aac3e68e1b47402ceebd1664c85b88aee59dc0c26a57e5eabb4052c"
+    },
+    {
+      "path": "test/EndToEnd/keyword-global-names.c",
+      "sha256": "adba97a7468cec7128e0f433176b909a1bd95f28557595dbf926d7827566752f"
+    },
+    {
+      "path": "test/EndToEnd/label-hoist-reinit.c",
+      "sha256": "c4ba87ef9460e7e06c945d50753d46cbf0063db9ed5a61d79015ca0f0c3d5ed3"
+    },
+    {
+      "path": "test/EndToEnd/late-init-merge.c",
+      "sha256": "067d8de23a5d970990803305bd422c4b7cd936e70df644fe09a59c2a03a704fa"
+    },
+    {
+      "path": "test/EndToEnd/late-init-moved-temp.cpp",
+      "sha256": "a797a0e8962bb7c95d049de777568e86a9f7222526a1b8c429cc2888443a79b5"
+    },
+    {
+      "path": "test/EndToEnd/lib-crate-external-caller.c",
+      "sha256": "976b548787f3f4155a23f7772d5d871f7273a10f602a34a699cbe9c24bf46fb7"
+    },
+    {
+      "path": "test/EndToEnd/lib-crate-externals-const-addr.c",
+      "sha256": "317fac36c9137f571821987c99296e286c6c19e563b4d79221988d8509b17f97"
+    },
+    {
+      "path": "test/EndToEnd/lib-crate-externals-const-byteregion.c",
+      "sha256": "2a73ed23ff590de224d0eb071fe82e5da1d9c047b2ebc32e2cee38d112e0a6c5"
+    },
+    {
+      "path": "test/EndToEnd/lib-crate-externals-const-struct.c",
+      "sha256": "864f7c594c9be2fa4f736f244a0d26468d34ea95ea661a3b77cdb0497a3f240a"
+    },
+    {
+      "path": "test/EndToEnd/lib-crate-externals-global.c",
+      "sha256": "2a869a6ddd7e8298f252f725bb279871c2ffea7ee5b12298ceff62b87f34a5ff"
+    },
+    {
+      "path": "test/EndToEnd/lib-crate-externals-nonconst-struct.c",
+      "sha256": "90a49df9ce5487043c6772a643866a18e4b04b77bbc4ab3ee6e8fb2049eb0fbf"
+    },
+    {
+      "path": "test/EndToEnd/lib-crate-externals-slice.c",
+      "sha256": "d29d2e6a94ae46c3db18c6d27f7f8e875af7a150bd1e6b79148043b01644faf5"
+    },
+    {
+      "path": "test/EndToEnd/lib-crate-externals-trait.c",
+      "sha256": "c00e9ddf3905b120174574e53768df834a1d142c057ef5ba4bdab31d5127f539"
+    },
+    {
+      "path": "test/EndToEnd/libc-subset.c",
+      "sha256": "10ebe6518d66fc613379dab874772793eb08c22739614b7946a1e02ab5c3ab70"
+    },
+    {
+      "path": "test/EndToEnd/linked-list.c",
+      "sha256": "a34abe70815d944d3854233a5c38550c01fd9811cc8ff45de2b970f0245aa61d"
+    },
+    {
+      "path": "test/EndToEnd/literal-scalar-mut-arg.c",
+      "sha256": "d47e6223ad53766d232b0b1ce90262a415707621c359ffbd10ee2dfc7442257d"
+    },
+    {
+      "path": "test/EndToEnd/loop-deferred-mut.c",
+      "sha256": "7f26947115364f98d5a5693c04f513af41a49d9f94d1c2f65d188cbfe87b6a9b"
+    },
+    {
+      "path": "test/EndToEnd/loop-escaping-place.c",
+      "sha256": "80526a2a48a1bb7fca843ccb4115335d391fea2451e74432e619b65622e5d24f"
+    },
+    {
+      "path": "test/EndToEnd/loops.c",
+      "sha256": "192949ab7ddeecfac2eae183d19eafe1b10965444e4d3ae3c437d50e408c799e"
+    },
+    {
+      "path": "test/EndToEnd/lostcopy-min.c",
+      "sha256": "178c4114cd0fbd337bbea7888b3df861179948a3e906df43475c24e7efee43ad"
+    },
+    {
+      "path": "test/EndToEnd/lostcopy-nested-branch.c",
+      "sha256": "b06dd467d38d20c0bbaadd62a3311654fa5bbd4f1aaf94b4c16c5a8026931f7e"
+    },
+    {
+      "path": "test/EndToEnd/lostcopy-rotations.c",
+      "sha256": "6dc4837c12f1891bd686d3e766ee3e29b521f86ce48cbf641c6ade1b43b205a5"
+    },
+    {
+      "path": "test/EndToEnd/malloc-region-slice-arg.c",
+      "sha256": "0e1fc6cf5b5565436237a733047287635becb6afdad16c5c05691121f967da5e"
+    },
+    {
+      "path": "test/EndToEnd/malloc-region-string-fn.c",
+      "sha256": "76adc79e2a7c1612bdde77ea39f1c084349b7258a2bc5973fac40dcc48e9340e"
+    },
+    {
+      "path": "test/EndToEnd/malloc-stack.c",
+      "sha256": "41d29f5164f510c2b07b88dd89793c9bd0cdc4282b7d0489e262edaf44923b25"
+    },
+    {
+      "path": "test/EndToEnd/malloc-string-fill.c",
+      "sha256": "6219e88013221c0f29b369d2899e49e3c11c2cbe8597a5be8414a3e10341beae"
+    },
+    {
+      "path": "test/EndToEnd/malloc-vec-fill.c",
+      "sha256": "6953ad502248e815c2f1d82ace9b5f1c13ef4ce59ba9598827ecf6a2b9e911d5"
+    },
+    {
+      "path": "test/EndToEnd/math-sin.c",
+      "sha256": "8e4e27c7463090b4851fee2944f7cb486c9d114d4b6bc3450c0c6aec59a5f91e"
+    },
+    {
+      "path": "test/EndToEnd/member-array-arg-decomposed.c",
+      "sha256": "3d3e3659078ed69b275419245f42fd98617eaf65bbb394a2fdeba056cb372c65"
+    },
+    {
+      "path": "test/EndToEnd/member-array-arg-offset.c",
+      "sha256": "54dc6b91605750c4476eaf892f41bb327de7398080e7b6e5b6f1824397f6d78d"
+    },
+    {
+      "path": "test/EndToEnd/member-array-arg.c",
+      "sha256": "c34d8b1aa7b9374221f99f5101036987b40a0b96f0844602697ffc7ea0e6168f"
+    },
+    {
+      "path": "test/EndToEnd/member-array-void-param.c",
+      "sha256": "c81eb5a00799544c95df60f06a77ebf68d05ee0342084ba2ece7eda8491ef750"
+    },
+    {
+      "path": "test/EndToEnd/member-struct-addr-arg.c",
+      "sha256": "98513a323c1b5aea256a2c146d4ed5a1b93ac8e764d057ef8471c1635ea67109"
+    },
+    {
+      "path": "test/EndToEnd/memset-typed-splat.c",
+      "sha256": "ed9a4d2edf170af76011da5add5dd1cb4bcca4b1e22baf03e13f64f25b6c8d5e"
+    },
+    {
+      "path": "test/EndToEnd/missing-return-expect-carrier.c",
+      "sha256": "1a3629c0fe3fe3291f5ecf8d3099b8876c2b8cbc3ab040efe4559af49c413d70"
+    },
+    {
+      "path": "test/EndToEnd/nonfinite.c",
+      "sha256": "84083e74899825d0e5b0d8b322782380dbeb210e2e955c3a7fe776a13770527a"
+    },
+    {
+      "path": "test/EndToEnd/nullable-slice-param.c",
+      "sha256": "38dc8b2973aded0b915cda7b1f5946b082cae1567cce1ae241fe83032aee04d3"
+    },
+    {
+      "path": "test/EndToEnd/owner-index-return.c",
+      "sha256": "745ddc173ae3b12922c942875180a4d8c1a30067380b875ceb3b1d97e5f8dc8a"
+    },
+    {
+      "path": "test/EndToEnd/owner-region-memcpy-alias.c",
+      "sha256": "a2d884c242772def05c8e6444639033153c7cfcd750c2c7af4e6f38e65acd11e"
+    },
+    {
+      "path": "test/EndToEnd/owners.c",
+      "sha256": "d0a9b124441d6961287e9142e1c69154629790aae0fef8670e173aabcb6e3dd7"
+    },
+    {
+      "path": "test/EndToEnd/param-cursor-return-nullable.c",
+      "sha256": "1110c9e8a3cc280bcdee476c0e28c34cb1b6b252f6f2995b30e29cb3656fbf20"
+    },
+    {
+      "path": "test/EndToEnd/param-cursor-return.c",
+      "sha256": "6dc8b428d37a0c42fc882339de1df3af7925bdadd4e78f393cac43805feb895a"
+    },
+    {
+      "path": "test/EndToEnd/percent-s-param.c",
+      "sha256": "ae54154d60478d8df2594381bfce295867da44cb56380b64fe0d5c1d08efa4ae"
+    },
+    {
+      "path": "test/EndToEnd/pointer-param-negative-index-owner.c",
+      "sha256": "767f9153a89ccae617a647f9b6d28d9f26dc8c6d9eecdbc03c6b2dfd93d84251"
+    },
+    {
+      "path": "test/EndToEnd/pointer-param-negative-index-slice.c",
+      "sha256": "14c8a68e97bb36ae1c4686e8951a90ec335cd7c227b7f200dfe73eb7124550ab"
+    },
+    {
+      "path": "test/EndToEnd/pointer-params.c",
+      "sha256": "3a4ad44a530fbe9329ee28c630e5f167e9b6f9a6d39a0772e915b8711ec1ae54"
+    },
+    {
+      "path": "test/EndToEnd/pointers-global-args.c",
+      "sha256": "1c3c58e46690fab60b968b67c6199cf1a78a2e5048fe08772be1e98456de63ba"
+    },
+    {
+      "path": "test/EndToEnd/pointers-global.c",
+      "sha256": "cb3a69f9179a2da490a1b8dab802f79cd72d35cb15bd14def36d522910f62ee5"
+    },
+    {
+      "path": "test/EndToEnd/pointers-into-global.c",
+      "sha256": "3932172a98e1d4327b4a6d5000bd34111b0a0b20a3d9aa6ba1165f764f4dba45"
+    },
+    {
+      "path": "test/EndToEnd/pointers-local.c",
+      "sha256": "423f80ab26bd9e445ea9ac74405715101e8b9f62671b4aa1e95b716b8c7f9fb8"
+    },
+    {
+      "path": "test/EndToEnd/pointers-member-array-local.c",
+      "sha256": "d7d7ba36832372500bc3ba876698969e85881ac9f577f5fdef16448702437eb4"
+    },
+    {
+      "path": "test/EndToEnd/pointers-member-array.c",
+      "sha256": "120400c9f4131479fd7e3b4051d4ce0a4695b84b2bf3f1cb6258b3bdf9800582"
+    },
+    {
+      "path": "test/EndToEnd/pointers-member-base.c",
+      "sha256": "f94c390baf860431fd817e57250b428177ce4f6738f98a2438d2cf7d4b5e5f8a"
+    },
+    {
+      "path": "test/EndToEnd/pointers-member.c",
+      "sha256": "5616cc102fe8bfa8a12a93fbc0a02eebbfa1f73d1b5586888b0cfcf41b7da02a"
+    },
+    {
+      "path": "test/EndToEnd/pointers-multi-base.c",
+      "sha256": "f0458946fd07e0353cf65fb55b43eb7a03bce327e77f8c39f99b8b89605f7eed"
+    },
+    {
+      "path": "test/EndToEnd/pointers-null-ternary.c",
+      "sha256": "1f877f73cc5ef9c7f90b62bee258abe28b1a78c4d53e7f47eec83aa28958e673"
+    },
+    {
+      "path": "test/EndToEnd/pointers-null.c",
+      "sha256": "57a444aa0abfe4d85a10cbe40f6c383a02fcd89feb2598d6462969e500056443"
+    },
+    {
+      "path": "test/EndToEnd/pointers-ptr-to-ptr.c",
+      "sha256": "2ef5859ad0aa264575b02d2e93027d8186641d576dc28ec80109b3a799f31482"
+    },
+    {
+      "path": "test/EndToEnd/pointers-reinterpret.c",
+      "sha256": "0fb018b90d884510ff2b6300b042f5f0185943030bc666d393e42bb69735effc"
+    },
+    {
+      "path": "test/EndToEnd/pointers-return-global.c",
+      "sha256": "ea859cd02ce025318d76c4aaad92df0db698275cd688d403fc68148c0249f978"
+    },
+    {
+      "path": "test/EndToEnd/pointers-void.c",
+      "sha256": "2dceb93ebd19f2beb8bec10316b7a61b55ee4d2d90ed3e98f49164ad33246e85"
+    },
+    {
+      "path": "test/EndToEnd/prelude-shadow-box.cpp",
+      "sha256": "d92a6b1908d225bb1c4c83a77a1d0b34864095500bfd956b5df89712f11543de"
+    },
+    {
+      "path": "test/EndToEnd/prelude-shadow-fnptr-local.c",
+      "sha256": "4a919fd34af63e8d5295872de5edf0295f7b2d328fdd68377b6f5122a65a9e31"
+    },
+    {
+      "path": "test/EndToEnd/prelude-shadow-option.c",
+      "sha256": "3b7f56d7a8b9a73546f66970fdd5cd96d199f77f4705347867dc1ec37b1437a7"
+    },
+    {
+      "path": "test/EndToEnd/prelude-shadow-string.c",
+      "sha256": "6c16dd86adce5c8aba9581658cefa97d7e7a3456b8b1358cebd532e569ae7895"
+    },
+    {
+      "path": "test/EndToEnd/prelude-shadow-vec.c",
+      "sha256": "561067479240cbdb6f2ba40e53a3dc543cb2ba18d15259ad5e247b817f261b37"
+    },
+    {
+      "path": "test/EndToEnd/preserve-c-names.c",
+      "sha256": "7398a6ca5c244d99c98379945a1a67e0c3d9b8b216c91eed5d307bc3fe42aa94"
+    },
+    {
+      "path": "test/EndToEnd/printf-char-bytes.c",
+      "sha256": "b459d0319c15bba3dc7f193995d62b90322c4c77b915b4dd319c7886de35694c"
+    },
+    {
+      "path": "test/EndToEnd/printf-empty-format.c",
+      "sha256": "cc4811fd3c9cef41c6541773893f3dc72ec5b7d88f77a83444649edceced39a5"
+    },
+    {
+      "path": "test/EndToEnd/printf-formats.c",
+      "sha256": "2f98ebe816397695975aa4386a8c4ab8bf4f7695b3d9a93b749e8497c080e380"
+    },
+    {
+      "path": "test/EndToEnd/printf-size-length.c",
+      "sha256": "cf1e10c968fb27eb9080bdbaf23efa77cf5658d1a7338357e054fab2a2507caf"
+    },
+    {
+      "path": "test/EndToEnd/printf-string-arg-write-order.c",
+      "sha256": "a5248d20ccb878ca1d6c47685e70e8372e0f76b0083a7646430677b4d28954d6"
+    },
+    {
+      "path": "test/EndToEnd/printf-string-nonascii.c",
+      "sha256": "83915ada0f55a8126d5e2a1f2539526cece5d166ac9a31c19c8b1088d8d0943f"
+    },
+    {
+      "path": "test/EndToEnd/printf-string-width-nonascii.c",
+      "sha256": "b3d225571c673f29f4f1bc721190349973a19b01969c985087cc772adf4c64d7"
+    },
+    {
+      "path": "test/EndToEnd/printf-user-defined-nonvariadic.c",
+      "sha256": "3d20d3a22565f52afb1a8e88d5567d4e485efae5e4947376f42cdfa2641ceeb1"
+    },
+    {
+      "path": "test/EndToEnd/printf-user-defined.c",
+      "sha256": "0c17d4cef2d1fec25ccaa046b3939996d58553405123f0a7b2c42d66cca270f2"
+    },
+    {
+      "path": "test/EndToEnd/putchar-cat-binary.c",
+      "sha256": "a3c5e3a9c8c6da79b417dcf233a5c0487236f9749358d536876163476004c2db"
+    },
+    {
+      "path": "test/EndToEnd/qualifiers.c",
+      "sha256": "37acabb2bdf1be221731e02807a45579715dbeb548d33a1a08019796150c8daa"
+    },
+    {
+      "path": "test/EndToEnd/range-for-aggregates.c",
+      "sha256": "b623621b3fc513d15cc9490ccb4ef68395c843077805c87f35b76c0d566e8bdf"
+    },
+    {
+      "path": "test/EndToEnd/range-for-assign-init.c",
+      "sha256": "5319f65f5da915139b8896a1a68f58a87adfe7b0c6b44f5d4057b5709bd67db6"
+    },
+    {
+      "path": "test/EndToEnd/range-for-bound-aliasing.c",
+      "sha256": "b5015d55f62e1a51bd2e45c15aeb76cb34bf6cd458503288b59498d77bce71b4"
+    },
+    {
+      "path": "test/EndToEnd/range-for-globals.c",
+      "sha256": "c98e6f150fdf21102d6ae1f472b33682ffec693edafa6689f919ca7e29de740c"
+    },
+    {
+      "path": "test/EndToEnd/range-for-if-body.c",
+      "sha256": "c0372f74fbe1b3bcebbcdd2fa1c707b41b5f580fc82aa01c4b156370cf3ed042"
+    },
+    {
+      "path": "test/EndToEnd/range-for-induction-type.c",
+      "sha256": "5567cb1461709e1b61497cdfa3ec9daa893ee13cc73821886e5d47afc024c6a3"
+    },
+    {
+      "path": "test/EndToEnd/range-for-nested-reuse.c",
+      "sha256": "8cdcdd9700e844d0fd957b83374ba8792f9641e0a8bc74b1c6025eebe5ec38cc"
+    },
+    {
+      "path": "test/EndToEnd/range-for-pointer-body.c",
+      "sha256": "fb8c26059ab84b1c13668e3980332da8319055af331a0d15dcfa5636a8584826"
+    },
+    {
+      "path": "test/EndToEnd/range-for-va-arg.c",
+      "sha256": "aa7e66d487f0cad648c66530910e3da30062aa286a8cd9b21b7b5e068559c398"
+    },
+    {
+      "path": "test/EndToEnd/range-for.c",
+      "sha256": "95081690f711c97762d01da85c7d3e2885faadc671157876c92030a1942e1045"
+    },
+    {
+      "path": "test/EndToEnd/recursion.c",
+      "sha256": "45eb9daad08a02cd93a73f3c68723b356e2aba1c0202b6da64a759ec934dd76c"
+    },
+    {
+      "path": "test/EndToEnd/scalar-out-param-forward-walked.c",
+      "sha256": "709a9d55efe8cfc7d55cceec81fce646a5e9ba98000281594f5b757f43ac5b1d"
+    },
+    {
+      "path": "test/EndToEnd/scalar-out-param-forward.c",
+      "sha256": "789341ad79553dbd5b9594005f092455c0aac2d10e46a37a1ca31b725b4a954e"
+    },
+    {
+      "path": "test/EndToEnd/shift-narrowing.c",
+      "sha256": "1616e4989731faaee01edda1e9ea4f7018484a4e97ae3e7fbf55976760e85914"
+    },
+    {
+      "path": "test/EndToEnd/snprintf.c",
+      "sha256": "1c2bee07d363e326e85c6c76337db30a7ed304e98e67f7d4b868cec28b035d9e"
+    },
+    {
+      "path": "test/EndToEnd/sprintf.c",
+      "sha256": "e760744776629a5fbc3f5abe2bec419cbc5fc06f52fbacd6422b79140704e872"
+    },
+    {
+      "path": "test/EndToEnd/static-underscore-helper.c",
+      "sha256": "a36ca7791999b533458de69b14610d3a7353c25bd5eba12fece840af1c3a126b"
+    },
+    {
+      "path": "test/EndToEnd/stdin-scan.c",
+      "sha256": "43ba31877f0611f4fc7e6f33567163e875faa4072ecb8429aa8cc3532c693c74"
+    },
+    {
+      "path": "test/EndToEnd/stdio-file-roundtrip.c",
+      "sha256": "0fd752b770a1e5944e0de7f60b463e5bf212427ae73dcdb6f541d6d3f1dd5d8b"
+    },
+    {
+      "path": "test/EndToEnd/stdio-include.c",
+      "sha256": "ccba0584c492ea454835d966bef4529379e2859b9b091b418e0f85589718e701"
+    },
+    {
+      "path": "test/EndToEnd/stl-array.cpp",
+      "sha256": "cb5ed5996d3f3ffb1b22f0054f5c8ac75f28fb4e5ff5d1a3684626dd4d44dbab"
+    },
+    {
+      "path": "test/EndToEnd/stl-lambda.cpp",
+      "sha256": "c0760d87539d8d31b1c1f2022c8be9e7465996cbb952dafdb355b4534dd99fdf"
+    },
+    {
+      "path": "test/EndToEnd/stl-map.cpp",
+      "sha256": "f62c9bef4ddf0aff33842a7c658daa20d3162266153cb0ea8b729c58803ee2d1"
+    },
+    {
+      "path": "test/EndToEnd/stl-methods.cpp",
+      "sha256": "c87e62a488364547f7bf850676710749d17d8f7a1fb369defd7605535d88bb27"
+    },
+    {
+      "path": "test/EndToEnd/stl-optional.cpp",
+      "sha256": "c1d384ec8f5d786445cb0a4e424581145b054c51729f65cd3a76cc1b56d2d93b"
+    },
+    {
+      "path": "test/EndToEnd/stl-pair.cpp",
+      "sha256": "1d32b109ca4dab724be477cd0a2675acc91914d60ddcd0b0e67e38cf917f6329"
+    },
+    {
+      "path": "test/EndToEnd/stl-ranged-for.cpp",
+      "sha256": "73ac9a244d42c3dcca6fcabd26a098c61d0ceef0917b4da6afcc69df10f23441"
+    },
+    {
+      "path": "test/EndToEnd/stl-string-self-append.cpp",
+      "sha256": "e1d95338264a480479d82890f185aa1a24f7939e0ff21e70889f9c0867b3c8cf"
+    },
+    {
+      "path": "test/EndToEnd/stl-string-view.cpp",
+      "sha256": "851da9c252e3d9f28bbb7924777506ab63c38f0b3ca1c9be7f398dbb1d488ae5"
+    },
+    {
+      "path": "test/EndToEnd/stl-string.cpp",
+      "sha256": "baf0e51bce3ff3ae11414166043872ca39dc903ecebac5ec3b16e3301f2f4e3c"
+    },
+    {
+      "path": "test/EndToEnd/stl-unique-ptr-deref-member.cpp",
+      "sha256": "14ae835365b8669d3a34651ba93bf25449bb88d16031a9fe10e8a623bed92a3e"
+    },
+    {
+      "path": "test/EndToEnd/stl-unique-ptr.cpp",
+      "sha256": "0188c477c37d7fafa01323835ab25c72c13d2840f9b7cf2c945a2e7cf423d75c"
+    },
+    {
+      "path": "test/EndToEnd/stl-variant.cpp",
+      "sha256": "1e8c350a8cc2a893c91090e488ab7aca4f066a95e7edbd542f1eba8cf19ded88"
+    },
+    {
+      "path": "test/EndToEnd/stl-vector-double.cpp",
+      "sha256": "225c9d7791d66a656c4118d10e644d7ad304d2a69269fc231b2dd66b119d1f79"
+    },
+    {
+      "path": "test/EndToEnd/stl-vector-element-member-write.cpp",
+      "sha256": "3c7527caa7bdb09b696e3a1cb0fac465895b438900e7e4b4aa4118fc3c12e8c0"
+    },
+    {
+      "path": "test/EndToEnd/stl-vector-struct.cpp",
+      "sha256": "a88209c4c73e4316d4c45bc6fe84453ed5514355502a3594aec93bdf511094f7"
+    },
+    {
+      "path": "test/EndToEnd/stl-vector.cpp",
+      "sha256": "a89c83a65b17f5339a69572ff1f157c6eb7e3dfe74df3f8f861c0802e6436892"
+    },
+    {
+      "path": "test/EndToEnd/stmt-expr.c",
+      "sha256": "c120653d95e250d48752dfb1e5a7c97be340366b52e4ea89e0dfd280ac215873"
+    },
+    {
+      "path": "test/EndToEnd/string-cursor.c",
+      "sha256": "397cc8d446e42c4176a5818b27817407f17ab52d65249e3925b040b15d9e5911"
+    },
+    {
+      "path": "test/EndToEnd/string-fn-member-region.c",
+      "sha256": "18cd3a9b8fbad933482bf25d248f632d2bc6cb20170beb3c490ee0f93ae282d6"
+    },
+    {
+      "path": "test/EndToEnd/string-fn-slice-param.c",
+      "sha256": "30b4c6e04273c8285fc09d1117eb78b37e0867e7200d224ae6734571a583b4c9"
+    },
+    {
+      "path": "test/EndToEnd/strings-exprs.c",
+      "sha256": "a808cc283958e557595454cb31a21ed2d65d3ec901186a99ae8de9c963573884"
+    },
+    {
+      "path": "test/EndToEnd/strings-hosted.c",
+      "sha256": "446d8a537bff5e39b516536d6a0277aa7f904561fe31a2b36436be8dded085c3"
+    },
+    {
+      "path": "test/EndToEnd/strings.c",
+      "sha256": "25661cbad83b24772be5d085eb43d98c79d27023fcd8d26ed9d110605a1d37fd"
+    },
+    {
+      "path": "test/EndToEnd/struct-copy-init.c",
+      "sha256": "caa36ab90cbdd8f799130537ace6afc6050b7bc81dc3a8df728e315e4cddb951"
+    },
+    {
+      "path": "test/EndToEnd/struct-long-arrays.c",
+      "sha256": "f69f5d77969e13fb4eed6430069c6a6a3def1b2294493ffd002c02a2e1b7792f"
+    },
+    {
+      "path": "test/EndToEnd/struct-tag-namespace.c",
+      "sha256": "57dd1eabc4b93aaf2f100e6ab8ae03e2d830cf1940086f5e48538cb39cd32b9b"
+    },
+    {
+      "path": "test/EndToEnd/structs-anon-member.c",
+      "sha256": "463a372fdc5725b143078159af923718c32f7490357143f4da1081b77e75a9cf"
+    },
+    {
+      "path": "test/EndToEnd/structs-anon.c",
+      "sha256": "bd4941ed57fa6a4f6d43acb589d3f98727d98a3b897214c6b199afdc69ce1de6"
+    },
+    {
+      "path": "test/EndToEnd/structs-nested.c",
+      "sha256": "b5d32f165cf8ba0d2ddadcd5f9531e897e52ed55e1886bbe6557685ad21d05fc"
+    },
+    {
+      "path": "test/EndToEnd/structs-shadow.c",
+      "sha256": "aac4476c520c58e052f88e3a6b5b26fb22f07aa412017b9697e9507f93d77a06"
+    },
+    {
+      "path": "test/EndToEnd/structs.c",
+      "sha256": "4180e9ae1158334cab366df517101a872fa70b407fa145c4d413847bf891014e"
+    },
+    {
+      "path": "test/EndToEnd/switch-case-int64-boundary.c",
+      "sha256": "c24314f4aec186e714e45f7e55e6d5e95cd37678711db7869955f941c2de3f91"
+    },
+    {
+      "path": "test/EndToEnd/switch-dispatch-chain.c",
+      "sha256": "004e01aa4b797fba37d464395b8eec665a3763c9f4d38cb339111a581c91ff4f"
+    },
+    {
+      "path": "test/EndToEnd/switch-dispatch.c",
+      "sha256": "b43f505fafaaff3688ac819474f6c4b72acacfc860845424c8a8fe94830c37d1"
+    },
+    {
+      "path": "test/EndToEnd/switch-enum.c",
+      "sha256": "4e07de222cab21298ca3040f7349a2926244021b5424beaa6e01e898b94f58f2"
+    },
+    {
+      "path": "test/EndToEnd/switch-fallthrough-ladder-scale.c",
+      "sha256": "c32b864edd60ce4a9e51b749fe3d09ee808dd52cd4056df9f4fa8bea6b24bf7d"
+    },
+    {
+      "path": "test/EndToEnd/switch-fallthrough-ladder.c",
+      "sha256": "526fb0c975f510cf4ec111a9f56ba3a064ed8a9e8adcebce7767889af7e83896"
+    },
+    {
+      "path": "test/EndToEnd/switch-general.c",
+      "sha256": "4111ddc92fbc62f2c7c93b971e1e29f49a0af75b3d385de92e486318f7b21b68"
+    },
+    {
+      "path": "test/EndToEnd/test-entry-main.c",
+      "sha256": "1426f05667b7a6b4f50d507068b24c5cb67de7b25f9118169f72055dc48ea698"
+    },
+    {
+      "path": "test/EndToEnd/union-find.c",
+      "sha256": "d6bd112d9de0230f11b0ad1625c1bec92472517a15275a5a63888a73650d9854"
+    },
+    {
+      "path": "test/EndToEnd/union-opaque-aggregate.c",
+      "sha256": "ac57d779a21d9490689655888397a0bb269d094c40e804d50fa59df7047b3b3a"
+    },
+    {
+      "path": "test/EndToEnd/union-opaque-anon-member.c",
+      "sha256": "61c4a7e4760319b51b62ba836c1f228c94c354f73c055c085023794fe18be675"
+    },
+    {
+      "path": "test/EndToEnd/union-opaque-arm-pun.c",
+      "sha256": "40b2c25f1bcc21807c3631b610f7ac9513ec20a801e3d8f4707d85cba893540a"
+    },
+    {
+      "path": "test/EndToEnd/unions.c",
+      "sha256": "786a608a13a29e43cbeb27e1063053267f197c81c85c2a4992a58ef3cca0cebb"
+    },
+    {
+      "path": "test/EndToEnd/unsigned.c",
+      "sha256": "8974960f36d4c28d4f03e916a0950fe13fe9ea14ec85c8704b75fb1fa0bff4d3"
+    },
+    {
+      "path": "test/EndToEnd/unused-assignment-allow.c",
+      "sha256": "c6c0f64336ba91a67f1f9ed7e190fd75b813002016e7555b9f803815580382dc"
+    },
+    {
+      "path": "test/EndToEnd/value-exprs.c",
+      "sha256": "8d506d8b22eaf4825850f082affb190c800088ed1588265755ffddf25ffc30ac"
+    },
+    {
+      "path": "test/EndToEnd/varargs-def.c",
+      "sha256": "69687313f5f77cc2ad46b013e48e80261e83649c7073ea89588f8268a7595971"
+    },
+    {
+      "path": "test/EndToEnd/varargs-fold-clone-names.c",
+      "sha256": "e05f2fead28f000d77080b11ea33d00b8b3058bde1028555309386138c8d1534"
+    },
+    {
+      "path": "test/EndToEnd/varargs-monomorph.c",
+      "sha256": "3165dc3cf555052a9d3c9ca83f39511f9f44e385cb4344f268029df27a2c96b9"
+    },
+    {
+      "path": "test/EndToEnd/void-cast.c",
+      "sha256": "e725b246e3e8c430c1e4df3b69de01e7a6db0f407a2ffbb3274a3d9d5cc68641"
+    },
+    {
+      "path": "test/EndToEnd/void-param-byte.c",
+      "sha256": "8d8c7f367e01703bac931d06b4335aacf8b978df40218a8754e9cc93b9ef32e4"
+    }
+  ]
+}

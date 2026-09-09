@@ -1175,21 +1175,33 @@ private:
   /// side as the function's tail expression.
   bool tailFoldActive = false;
 
-  /// FR-61b: deferred bindings (`deferredInits` members that need no `mut`)
-  /// rendered as `let x: T = if c { .. } else { .. };` -- the mapped
-  /// `emitrust.if` immediately follows the binding, both its arms end with
-  /// the binding's only two assignments, and each arm's final assignment
-  /// becomes the arm's tail expression. Populated per function by
-  /// `computeIfExprBindings`.
-  DenseMap<Operation *, emitrust::IfOp> ifExprBindings;
+  /// FR-61b, generalised by FR-215: deferred bindings (`deferredInits`
+  /// members that need no `mut`) rendered as
+  /// `let x: T = if c { .. } else { .. };` or
+  /// `let x: T = match d { 0 => { .. } _ => { .. } };`. The mapped COND OP is
+  /// an `emitrust.if` with an else region or an `emitrust.switch` (whose
+  /// default region is mandatory, so the emitted `match` is exhaustive); it
+  /// follows the binding in the same block with only ops that cannot observe
+  /// it in between; every arm either ends with one of the binding's only
+  /// assignments -- which becomes that arm's tail expression -- or, for an
+  /// `emitrust.if` only, DIVERGES. Populated per function by
+  /// `computeCondExprBindings`.
+  DenseMap<Operation *, Operation *> condExprBindings;
 
-  /// FR-61b: the `emitrust.if` ops consumed into an if-expression binding;
-  /// the normal statement walk skips them.
-  llvm::SmallPtrSet<Operation *, 8> consumedIfs;
+  /// Reverse map: consumed cond op -> its deferred declaration. The
+  /// declaration renders nothing at its own program point (it only claims its
+  /// name, keeping v-numbering stable); the COND OP renders the whole
+  /// `let x: T = <cond-expression>;` in its own place, which is what lets the
+  /// declaration sink past a gap.
+  DenseMap<Operation *, Operation *> condExprOwner;
 
-  /// Fills `ifExprBindings`/`consumedIfs` from the `deferredInits` already
-  /// computed for the current function.
-  void computeIfExprBindings();
+  /// Fills `condExprBindings`/`condExprOwner` from the `deferredInits`
+  /// already computed for the current function.
+  void computeCondExprBindings();
+
+  /// FR-215: the SUNK gap scan -- the cond op that follows `declOp` in the
+  /// same block with only ops that cannot observe `binding` in between.
+  Operation *findCondExprOp(Operation *declOp, Value binding);
 
   // --- FR-63 (clippy::field_reassign_with_default): default + field-store
   //     fusion into a functional-update struct literal ---
@@ -1236,7 +1248,7 @@ private:
   DenseMap<Operation *, Operation *> lateInitOwner;
 
   /// Fills `lateInitMerges`/`lateInitOwner`. Must run LAST -- after
-  /// `computeIfExprBindings` (FR-61b keeps priority), `computeDroppedOps`,
+  /// `computeCondExprBindings` (FR-61b keeps priority), `computeDroppedOps`,
   /// `computeInlineCandidates`, `computeDeadStores` and
   /// `computeFieldInitFuses` -- because the gap scan asks which ops render.
   void computeLateInitMerges(emitrust::FuncOp funcOp);
@@ -1408,10 +1420,16 @@ private:
   /// Whether infix `op`'s right operand renders as bare trailing-cast text.
   bool rhsEndsInCast(Operation *op, Prec rank);
 
-  /// FR-61b: emits `let <name>: <type> = if <cond> {` .. `} else {` .. `};`
-  /// for the deferred binding `op` consumed together with `ifOp`.
-  LogicalResult emitIfExprBinding(Operation *op, Value result, Type valueType,
-                                  emitrust::IfOp ifOp);
+  /// FR-61b/FR-215: emits `let <name>: <type> = if <cond> {` .. `} else {` ..
+  /// `};` (or the `match` form) at `condOp`'s own program point, for the
+  /// deferred declaration `condExprOwner` maps it back to.
+  LogicalResult emitCondExprBinding(Operation *condOp);
+
+  /// FR-215: prints one `emitrust.switch` case pattern -- the raw 64-bit case
+  /// value interpreted in the discriminator's Rust type -- shared by the
+  /// statement `match` and the match-expression binding so the two spellings
+  /// can never drift.
+  void emitSwitchCasePattern(Type discriminatorType, int64_t value);
 
   /// FR-61b: emits one arm of an if-expression binding: every statement
   /// except the final assignment to `binding`, whose right-hand side is
@@ -1443,6 +1461,9 @@ private:
 
 /// Whether `op` renders as a diverging Rust expression (defined below).
 static bool opDiverges(Operation *op);
+
+/// Whether `op` or anything nested in its regions uses `v` as an operand.
+static bool opTouchesValue(Operation *op, Value v);
 
 /// Whether `op` is a place-refining projection (`v.x`, `v[i]`, `*p`, `v.0`).
 /// Projections emit nothing at their program point; their read/write is
@@ -2657,33 +2678,130 @@ static Operation *armTailAssign(Region &region, Value binding) {
   return last && isBindingWrite(last, binding) ? last : nullptr;
 }
 
-void RustEmitter::computeIfExprBindings() {
+/// FR-215: whether `region` is an arm that DIVERGES without ever writing
+/// `binding` -- its last emitted op is a `panic!`/`return`/`break`/`continue`.
+/// Rust types such a block `!`, which coerces to the binding's type (probed
+/// against rustc over every shape this emitter produces before the fold was
+/// admitted), so the arm contributes no value and needs none.
+static bool armDivergesWithoutWriting(Region &region, Value binding) {
+  if (region.empty() || !region.hasOneBlock())
+    return false;
+  Operation *last = nullptr;
+  for (Operation &op : region.front()) {
+    if (isa<emitrust::YieldOp>(op))
+      continue;
+    last = &op;
+    if (opDiverges(&op))
+      break;
+  }
+  return last && opDiverges(last) && !isBindingWrite(last, binding);
+}
+
+/// FR-215: the SUNK gap scan. Returns the `emitrust.if`/`emitrust.switch`
+/// that follows `declOp` in the same block with only ops that provably cannot
+/// observe `binding` in between, or null.
+///
+/// The relaxation from FR-61b's `getNextNode()` is what makes the corpus shape
+/// visible at all: an inlined `emitrust.cmp` (`if argc > 1`) or an inlined
+/// cast chain (a switch discriminator) sits between the declaration and the
+/// cond op in the IR while rendering NOTHING. But the gap is scanned, never
+/// skipped -- the rule is FR-132's, verbatim, because the question is
+/// identical (a declaration that emits no code, sunk past statements that
+/// cannot observe it, is inert):
+///   * any MENTION of the binding refuses -- a read, a projection, or a write
+///     nested in a region op -- even one that renders nothing;
+///   * a diverging gap op refuses: nothing after it renders;
+///   * DROP ORDER. Rust drops in reverse DECLARATION order, so sinking a
+///     may-drop declaration past another may-drop value flips two destructors
+///     and BOTH orderings compile clean. This scan runs before
+///     `computeDroppedOps`/`computeInlineCandidates`, so it cannot ask which
+///     gap ops render; it therefore asks the question of EVERY gap result,
+///     which is strictly the conservative direction.
+Operation *RustEmitter::findCondExprOp(Operation *declOp, Value binding) {
+  bool bindingMayDrop = typeMayDrop(binding.getType());
+  for (Operation *cur = declOp->getNextNode(); cur; cur = cur->getNextNode()) {
+    if (isa<emitrust::IfOp, emitrust::SwitchOp>(cur))
+      return opTouchesValue(cur, binding) ? cur : nullptr;
+    if (opTouchesValue(cur, binding))
+      return nullptr;
+    if (opDiverges(cur))
+      return nullptr;
+    if (bindingMayDrop)
+      for (Value res : cur->getResults())
+        if (typeMayDrop(res.getType()))
+          return nullptr;
+  }
+  return nullptr;
+}
+
+void RustEmitter::computeCondExprBindings() {
   for (auto [op, needsMut] : deferredInits) {
     // A deferred binding that still needs `mut` is assigned more than once
-    // per path or mutated after init -- not the both-arms-assign-once shape.
+    // per path or mutated after init -- not the arms-assign-once shape.
     if (needsMut)
       continue;
-    auto ifOp = dyn_cast_or_null<emitrust::IfOp>(op->getNextNode());
-    if (!ifOp || ifOp.getElseRegion().empty())
-      continue;
     Value binding = op->getResult(0);
-    Operation *thenAssign = armTailAssign(ifOp.getThenRegion(), binding);
-    Operation *elseAssign = armTailAssign(ifOp.getElseRegion(), binding);
-    if (!thenAssign || !elseAssign)
+    Operation *condOp = findCondExprOp(op, binding);
+    if (!condOp)
       continue;
-    // The two arm-final assignments must be the binding's only assignments
-    // in the whole function; any other write keeps the statement form.
+    // The arms. An `emitrust.if` without an else is not exhaustive: the
+    // fall-through path leaves the binding uninitialized and there is no arm
+    // to give it a value. An `emitrust.switch`'s default region is MANDATORY
+    // (ODS `SizedRegion<1>`), which is exactly what makes the emitted `match`
+    // exhaustive and this fold sound.
+    SmallVector<Region *, 8> arms;
+    if (auto ifOp = dyn_cast<emitrust::IfOp>(condOp)) {
+      if (ifOp.getElseRegion().empty())
+        continue;
+      arms.push_back(&ifOp.getThenRegion());
+      arms.push_back(&ifOp.getElseRegion());
+    } else {
+      auto switchOp = cast<emitrust::SwitchOp>(condOp);
+      for (Region &caseRegion : switchOp.getCaseRegions())
+        arms.push_back(&caseRegion);
+      arms.push_back(&switchOp.getDefaultRegion());
+    }
+    // Every arm must tail-assign the binding. A DIVERGING arm is admitted for
+    // `emitrust.if` only, and only as the OTHER arm: `let x: T = if c { v }
+    // else { panic!(..) };` is the varargs-monomorph shape and its `!` block
+    // coerces, but a diverging `emitrust.switch` arm is a `break`/`return`
+    // ladder rung, out of scope, and refuses.
+    bool allowDiverging = isa<emitrust::IfOp>(condOp);
+    SmallPtrSet<Operation *, 8> armAssigns;
+    bool shaped = true;
+    for (Region *arm : arms) {
+      if (Operation *assign = armTailAssign(*arm, binding)) {
+        armAssigns.insert(assign);
+        continue;
+      }
+      if (allowDiverging && armDivergesWithoutWriting(*arm, binding))
+        continue;
+      shaped = false;
+      break;
+    }
+    // At least one arm must produce the value; all-diverging leaves the
+    // binding genuinely uninitialized (rustc's own E0381 -- the safe
+    // direction) and there is nothing to bind.
+    if (!shaped || armAssigns.empty())
+      continue;
+    // The arm-final assignments must be the binding's only assignments in the
+    // whole function; any other write keeps the statement form.
     bool onlyAssignments = true;
     for (Operation *user : binding.getUsers())
-      if (isBindingWrite(user, binding) && user != thenAssign &&
-          user != elseAssign) {
+      if (isBindingWrite(user, binding) && !armAssigns.contains(user)) {
         onlyAssignments = false;
         break;
       }
     if (!onlyAssignments)
       continue;
-    ifExprBindings[op] = ifOp;
-    consumedIfs.insert(ifOp.getOperation());
+    // One cond op can own at most one binding -- every arm's LAST emitted op
+    // is unique, so two bindings cannot both be every arm's tail assignment.
+    // `deferredInits` is a DenseMap with no stable iteration order, so this is
+    // asserted rather than assumed: silently keeping whichever entry came
+    // last would make the emitted bytes depend on pointer hashing.
+    if (!condExprOwner.insert({condOp, op}).second)
+      continue;
+    condExprBindings[op] = condOp;
   }
 }
 
@@ -3466,7 +3584,6 @@ void RustEmitter::computeFieldInitFuses(emitrust::FuncOp funcOp) {
   });
 }
 
-/// Whether `op` or anything nested in its regions uses `v` as an operand.
 static bool opTouchesValue(Operation *op, Value v) {
   bool found = false;
   op->walk([&](Operation *nested) {
@@ -3627,7 +3744,7 @@ void RustEmitter::computeLateInitMerges(emitrust::FuncOp funcOp) {
       return;
     // FR-61b keeps priority: an if-expression binding already folds both
     // program points, and into a strictly better rendering.
-    if (ifExprBindings.count(op))
+    if (condExprBindings.count(op))
       return;
     // A declaration that renders nothing (or renders as the function's tail)
     // has no two points to merge.
@@ -3724,7 +3841,7 @@ void RustEmitter::computeUnwrappedFnPtrs(emitrust::FuncOp funcOp) {
       return;
     Operation *declOp = variableOp.getOperation();
     if (!deferredInits.count(declOp) || unreachableOps.count(declOp) ||
-        droppedOps.count(declOp) || ifExprBindings.count(declOp))
+        droppedOps.count(declOp) || condExprBindings.count(declOp))
       return;
     emitrust::ConstantOp init;
     SmallVector<Value> loadResults;
@@ -6031,8 +6148,8 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   valueReadCache.clear();
   deferredInits.clear();
   deadStores.clear();
-  ifExprBindings.clear();
-  consumedIfs.clear();
+  condExprBindings.clear();
+  condExprOwner.clear();
   tailReturn = nullptr;
   tailFoldCandidate = nullptr;
   pendingTailFold = false;
@@ -6059,7 +6176,7 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   computeUnreachable(body.front());
   computeDeadStores(body.front());
   computeDeferredInits(body.front());
-  computeIfExprBindings();
+  computeCondExprBindings();
   // FR-190: decided on the IR shape alone, so its position among the other
   // per-function passes is free -- but it must precede emission, and it is
   // placed before the drop/inline passes so that anything later which asks
@@ -6090,15 +6207,22 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
       if (def && def == finalReturn->getPrevNode() && returned.hasOneUse() &&
           def->getNumResults() == 1 && isTailFoldableProducer(def)) {
         tailFoldCandidate = def;
-      } else if (def && ifExprBindings.count(def)) {
-        // FR-61d slice 3: an if-expression binding whose consumed `if`
-        // immediately precedes the tail return, and whose only READ is
-        // that return (its other uses are exactly the two arm assignments
-        // the if-expression rendering consumes), folds too: the function
-        // body ends in the bare if-expression.
-        emitrust::IfOp ifOp = ifExprBindings.lookup(def);
-        if (def->getNextNode() == ifOp.getOperation() &&
-            ifOp->getNextNode() == finalReturn) {
+      } else if (def && condExprBindings.count(def)) {
+        // FR-61d slice 3 (FR-215: `emitrust.switch` too): a cond-expression
+        // binding whose consumed `if`/`switch` immediately precedes the tail
+        // return, and whose only READ is that return (its other uses are
+        // exactly the arm assignments the cond-expression rendering
+        // consumes), folds too: the function body ends in the bare
+        // if-/match-expression.
+        //
+        // WITHOUT THIS the switch fold merely TRADES `needless_late_init` for
+        // `clippy::let_and_return` -- the corpus shape is
+        // `let v9: i32; match .. { .. } v9`. The candidate is the COND OP,
+        // not the declaration, because that is where the expression renders
+        // (the declaration is sunk and renders nothing); the declaration
+        // therefore no longer has to be adjacent to it.
+        Operation *condOp = condExprBindings.lookup(def);
+        if (condOp->getNextNode() == finalReturn) {
           bool returnIsOnlyRead = true;
           for (OpOperand &use : returned.getUses()) {
             Operation *owner = use.getOwner();
@@ -6110,7 +6234,7 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
             }
           }
           if (returnIsOnlyRead)
-            tailFoldCandidate = def;
+            tailFoldCandidate = condOp;
         }
       }
     }
@@ -6125,7 +6249,7 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   computeFieldInitFuses(funcOp);
   // FR-132 (clippy::needless_late_init): LAST -- the gap scan asks which ops
   // render, so every set that silences an op must already be populated, and
-  // `ifExprBindings` must already have claimed the bindings it folds better.
+  // `condExprBindings` must already have claimed the bindings it folds better.
   computeLateInitMerges(funcOp);
   // FR-133: after every set that decides how a binding renders -- the
   // candidate must be a DEFERRED declaration, and its initializing store must
@@ -6666,11 +6790,19 @@ LogicalResult RustEmitter::emitEnumVariant(emitrust::EnumVariantOp variantOp) {
 
 LogicalResult RustEmitter::emitDeferredBinding(Operation *op, Value result,
                                                Type type) {
-  // FR-61b: a deferred binding whose immediately following `if` assigns it
-  // exactly once at the end of both arms renders as an if-expression binding
-  // instead of the `let x: T;` + statement-`if` pair.
-  if (auto ifOp = ifExprBindings.lookup(op))
-    return emitIfExprBinding(op, result, type, ifOp);
+  // FR-61b/FR-215: a deferred binding whose following `if`/`switch` assigns
+  // it exactly once at the end of every arm renders as a cond-expression
+  // binding instead of the `let x: T;` + statement pair. The DECLARATION
+  // renders nothing here -- the cond op renders the whole `let` in its own
+  // place, which is what lets the declaration sink past a gap. The name is
+  // still claimed so v-numbering stays stable, with FR-140's note suppressed
+  // when the binding is tail-folded and therefore never spelled at all.
+  if (Operation *condOp = condExprBindings.lookup(op)) {
+    llvm::SaveAndRestore<bool> notes(noteBoundNames,
+                                     condOp != tailFoldCandidate);
+    assignName(result);
+    return success();
+  }
   // FR-132: the declaration of a merged binding renders NOTHING -- its
   // initializing assign renders the whole `let`. The name is assigned
   // unconditionally so v-numbering stays stable even when the binding folds
@@ -6689,17 +6821,21 @@ LogicalResult RustEmitter::emitDeferredBinding(Operation *op, Value result,
   return success();
 }
 
-LogicalResult RustEmitter::emitIfExprBinding(Operation *op, Value result,
-                                             Type valueType,
-                                             emitrust::IfOp ifOp) {
-  (void)op;
-  // The name is assigned unconditionally so v-numbering stays stable even
-  // when the binding folds away. FR-140: when it does fold away it never
-  // renders, so it must not pull an `#[allow(non_snake_case)]` onto the fn.
+LogicalResult RustEmitter::emitCondExprBinding(Operation *condOp) {
+  Operation *declOp = condExprOwner.lookup(condOp);
+  assert(declOp && "a consumed cond op must map back to its declaration");
+  Value result = declOp->getResult(0);
+  Type valueType = result.getType();
+  if (auto lvalueType = dyn_cast<emitrust::LValueType>(valueType))
+    valueType = lvalueType.getValueType();
+  // The name was already claimed at the declaration (keeping v-numbering
+  // stable); `assignName` is idempotent, so this is a lookup. FR-140: when
+  // the binding folds away entirely it never renders, so it must not pull an
+  // `#[allow(non_snake_case)]` onto the fn.
   llvm::SaveAndRestore<bool> notes(noteBoundNames, !pendingTailFold);
   std::string name = assignName(result);
   // FR-61d slice 3: when this binding is the tail-fold candidate the `let`
-  // prefix never renders -- the if-expression itself becomes the
+  // prefix never renders -- the cond-expression itself becomes the
   // function's tail (the statement's trailing `;` is erased by the tail
   // return, exactly like the FR-61a fold).
   if (pendingTailFold) {
@@ -6711,16 +6847,46 @@ LogicalResult RustEmitter::emitIfExprBinding(Operation *op, Value result,
       return failure();
     os << " = ";
   }
-  os << "if ";
-  if (failed(emitOperand(ifOp.getLoc(), ifOp.getCondition(),
+  if (auto ifOp = dyn_cast<emitrust::IfOp>(condOp)) {
+    os << "if ";
+    if (failed(emitOperand(ifOp.getLoc(), ifOp.getCondition(),
+                           ExprPos::cond())))
+      return failure();
+    os << " {\n";
+    if (failed(emitArmBodyWithTail(ifOp.getThenRegion(), result)))
+      return failure();
+    os << "} else {\n";
+    if (failed(emitArmBodyWithTail(ifOp.getElseRegion(), result)))
+      return failure();
+    os << "};\n";
+    return success();
+  }
+  // FR-215: the `match` form. The skeleton, the case patterns and the arm
+  // order are exactly `emitSwitch`'s (the pattern printing is literally
+  // shared, so the two spellings cannot drift); only the arm BODIES differ,
+  // each ending in its tail-assignment's right-hand side instead of the
+  // assignment statement.
+  auto switchOp = cast<emitrust::SwitchOp>(condOp);
+  os << "match ";
+  if (failed(emitOperand(switchOp.getLoc(), switchOp.getDiscriminator(),
                          ExprPos::cond())))
     return failure();
   os << " {\n";
-  if (failed(emitArmBodyWithTail(ifOp.getThenRegion(), result)))
+  increaseIndent();
+  Type discriminatorType = switchOp.getDiscriminator().getType();
+  for (auto [value, region] :
+       llvm::zip(switchOp.getCases(), switchOp.getCaseRegions())) {
+    emitSwitchCasePattern(discriminatorType, value);
+    os << " => {\n";
+    if (failed(emitArmBodyWithTail(region, result)))
+      return failure();
+    os << "}\n";
+  }
+  os << "_ => {\n";
+  if (failed(emitArmBodyWithTail(switchOp.getDefaultRegion(), result)))
     return failure();
-  os << "} else {\n";
-  if (failed(emitArmBodyWithTail(ifOp.getElseRegion(), result)))
-    return failure();
+  os << "}\n";
+  decreaseIndent();
   os << "};\n";
   return success();
 }
@@ -6728,7 +6894,7 @@ LogicalResult RustEmitter::emitIfExprBinding(Operation *op, Value result,
 LogicalResult RustEmitter::emitArmBodyWithTail(Region &region, Value binding) {
   increaseIndent();
   for (Operation &op : region.front()) {
-    // The arm's final assignment (its only one, per `computeIfExprBindings`):
+    // The arm's final assignment (its only one, per `computeCondExprBindings`):
     // its right-hand side is the arm's tail expression.
     if (isBindingWrite(&op, binding)) {
       auto assign = cast<emitrust::AssignOp>(&op);
@@ -7493,9 +7659,11 @@ LogicalResult RustEmitter::emitSelect(emitrust::SelectOp selectOp) {
 LogicalResult RustEmitter::emitIf(emitrust::IfOp ifOp) {
   Operation *op = ifOp.getOperation();
   // FR-61b: an `if` consumed into an if-expression binding was already
-  // rendered by `emitIfExprBinding`.
-  if (consumedIfs.count(op))
-    return success();
+  // rendered as a cond-expression binding: `emitCondExprBinding` prints the
+  // whole `let x: T = if .. {} else {};` HERE, at the `if`'s own program
+  // point, and the declaration above rendered nothing.
+  if (condExprOwner.count(op))
+    return emitCondExprBinding(op);
   os << "if ";
   if (failed(emitOperand(op->getLoc(), op->getOperand(0), ExprPos::cond())))
     return failure();
@@ -7624,8 +7792,33 @@ LogicalResult RustEmitter::emitWhile(emitrust::WhileOp whileOp) {
   return success();
 }
 
+/// The cases attribute stores the raw 64-bit case pattern; render it
+/// interpreted in the discriminator's Rust type so the literal arm compares
+/// equal at runtime. A usize (index) or unsigned discriminator prints the low
+/// bits as unsigned decimal (a C `case -1:` on `long` reaches a usize
+/// scrutinee as the bit pattern 2^64 - 1); a signed iN discriminator prints
+/// the sign-interpreted value of its width.
+void RustEmitter::emitSwitchCasePattern(Type discriminatorType, int64_t value) {
+  if (isa<IndexType>(discriminatorType)) {
+    os << static_cast<uint64_t>(value);
+    return;
+  }
+  auto intType = cast<IntegerType>(discriminatorType);
+  unsigned width = intType.getWidth();
+  if (intType.isUnsigned())
+    os << (static_cast<uint64_t>(value) &
+           llvm::maskTrailingOnes<uint64_t>(width));
+  else
+    os << llvm::SignExtend64(value, width);
+}
+
 LogicalResult RustEmitter::emitSwitch(emitrust::SwitchOp switchOp) {
   Operation *op = switchOp.getOperation();
+  // FR-215: a `switch` consumed into a match-expression binding renders the
+  // whole `let x: T = match .. {};` HERE, at its own program point (the
+  // declaration above rendered nothing).
+  if (condExprOwner.count(op))
+    return emitCondExprBinding(op);
   os << "match ";
   if (failed(emitOperand(op->getLoc(), switchOp.getDiscriminator(),
                          ExprPos::cond())))
@@ -7635,23 +7828,7 @@ LogicalResult RustEmitter::emitSwitch(emitrust::SwitchOp switchOp) {
   Type discriminatorType = switchOp.getDiscriminator().getType();
   for (auto [value, region] :
        llvm::zip(switchOp.getCases(), switchOp.getCaseRegions())) {
-    // The cases attribute stores the raw 64-bit case pattern; render it
-    // interpreted in the discriminator's Rust type so the literal arm
-    // compares equal at runtime. A usize (index) or unsigned discriminator
-    // prints the low bits as unsigned decimal (a C `case -1:` on `long`
-    // reaches a usize scrutinee as the bit pattern 2^64 - 1); a signed iN
-    // discriminator prints the sign-interpreted value of its width.
-    if (isa<IndexType>(discriminatorType)) {
-      os << static_cast<uint64_t>(value);
-    } else {
-      auto intType = cast<IntegerType>(discriminatorType);
-      unsigned width = intType.getWidth();
-      if (intType.isUnsigned())
-        os << (static_cast<uint64_t>(value) &
-               llvm::maskTrailingOnes<uint64_t>(width));
-      else
-        os << llvm::SignExtend64(value, width);
-    }
+    emitSwitchCasePattern(discriminatorType, value);
     os << " => {\n";
     if (failed(emitRegionBody(op, region)))
       return failure();

@@ -13577,6 +13577,74 @@ piece and becomes FR-45.
   storage, conversion, passing and printing. A real 80-bit type is not
   available -- Rust has no `f80`.
 
+- [x] FR-216 (opened and LANDED 2026-09-09; implements FR-213's
+  recommendation): **THE 46 LATE-INIT MERGES LAND, EPOCH-6 CLOSES, AND THE
+  EPOCH BOUNDARY IMMEDIATELY EXPOSED A DISTORTION IN THE NEW BINDING METRIC.**
+  FR-213 classified all 60 `needless_late_init` instances, landed 9, and
+  established that **46 of the remaining 51 were sound and blocked only by the
+  epoch-6 freeze** -- each needed a `CHECK` block edited in a pinned corpus
+  source, which would make `assert_comparable(6)` fail and leave no clippy
+  number reportable at all. The owner pre-authorised an epoch-7 freeze.
+  IMPLEMENTED: FR-61b's if-expression fold generalised to `emitrust.switch`
+  (SWITCH-EXPR), plus FR-61b's `op->getNextNode()` adjacency test replaced by
+  FR-132's SCOPE rule -- a gap of statements that cannot observe the binding
+  no longer blocks the fold -- which is what makes IF-EXPR-SUNK reachable and
+  IF-EXPR-DIVERGE with it. The FR-61d-slice-3 tail fold was applied alongside,
+  and it earned its place: **`clippy::let_and_return` does not appear in the
+  epoch-7 tally at all**, so the lint was not merely traded.
+  `needless_late_init` **51 -> 7**. (Populations differ across the epoch
+  boundary -- 268 vs 294 files -- so that is a direction, not a trajectory.)
+  **THREE PINNED ENDTOEND TESTS WERE EDITED, and one of them is a genuine
+  invariant relocation rather than a re-spelling.**
+  `late-init-merge.c` and `fnptr-literal-unwrap.c` are the two FR-213 named.
+  The third, `deferred-mut-slice-index.c`, was NOT anticipated: its `switch`
+  leg existed on the explicit reasoning that *"the if-expression lift only
+  ever fires on an `if`, so the two-program-point rendering survives, which
+  makes this arm the isolated pin on the `mut` decision itself"*. **This
+  increment makes that reasoning false by design.** The FR-142 `mut` invariant
+  was therefore MOVED, not dropped, to
+  `test/Target/Rust/deferred-mut-slice-index.mlir` `@index_two_point_mut`,
+  which pins the two-program-point spelling byte-for-byte (`let v4: i64;`,
+  never `let mut v4: i64;`) and stays two-point **because its first arm
+  DIVERGES, which the fold refuses outright** -- so it is a stable home rather
+  than one more shape a later fold will absorb. All three of that test's
+  runtime byte-diffs passed throughout; only the text leg moved.
+  **THE EPOCH BOUNDARY IMMEDIATELY CAUGHT A DISTORTION IN FR-214'S METRIC, and
+  this is the part worth carrying forward.** Frozen naively, epoch-7's binding
+  numbers were nonsense: statements 16,343 -> 47,654 (2.9x, for a 10% file
+  increase), `depth_max` 12 -> 67, `free_per_100_stmts` 11.83 -> 4.88. Cause,
+  measured: FR-207's and FR-211's chain tests emit **14,770 and 15,893 lines**
+  -- 30,663 of 47,654 statements, **64% of the population from 2 of 296
+  files** -- and the depth-67 statement is literally the generated scrutinee
+  ladder `((((((sel * 2i32 + 1i32) * 2i32 + 2i32) ...` at `main.rs:14742`.
+  They are measurable and belong in the CLIPPY epoch, but they are
+  machine-generated stress inputs pinning a compiler BOUND, not specimens of
+  emitted style. A binding-only exclusion (`binding-exclude.txt`, with the bar
+  for adding one: machine-generated at a bound; a large HAND-WRITTEN test
+  stays in) restores the metric -- `depth_max` back to 12, p95 back to 5,
+  ratio 11.71 against epoch-6's 11.83. **FR-214 said the metric wanted a few
+  waves of stability before gating; this was the instability, and it appeared
+  in the first wave.**
+  **THE EPOCH FREEZE ALSO CAUGHT TWO UNMEASURABLE FILES the first time round.**
+  `fn-symbol-collision-fnptr.c` and `fn-symbol-collision-recover.c` pin a
+  LOCATED REJECTION for an FR-195 name collision, so `--emit=crate`
+  deliberately produces nothing and step (a) of the measurability criterion
+  fails by design. The population guard refused to ratchet (294 linted, 2
+  skipped) rather than quietly reporting a number over a population it could
+  not vouch for; epoch-7 was re-frozen with both excluded, and now reports
+  **294 files, 0 skipped**.
+  Epoch-6 CLOSED with its reason naming all three edited files.
+  **All THREE consumers were repointed together** -- `clippy_eval.py`'s
+  `DEFAULT_BASELINE`, `signals.py`'s `DEFAULT_CLIPPY`, `controller.py`'s
+  `CLIPPY_BASELINE` -- because the code's own warning is that if they diverge,
+  the controller `--update`s and COMMITS a file the ratchet never reads.
+  Gate **1027/1027**; clippy pinned at **57** over 294 crates, 0 skipped;
+  binding pinned at free_temps 2307 / depth p95 5 over 292; both corpus
+  ratchets unmoved; TRACTOR **41/252**; `assert_comparable(7)` OK.
+  NOT A TRAJECTORY across the boundary: epoch-6's 93 over 268 files and
+  epoch-7's 57 over 294 are different populations, and epoch-6's baseline
+  document stays byte-untouched as history.
+
 - [x] FR-215 (opened and SPIKED 2026-09-09; FR-174's top-ranked sub-item):
   **`pointer type outside a parameter position` IS NOT A MECHANISM, THE
   AMPLIFICATION THAT EARNED IT THE #1 RANK IS NOT WHERE FR-174 THOUGHT, AND

@@ -133,8 +133,18 @@ int may_be_none(int seed) {
 // SCOPE DECISION: all-literal assignment on both arms is a REASSIGNMENT by
 // this FR's rule and stays wrapped. Admitting it would need definite-
 // assignment reasoning this rendering fold does not have.
+//
+// FR-215 MOVED THE SPELLING, NOT THE DECISION. The declaration used to render
+// as a bare `let cp: Option<..>;` with the `if` as a statement below it;
+// FR-215's sunk cond-expression fold now binds `cp` at the `if` itself (the
+// gap was the inlined `emitrust.cmp` for `seed > 4`). Every load-bearing part
+// of this leg is unchanged and still checked: `cp`'s TYPE is still
+// `Option<fn(i32) -> i32>`, both arms still construct a literal `Some(..)`,
+// and the call still goes through `.expect("null function pointer")`. If
+// FR-133 ever over-relaxed and dropped the wrapper, the type on the `let` and
+// the `.expect` would both disappear and this leg fails exactly as before.
 // CHECK-LABEL: fn multi_arm
-// CHECK-NEXT:    let cp: Option<fn(i32) -> i32>;
+// CHECK-NEXT:    let cp: Option<fn(i32) -> i32> = if
 // CHECK:         let v2: Option<fn(i32) -> i32> = Some(addk);
 // CHECK:         let v3: Option<fn(i32) -> i32> = Some(subk);
 // CHECK:         cp.expect("null function pointer")(seed)
