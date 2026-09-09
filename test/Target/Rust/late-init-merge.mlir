@@ -290,11 +290,18 @@ emitrust.func @if_expr_priority(%arg0: i1, %arg1: i32, %arg2: i32) -> i32 {
 // are live... in the emitted Rust they are moved, but the gate must not depend
 // on that). Merging `a` would emit `b`'s declaration first and flip the two
 // destructors. Both orderings compile clean, so only this pin catches it.
+//
+// `b` DOES merge, and that is the narrowing (see
+// late-init-merge-moved-temp.mlir): `b`'s own gap holds only `%mb`, whose one
+// and only use is `b`'s initializing write, so it runs no destructor at scope
+// end in either ordering. `a`'s gap holds `b` -- a may-drop DECLARATION that
+// is still owning at `a`'s write -- and `%mb`, whose use is `b`'s write and
+// not `a`'s. `a` therefore still refuses, and that refusal is what this leg
+// exists to pin.
 // CHECK-LABEL: fn drop_order(v0: i32) {
 // CHECK-NEXT:    let a: L;
-// CHECK-NEXT:    let b: L;
 // CHECK-NEXT:    let v1: L = mk(v0);
-// CHECK-NEXT:    b = v1;
+// CHECK-NEXT:    let b: L = v1;
 // CHECK-NEXT:    let v2: L = mk(v0);
 // CHECK-NEXT:    a = v2;
 // CHECK-NEXT:    sink(a, b);

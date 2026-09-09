@@ -90,8 +90,12 @@ emitrust.func @fold_borrows() {
 // `*n = ..` on an immutable binding (rustc E0596). The same op is what keeps
 // `bindingIsBorrowed` true, holding a Drop-carrying Box out of loop-body
 // dead-store elision.
+// (The declaration renders MERGED onto its initializing write -- `Box::new`'s
+// result is a gap value whose one and only use is that write, so FR-132's
+// drop-order gate admits it. The `mut` is what this leg pins, and it is still
+// on the binding.)
 // CHECK-LABEL: fn fold_keeps_mut(
-// CHECK:         let mut m: Box<i32>;
+// CHECK:         let mut m: Box<i32> = {{v[0-9]+}};
 // CHECK-NOT:     DerefMut::deref_mut
 // CHECK:         *m = {{.*}};
 emitrust.func @fold_keeps_mut(%arg0: i32) {

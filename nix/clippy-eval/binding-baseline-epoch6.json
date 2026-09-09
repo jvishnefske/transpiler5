@@ -1,0 +1,373 @@
+{
+  "epoch_id": 6,
+  "corpus": "test/EndToEnd",
+  "corpus_roots": [
+    "test/EndToEnd"
+  ],
+  "extensions": [
+    ".c",
+    ".cpp"
+  ],
+  "corpus_hash": "sha256:5e1c3576c3377f0892e068ec4be3d30ee1dc6fb1ab5dd33d72f993a2ac1671f5",
+  "_comment": "Binding-hygiene baseline. TWO AXES, PARETO, NEVER SUMMED: axis A is free_per_100_stmts, axis B is depth_p95/depth_max. Pinned to the SAME epoch-6 population as clippy-baseline-epoch6.json so the two idiomatic-output metrics are paired over one sample. NOT wired into the meson gate yet.",
+  "emitter_rev": "20d9a1700a80791004dddae8a0a1581640f8727c",
+  "crates_measured": 268,
+  "crates_skipped": 0,
+  "parse_errors": 0,
+  "statements": 16343,
+  "free_temps": 1934,
+  "free_per_100_stmts": 11.8338,
+  "single_use_next_stmt": 2213,
+  "single_use_per_100_stmts": 13.541,
+  "generated_lets": 4699,
+  "unread_generated_lets": 70,
+  "rejected": {
+    "blocked_effectful_prefix": 7,
+    "blocked_panicking_prefix": 7,
+    "blocked_place": 65,
+    "blocked_unordered": 20,
+    "blocked_maybe_drop": 106,
+    "skipped_shadowed": 0,
+    "skipped_inline_fmt": 0,
+    "skipped_mut": 74
+  },
+  "depth_p95": 5,
+  "depth_max": 12,
+  "depth_mean": 2.4959,
+  "depth_hist": {
+    "1": 3548,
+    "2": 6569,
+    "3": 3014,
+    "4": 1538,
+    "5": 1326,
+    "6": 247,
+    "7": 48,
+    "8": 30,
+    "9": 14,
+    "10": 4,
+    "11": 4,
+    "12": 1
+  },
+  "worst_crates": [
+    {
+      "file": "test/EndToEnd/stl-map.cpp",
+      "statements": 216,
+      "free_temps": 71,
+      "single_use_next_stmt": 85,
+      "generated_lets": 127,
+      "depth_max": 5
+    },
+    {
+      "file": "test/EndToEnd/stl-unique-ptr.cpp",
+      "statements": 177,
+      "free_temps": 64,
+      "single_use_next_stmt": 64,
+      "generated_lets": 71,
+      "depth_max": 5
+    },
+    {
+      "file": "test/EndToEnd/libc-subset.c",
+      "statements": 213,
+      "free_temps": 57,
+      "single_use_next_stmt": 64,
+      "generated_lets": 107,
+      "depth_max": 6
+    },
+    {
+      "file": "test/EndToEnd/strings-hosted.c",
+      "statements": 245,
+      "free_temps": 45,
+      "single_use_next_stmt": 48,
+      "generated_lets": 110,
+      "depth_max": 6
+    },
+    {
+      "file": "test/EndToEnd/cpp-references.cpp",
+      "statements": 146,
+      "free_temps": 33,
+      "single_use_next_stmt": 35,
+      "generated_lets": 57,
+      "depth_max": 4
+    },
+    {
+      "file": "test/EndToEnd/fnptr-literal-unwrap.c",
+      "statements": 79,
+      "free_temps": 29,
+      "single_use_next_stmt": 32,
+      "generated_lets": 33,
+      "depth_max": 5
+    },
+    {
+      "file": "test/EndToEnd/loop-escaping-place.c",
+      "statements": 217,
+      "free_temps": 29,
+      "single_use_next_stmt": 45,
+      "generated_lets": 82,
+      "depth_max": 6
+    },
+    {
+      "file": "test/EndToEnd/union-opaque-arm-pun.c",
+      "statements": 132,
+      "free_temps": 27,
+      "single_use_next_stmt": 28,
+      "generated_lets": 50,
+      "depth_max": 7
+    },
+    {
+      "file": "test/EndToEnd/pointers-into-global.c",
+      "statements": 91,
+      "free_temps": 26,
+      "single_use_next_stmt": 27,
+      "generated_lets": 49,
+      "depth_max": 5
+    },
+    {
+      "file": "test/EndToEnd/ctype-classifiers.c",
+      "statements": 136,
+      "free_temps": 25,
+      "single_use_next_stmt": 25,
+      "generated_lets": 41,
+      "depth_max": 7
+    },
+    {
+      "file": "test/EndToEnd/flexible-array-nullable-return.c",
+      "statements": 118,
+      "free_temps": 25,
+      "single_use_next_stmt": 29,
+      "generated_lets": 41,
+      "depth_max": 6
+    },
+    {
+      "file": "test/EndToEnd/fn-pointers.c",
+      "statements": 74,
+      "free_temps": 24,
+      "single_use_next_stmt": 32,
+      "generated_lets": 33,
+      "depth_max": 6
+    },
+    {
+      "file": "test/EndToEnd/byte-region-member-window.c",
+      "statements": 137,
+      "free_temps": 22,
+      "single_use_next_stmt": 29,
+      "generated_lets": 59,
+      "depth_max": 12
+    },
+    {
+      "file": "test/EndToEnd/member-struct-addr-arg.c",
+      "statements": 118,
+      "free_temps": 22,
+      "single_use_next_stmt": 22,
+      "generated_lets": 42,
+      "depth_max": 8
+    },
+    {
+      "file": "test/EndToEnd/range-for-if-body.c",
+      "statements": 221,
+      "free_temps": 22,
+      "single_use_next_stmt": 22,
+      "generated_lets": 62,
+      "depth_max": 5
+    },
+    {
+      "file": "test/EndToEnd/malloc-region-slice-arg.c",
+      "statements": 86,
+      "free_temps": 21,
+      "single_use_next_stmt": 24,
+      "generated_lets": 35,
+      "depth_max": 8
+    },
+    {
+      "file": "test/EndToEnd/varargs-monomorph.c",
+      "statements": 409,
+      "free_temps": 21,
+      "single_use_next_stmt": 37,
+      "generated_lets": 170,
+      "depth_max": 6
+    },
+    {
+      "file": "test/EndToEnd/stdio-file-roundtrip.c",
+      "statements": 139,
+      "free_temps": 20,
+      "single_use_next_stmt": 20,
+      "generated_lets": 38,
+      "depth_max": 7
+    },
+    {
+      "file": "test/EndToEnd/array-params.c",
+      "statements": 48,
+      "free_temps": 19,
+      "single_use_next_stmt": 19,
+      "generated_lets": 19,
+      "depth_max": 5
+    },
+    {
+      "file": "test/EndToEnd/sprintf.c",
+      "statements": 65,
+      "free_temps": 19,
+      "single_use_next_stmt": 25,
+      "generated_lets": 35,
+      "depth_max": 6
+    },
+    {
+      "file": "test/EndToEnd/unused-assignment-allow.c",
+      "statements": 147,
+      "free_temps": 19,
+      "single_use_next_stmt": 19,
+      "generated_lets": 59,
+      "depth_max": 6
+    },
+    {
+      "file": "test/EndToEnd/stl-string.cpp",
+      "statements": 46,
+      "free_temps": 18,
+      "single_use_next_stmt": 18,
+      "generated_lets": 20,
+      "depth_max": 3
+    },
+    {
+      "file": "test/EndToEnd/string-fn-slice-param.c",
+      "statements": 81,
+      "free_temps": 18,
+      "single_use_next_stmt": 18,
+      "generated_lets": 36,
+      "depth_max": 5
+    },
+    {
+      "file": "test/EndToEnd/flexible-array-member-tail-local.c",
+      "statements": 116,
+      "free_temps": 17,
+      "single_use_next_stmt": 19,
+      "generated_lets": 41,
+      "depth_max": 10
+    },
+    {
+      "file": "test/EndToEnd/math-sin.c",
+      "statements": 41,
+      "free_temps": 17,
+      "single_use_next_stmt": 17,
+      "generated_lets": 23,
+      "depth_max": 4
+    },
+    {
+      "file": "test/EndToEnd/pointers-member-array.c",
+      "statements": 111,
+      "free_temps": 17,
+      "single_use_next_stmt": 27,
+      "generated_lets": 42,
+      "depth_max": 6
+    },
+    {
+      "file": "test/EndToEnd/unsigned.c",
+      "statements": 175,
+      "free_temps": 17,
+      "single_use_next_stmt": 17,
+      "generated_lets": 48,
+      "depth_max": 5
+    },
+    {
+      "file": "test/EndToEnd/aggregate-init.c",
+      "statements": 117,
+      "free_temps": 16,
+      "single_use_next_stmt": 30,
+      "generated_lets": 46,
+      "depth_max": 5
+    },
+    {
+      "file": "test/EndToEnd/malloc-region-string-fn.c",
+      "statements": 122,
+      "free_temps": 16,
+      "single_use_next_stmt": 16,
+      "generated_lets": 38,
+      "depth_max": 6
+    },
+    {
+      "file": "test/EndToEnd/pointers-global-args.c",
+      "statements": 115,
+      "free_temps": 16,
+      "single_use_next_stmt": 21,
+      "generated_lets": 39,
+      "depth_max": 6
+    },
+    {
+      "file": "test/EndToEnd/cpp-operator-free.cpp",
+      "statements": 44,
+      "free_temps": 15,
+      "single_use_next_stmt": 19,
+      "generated_lets": 23,
+      "depth_max": 5
+    },
+    {
+      "file": "test/EndToEnd/cpp-operator-friend.cpp",
+      "statements": 45,
+      "free_temps": 15,
+      "single_use_next_stmt": 18,
+      "generated_lets": 25,
+      "depth_max": 5
+    },
+    {
+      "file": "test/EndToEnd/flexible-array-owned-member.c",
+      "statements": 86,
+      "free_temps": 15,
+      "single_use_next_stmt": 16,
+      "generated_lets": 33,
+      "depth_max": 8
+    },
+    {
+      "file": "test/EndToEnd/printf-formats.c",
+      "statements": 344,
+      "free_temps": 15,
+      "single_use_next_stmt": 15,
+      "generated_lets": 120,
+      "depth_max": 6
+    },
+    {
+      "file": "test/EndToEnd/range-for-induction-type.c",
+      "statements": 154,
+      "free_temps": 15,
+      "single_use_next_stmt": 15,
+      "generated_lets": 36,
+      "depth_max": 5
+    },
+    {
+      "file": "test/EndToEnd/shift-narrowing.c",
+      "statements": 94,
+      "free_temps": 15,
+      "single_use_next_stmt": 15,
+      "generated_lets": 32,
+      "depth_max": 5
+    },
+    {
+      "file": "test/EndToEnd/deferred-mut-slice-index.c",
+      "statements": 72,
+      "free_temps": 14,
+      "single_use_next_stmt": 14,
+      "generated_lets": 23,
+      "depth_max": 8
+    },
+    {
+      "file": "test/EndToEnd/enum-array-index.c",
+      "statements": 69,
+      "free_temps": 14,
+      "single_use_next_stmt": 15,
+      "generated_lets": 33,
+      "depth_max": 6
+    },
+    {
+      "file": "test/EndToEnd/float-literals.c",
+      "statements": 36,
+      "free_temps": 14,
+      "single_use_next_stmt": 14,
+      "generated_lets": 14,
+      "depth_max": 3
+    },
+    {
+      "file": "test/EndToEnd/pointer-params.c",
+      "statements": 45,
+      "free_temps": 14,
+      "single_use_next_stmt": 14,
+      "generated_lets": 20,
+      "depth_max": 5
+    }
+  ]
+}

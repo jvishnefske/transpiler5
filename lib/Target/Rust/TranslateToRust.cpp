@@ -3575,6 +3575,49 @@ void RustEmitter::computeBoxDerefFolds(emitrust::FuncOp funcOp) {
   });
 }
 
+/// FR-132's drop-order gate, NARROWED: whether a may-drop value declared in
+/// the gap has no destructor left to reorder, because the merging assignment
+/// `mergeAssign` is its ONE and only use.
+///
+/// The gate exists because the merge SINKS the binding's declaration past the
+/// gap, and Rust drops in reverse declaration order: sinking past another
+/// value that still owns at scope end swaps two destructors, and both
+/// orderings compile clean. But the value the gap most often holds is the
+/// merged value ITSELF (`let v: T = f(); .. x = v;`), and for that one the
+/// swap is provably unobservable -- WITHOUT any move analysis, because the
+/// two possible readings agree:
+///   * `Copy` type: Rust forbids `Copy` and `Drop` on the same type, so there
+///     is no destructor at all. (`typeMayDrop` is deliberately WIDER than
+///     `has_drop` -- it answers true for every opaque owner and every data
+///     enum, including `Copy` ones such as `Option<i32>` -- so this leg is
+///     load-bearing, not hypothetical.)
+///   * non-`Copy` type: the assignment renders as a bare use of the value, so
+///     it MOVES; the value's scope-end drop is already a no-op in the
+///     unmerged spelling too.
+/// Either way the value runs no destructor at the enclosing scope's end, in
+/// EITHER ordering, so its position relative to the sunk declaration cannot
+/// be observed.
+///
+/// The rule is "the single use IS the merging assign", not "the value has a
+/// single use": a gap value consumed only AFTER the write is still owning at
+/// the write, and sinking past it would genuinely flip a destructor pair. A
+/// CHAIN (`%a` feeds `%b` feeds the assign) refuses for the same reason --
+/// deciding whether the intermediate callee takes its argument by value or by
+/// reference IS the move analysis this fold does not have. Both refusals are
+/// pinned in test/Target/Rust/late-init-merge-moved-temp.mlir, and the chain
+/// one is live on real C++ (`std::make_unique<Node>`).
+static bool gapValueIsConsumedByMerge(Value res, Operation *mergeAssign) {
+  if (!res.hasOneUse())
+    return false;
+  OpOperand &use = *res.getUses().begin();
+  if (use.getOwner() != mergeAssign)
+    return false;
+  // The assigned VALUE, not the assigned place: a value reaching the place
+  // operand is a borrow of somewhere else and is not consumed here.
+  auto assign = dyn_cast<emitrust::AssignOp>(mergeAssign);
+  return assign && assign.getValue() == res;
+}
+
 /// FR-132: find, for each deferred binding, the assignment that may render its
 /// whole `let`. The gate is SCOPE, not adjacency -- intervening statements that
 /// cannot observe the binding are the common case.
@@ -3618,7 +3661,8 @@ void RustEmitter::computeLateInitMerges(emitrust::FuncOp funcOp) {
                 droppedOps.count(gap))
               continue;
             for (Value res : gap->getResults())
-              if (typeMayDrop(res.getType()))
+              if (typeMayDrop(res.getType()) &&
+                  !gapValueIsConsumedByMerge(res, cur))
                 return;
           }
         }

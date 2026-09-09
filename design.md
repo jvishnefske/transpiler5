@@ -13577,6 +13577,130 @@ piece and becomes FR-45.
   storage, conversion, passing and printing. A real 80-bit type is not
   available -- Rust has no `f80`.
 
+- [x] FR-213 (opened and LANDED 2026-09-09): **CLIPPY 101 -> 93 VIA A
+  NARROWED DROP-ORDER GATE; AND 46 OF THE REMAINING 51 ARE SOUND BUT BLOCKED
+  BY THE EPOCH-6 FREEZE, NOT BY ANALYSIS.**
+  `clippy::needless_late_init` was **60 of 101 warnings -- 59% of the entire
+  debt**. All 60 were classified before anything was changed, into four
+  disjoint classes:
+   - **SWITCH-EXPR (32)** -- decl immediately precedes an `emitrust.switch`
+     whose every arm (including the mandatory default) tail-assigns the
+     binding once. **Sound to merge.**
+   - **IF-EXPR-DIVERGE (8)** -- one arm tail-assigns, the other diverges
+     (`panic!`); all in `varargs-monomorph.c`. **Sound.**
+   - **IF-EXPR-SUNK (6)** -- both arms tail-assign but the `IfOp` is not
+     `getNextNode()` because an inlined `emitrust.cmp` sits between.
+     **Sound.**
+   - **DROP-GAP (14)** -- FR-132's drop-order gate refused. 11 sound, 3 not.
+  **THE 46 SOUND ONES ARE BLOCKED BY A TEST-FREEZE, NOT BY SOUNDNESS.** Each
+  of the three blocked classes needs exactly one `CHECK` block updated in an
+  EPOCH-6-PINNED corpus source (`late-init-merge.c:112-114`, FR-132's
+  deliberate `region_write` refusal pin; and `fnptr-literal-unwrap.c:136-139`,
+  FR-133's `multi_arm` scope pin). Editing either makes
+  `epoch.assert_comparable(6)` fail, `clippy_eval.py` exits 2, and **no clippy
+  number can be reported at all**. IF-EXPR-DIVERGE is additionally gated on
+  IF-EXPR-SUNK, since in all 8 the condition is an inlined `emitrust.cmp`.
+  Recorded rather than forced: unlocking them is an epoch-7 freeze plus the
+  FR-61b if-expression fold generalised to `emitrust.switch`, with the
+  FR-61d-slice-3 tail fold so it does not trade this lint for
+  `clippy::let_and_return`.
+  WHAT LANDED: `gapValueIsConsumedByMerge()` narrows FR-132's gate on a proof
+  that needs **no move analysis and no liveness** -- a gap value whose ONE AND
+  ONLY use is the merging assignment runs no destructor at scope end in either
+  ordering, because a `Copy` type cannot also be `Drop`, and a non-`Copy` one
+  is MOVED by the assignment so its scope-end drop was already a no-op. The
+  rule is deliberately "the single use **is** the merging assign", not "has a
+  single use": a value consumed AFTER the write is still owning at the write.
+  **FIVE CASES REFUSED AS UNSOUND, and the reasons are worth keeping.**
+  `compound-literals.c:62` is not the drop gate at all -- `emitrust.member`
+  projections of the binding sit in the gap, so FR-132's "any mention
+  refuses" correctly fires. `cpp-copy-ctor.cpp:72`'s gap declares a live
+  droppy local, so merging would swap two destructors. And
+  `stl-string.cpp:4,27` plus `flexible-array-nullable-return.c:163` are
+  **chains** (`&'static str -> String::from -> s`), where only the LAST link's
+  use is the merging assign; admitting earlier links needs to know whether the
+  intermediate callee takes its argument by value or by reference -- a move
+  analysis this fold does not have, with `println!`/`print!` a live
+  counterexample to "a value operand is always a move". `std::make_unique<T>`
+  lowers to exactly that chain, so the refusal is exercised on real C++.
+  ONE LINT ROSE AND IT IS THE GOOD DIRECTION: `unnecessary_literal_unwrap`
+  2 -> 3 at `stl-optional.cpp`. **Verified at the source rather than
+  accepted**: the merged `let o: Option<i32> = v15;` lets clippy const-trace
+  `v15 = None` into the later `o.unwrap_or(...)`, which the two-point form
+  hid from it. The code did not get worse -- the linter can see further.
+  GOLDEN MOVEMENT: 21 files, **every one a shrink**, with the unified diff of
+  each read by hand -- every hunk exactly `let X: T;` + `X = vN;` becoming
+  `let [mut] X: T = vN;`, zero `vNN` renumbering, zero non-fold hunks -- and
+  all 21 re-verified by their OWN byte-diff rather than re-blessed.
+  Return-code changes 0; 32 files rejected by both sides were correctly NOT
+  counted as moved (the discriminator FR-207 got wrong).
+  ANTI-GOODHART: train -6, held-out -2. Both slices improved, so the gain is
+  not a fit to the measured half.
+  Gate 1025/1025; **clippy 101 -> 93 (-8)**, re-pinned in place at epoch-6
+  (population unchanged at 268 files, same `corpus_hash`, so this is a ratchet
+  tightening and NOT a new epoch); both corpus ratchets unmoved; TRACTOR
+  41/252.
+
+- [x] FR-214 (opened and LANDED 2026-09-09): **A BINDING-HYGIENE METRIC FOR
+  THE EMITTED RUST -- TWO PARETO AXES, AND THE FIRST THING IT MEASURED WAS ITS
+  OWN GOODHART TRAP.**
+  Clippy measures lint-cleanliness and says almost nothing about the most
+  obvious tell that no human wrote this code: chains of single-use SSA
+  temporaries. `nix/clippy-eval/binding_eval.py` plus a `syn`-based Rust probe
+  measures two axes over the same epoch-6 population, deliberately shaped like
+  `clippy_eval.py` and IMPORTING its `is_pinned`/`pinned_population` so the
+  two tools cannot drift on what "the same population" means.
+  **AXIS A -- free temporaries.** A binding counts only when it is
+  generated-named, has exactly one use, that use is in the next statement, and
+  **inlining crosses no side effect**. That last condition is the load-bearing
+  one -- a temporary that cannot be inlined without crossing a side effect is
+  not noise, it is evaluation order -- and it mirrors FR-192's
+  `laterArgSideEffects`. **Measured honestly, it rejects only 14 of 2213
+  candidates (0.63%)**, because the emitter already emits about one effect per
+  statement. It is a correctness guard on the DEFINITION, not a volume filter,
+  and it will start to bite exactly when someone begins fusing statements.
+  **A CONDITION THE SPEC DID NOT ASK FOR, added because the metric would
+  otherwise have rewarded a behaviour change:** a use that is a method
+  receiver, field base or index base does NOT move the value, so inlining
+  pulls its drop from end-of-block to end-of-statement -- observable for a
+  side-effecting `Drop`. It now requires the `let`'s own annotation to prove
+  no `Drop` is possible. Cost 106 sites (2040 -> 1934).
+  **AXIS B -- expression nesting depth**, the anti-cramming guard. p95 5,
+  max 12, mean 2.50.
+  **VALIDATED BY THE PROJECT'S OWN TOP ORACLE, not by inspection**: every
+  flagged binding was mechanically inlined across all 232 crates that have
+  any, both copies built, and stdout/stderr/exit byte-diffed under three argv
+  vectors -- **221/221 runnable crates IDENTICAL, 1895 bindings inlined, zero
+  divergences**. Two apparent divergences on the first pass were the ORACLE's
+  fault: Rust's panic header embeds the OS thread id, which varies run to run.
+  Worth knowing for anyone diffing stderr from a panicking emitted crate.
+  **TWO RATCHET INPUTS WERE DEMOTED TO REPORTED-ONLY, both for measured
+  reasons.**
+   - `depth_max` is a SINGLE-STATEMENT statistic, so as a gate it is a
+     tripwire any unrelated edit flips -- and its outliers are
+     compound-assignment expansion and bitfield masking, i.e. it is not
+     measuring the cramming axis B exists to prevent.
+   - **`free_per_100_stmts` is the Goodhart trap, and FR-213 sprang it the
+     same day.** FR-213 merged 30 `let x; x = v;` pairs, leaving `free_temps`
+     at EXACTLY 1934 and dropping statements 16373 -> 16343 -- so the RATIO
+     rose 11.8121 -> 11.8338 and the ratchet fired on a change that improved
+     the code and did not touch binding hygiene at all. **Removing a good
+     statement must never read as debt.** Axis A now ratchets the ABSOLUTE
+     count, which is sound precisely because the epoch freezes the population
+     -- and is what `clippy_eval` already does with `total_warnings`. The
+     ratio stays reported, since it is the number that carries meaning ACROSS
+     epochs where populations differ.
+  Ratchet behaviour verified per input: lowering `free_temps` fires, lowering
+  `depth_p95` fires independently (so the Pareto rule works), and lowering
+  either reported-only field does not.
+  Baseline pinned at epoch-6: **free_temps 1934, depth p95 5** (reported:
+  11.8338 per 100 stmts, 16343 statements, depth max 12, 268 crates).
+  DELIBERATELY NOT WIRED INTO THE MESON GATE -- the numbers want a few waves
+  of stability first.
+  NOT SEEN by the probe, all failing toward NOT counting: a C local literally
+  spelled `v3`, non-conforming macro bodies, inline format args (0 at
+  baseline), and anything needing type resolution.
+
 - [x] FR-212 (opened and SPIKED 2026-09-08; found by the FR-178
   re-measurement spike; RESOLVED AS A RECORDED BOUNDED DIVERGENCE): **`--c-abi-exports` CLASS 1 HANDS A
   `&mut T` TO MEMORY A C CALLER IS ENTITLED TO LEAVE UNINITIALIZED -- IN

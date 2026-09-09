@@ -102,8 +102,8 @@ emitrust.actor_runtime @PingActor mode = threaded
 // mutability classification), the spawn construction stays the spike's
 // deferred-init shape, and shutdown renders as a plain method call.
 // CHECK:      fn c_main() -> i32 {
-// CHECK:          let mut counter_actor: CounterActorHandle;
-// CHECK:          counter_actor = v{{[0-9]+}};
+// CHECK:          let v{{[0-9]+}}: CounterActorHandle = CounterActorHandle::spawn(
+// CHECK:          let mut counter_actor: CounterActorHandle = v{{[0-9]+}};
 // CHECK:          counter_actor.bump()
 // CHECK:          counter_actor.shutdown();
 emitrust.func @c_main() -> i32 {
