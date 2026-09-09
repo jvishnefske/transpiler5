@@ -39,8 +39,22 @@ jobs:
       # importer, driver, differential end-to-end tests, and the
       # c-testsuite ledger driver (test/CTestSuite/c-testsuite.c). This is
       # the same suite the CMake `check-emitrust` target ran.
+      # --print-errorlogs: without it meson reports only "Fail: 1" and keeps
+      # the failing test's output in build/meson-logs/testlog.txt, which is
+      # not otherwise visible from the job log. A red slow tier was
+      # undiagnosable from CI output alone until this was added.
       - name: Regression suite (lit, both tiers)
-        run: nix develop -c meson test -C build
+        run: nix develop -c meson test -C build --print-errorlogs
+
+      # The full log, for when --print-errorlogs is truncated or the failure
+      # is in a test lit did not report inline.
+      - name: Upload meson test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meson-testlog
+          path: build/meson-logs/testlog.txt
+          if-no-files-found: warn
 
       # Explicit conformance gate against the required-pass list.  Every
       # test named in test/CTestSuite/expected-pass.txt must transpile,
