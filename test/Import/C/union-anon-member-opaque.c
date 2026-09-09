@@ -16,12 +16,8 @@
 //     same-width int/float pun) now imports instead of rejecting;
 //   * every residual rejection keeps its EXACT original wording and
 //     location, because the trial's diagnostics are re-emitted verbatim
-//     when the union import also fails — an unnamed (anonymous-struct)
-//     arm keeps the flattening `union type` wording, NOT
-//     `collectUnionSlot`'s "union with an unnamed arm"; a bit-field arm
-//     keeps its ARM location; a pointer arm keeps the flattening
-//     `pointer type outside a parameter position` wording, NOT
-//     "union with a pointer arm";
+//     when the union import also fails — a bit-field arm keeps its ARM
+//     location and `collectUnionSlot`'s bit-field wording;
 //   * C++ is OUT of scope (FR-78 already scopes out C++, and a
 //     non-flattening anonymous union newly reaching `collectUnionSlot`
 //     would meet the unmeasured destructor/copy-ctor member surface), so
@@ -30,9 +26,9 @@
 // RUN: emitrust-import-c %t/anon.c | FileCheck %s --check-prefix=ANON
 // RUN: emitrust-import-c %t/named.c | FileCheck %s --check-prefix=NAMED
 // RUN: emitrust-import-c %t/pun-arms.c | FileCheck %s --check-prefix=PUN
-// RUN: not emitrust-import-c %t/unnamed-arm.c 2>&1 | FileCheck %s --check-prefix=UNNAMEDARM
+// RUN: emitrust-import-c %t/unnamed-arm.c 2>&1 | FileCheck %s --check-prefix=UNNAMEDARM
 // RUN: not emitrust-import-c %t/bitfield-arm.c 2>&1 | FileCheck %s --check-prefix=BITFIELD
-// RUN: not emitrust-import-c %t/pointer-arm.c 2>&1 | FileCheck %s --check-prefix=POINTER
+// RUN: emitrust-import-c %t/pointer-arm.c 2>&1 | FileCheck %s --check-prefix=POINTER
 // RUN: not emitrust-import-c %t/cpp-gate.cpp 2>&1 | FileCheck %s --check-prefix=CPPGATE
 
 //--- anon.c
@@ -105,9 +101,11 @@ struct s g;
 
 //--- unnamed-arm.c
 // An anonymous-STRUCT arm: the flatten rejects it as wider than one slot,
-// and `collectUnionSlot` rejects it as an unnamed arm. Because the union
-// import also fails, the TRIAL's diagnostic is re-emitted verbatim, so
-// this shape keeps the historical CTS-R2 wording and location.
+// and `collectUnionSlot` rejected it as an unnamed arm. FR-167 PHASE 2
+// MOVED THIS PIN FORWARD: that second refusal is exactly where the blob
+// now lands, so phase 1's rollback delivers the union to phase 2's
+// fallback and the record imports. The `-NOT` keeps the old wording gone
+// -- a union that imports must not also print an error.
 struct s {
   union {
     struct {
@@ -120,8 +118,9 @@ struct s {
 
 struct s g;
 
-// UNNAMEDARM: unnamed-arm.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: union type
-// UNNAMEDARM-NOT: union with an unnamed arm
+// UNNAMEDARM: emitrust.struct_def @[[UA:Anon[0-9A-F]+]] ["opaque"] [!emitrust.array<8xui8>] {{.*}}emitrust.opaque_union}
+// UNNAMEDARM: emitrust.struct_def @s ["__u0"] [!emitrust.struct<"[[UA]]">]
+// UNNAMEDARM-NOT: error: unsupported: union
 
 //--- bitfield-arm.c
 // A bit-field arm is not addressable storage for either model. The trial
@@ -139,9 +138,17 @@ struct s g;
 // BITFIELD: bitfield-arm.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: union with a bit-field arm
 
 //--- pointer-arm.c
-// A pointer arm: the trial's `mapType` rejects the pointer leaf at the
-// ARM declaration, while `collectUnionSlot` would say "union with a
-// pointer arm" at the union. The trial's wording and location win.
+// FR-215's 38.6x amplification bucket (193 items behind three systemd
+// sites: `NLAPolicy.policy_set`, `sd_json_variant.parent`,
+// `NLAPolicySetUnionElement.string`). The trial's `mapType` rejects the
+// pointer leaf at the ARM declaration -- pointer WORDING on what is
+// really a union item, because `collectRecordFields` flattens the
+// anonymous union and bypasses `mapStructFieldType`'s data-pointer -> i64
+// shortcut -- and `collectUnionSlot` then said "union with a pointer arm"
+// at the union. FR-167 PHASE 2 MOVED THIS PIN FORWARD: that second
+// refusal is where the blob lands, so the record imports and the pointer
+// arm is access-rejected at its own sites instead. The `-NOT` keeps BOTH
+// old wordings gone.
 struct A {
   int x;
   int y;
@@ -157,7 +164,10 @@ struct s {
 
 struct s g;
 
-// POINTER: pointer-arm.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer type outside a parameter position
+// POINTER: emitrust.struct_def @A ["x", "y"] [i32, i32]
+// POINTER: emitrust.struct_def @[[PU:Anon[0-9A-F]+]] ["opaque"] [!emitrust.array<8xui8>] {{.*}}emitrust.opaque_union}
+// POINTER: emitrust.struct_def @s ["hdr", "__u1"] [i32, !emitrust.struct<"[[PU]]">]
+// POINTER-NOT: pointer type outside a parameter position
 // POINTER-NOT: union with a pointer arm
 
 //--- cpp-gate.cpp

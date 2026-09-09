@@ -7,9 +7,16 @@
 // a located rejection (the FAM declaration and its folded static
 // initializer are legal, see byte-region-aggregates.c); (3) an unnamed
 // union arm with non-u8 leaves whose size differs from the union's is
-// not representable as an equal-size alias and keeps the union family
-// rejection (stem pin: GREEN may sharpen the wording but not the
-// location or the union mention).
+// not representable as an equal-size alias. FR-167 PHASE 2 MOVED THAT
+// THIRD PIN FORWARD WITHOUT LOOSENING IT: the union DECLARATION now
+// imports as FR-78's sizeof-sized opaque blob, so the refusal moves from
+// the union's `{` to the STATIC INITIALIZER that names an arm --
+// `unsupported: opaque union arm initializer`, at the initializer, which
+// is FR-78's standing constraint that a blob admits only the all-zero
+// constant. Still one located rejection per TU, at a strictly more
+// precise site; the wording is pinned EXACTLY so a regression that
+// silently accepted an arm initializer (a miscompile: the blob would
+// carry zeros where C wrote 7) fails here.
 //
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/int-leaf-view.c 2>&1 | FileCheck %s --check-prefix=INTLEAF
@@ -57,7 +64,9 @@ int main(void) {
 //--- mixed-size-arm.c
 // The unnamed arm's leaves are u16 (non-u8) and its 2-byte size differs
 // from the union's 4 bytes: neither a u8-only view nor an equal-size
-// alias, so the union shape stays rejected.
+// alias, so the one-slot trial fails and phase 2's blob takes the
+// declaration. The `= {{7}}` initializer names an arm the blob cannot
+// represent, and THAT is what rejects now.
 typedef unsigned char u8;
 union Bad {
   struct { unsigned short w; };
@@ -68,4 +77,5 @@ union Bad gb = {{7}};
 int main(void) {
   return gb.raw[0];
 }
-// MIXED: mixed-size-arm.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: union
+// MIXED: mixed-size-arm.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm initializer
+// MIXED-NOT: error: unsupported: union
