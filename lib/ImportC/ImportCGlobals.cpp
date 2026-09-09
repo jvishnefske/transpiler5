@@ -605,6 +605,180 @@ LogicalResult CImporter::deferExternGlobal(const clang::VarDecl *key,
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// FR-217: `const char *const` string tables in the padded 2-D byte form
+//===----------------------------------------------------------------------===//
+
+/// The `const char *const` element of a candidate string table, or a null
+/// QualType. The pointer itself must be const (no element can ever be
+/// reassigned) and the pointee must be an ordinary 1-byte character type.
+static clang::QualType stringTableElement(clang::ASTContext &ctx,
+                                          clang::QualType arrayType) {
+  const clang::ConstantArrayType *array =
+      ctx.getAsConstantArrayType(arrayType.getCanonicalType());
+  if (!array)
+    return clang::QualType();
+  clang::QualType element = array->getElementType();
+  if (!element.isConstQualified())
+    return clang::QualType();
+  const auto *pointer = element.getCanonicalType()->getAs<clang::PointerType>();
+  if (!pointer)
+    return clang::QualType();
+  clang::QualType pointee = pointer->getPointeeType();
+  // The POINTEE must be const too. `char *const t[] = {"a"}` would admit
+  // `t[i][j] = c`, which C leaves undefined (a string literal is not
+  // writable) but the padded lowering would happily perform against its
+  // own storage; keeping it on the historical rejection is the safe
+  // direction, and FR-215 measured 178 of the 199 real sites as
+  // `const char *const` anyway.
+  if (!pointee.isConstQualified() || !pointee->isCharType())
+    return clang::QualType();
+  return element;
+}
+
+bool CImporter::isStringTableCandidate(const clang::VarDecl *var) {
+  if (!var || var->getType().isNull())
+    return false;
+  if (stringTableElement(astContext(), var->getType()).isNull())
+    return false;
+  const clang::Expr *init = significantInit(var);
+  return init && llvm::isa<clang::InitListExpr>(init->IgnoreParenImpCasts());
+}
+
+/// The string literal a table element designates, seen through the
+/// array-to-pointer decay and any parenthesization/qualification casts.
+/// Null for anything else, including a null pointer constant.
+static const clang::StringLiteral *tableElementLiteral(const clang::Expr *e) {
+  if (!e)
+    return nullptr;
+  return llvm::dyn_cast<clang::StringLiteral>(e->IgnoreParenCasts());
+}
+
+FailureOr<uint64_t> CImporter::classifyStringTable(const clang::VarDecl *var,
+                                                   Location loc) {
+  const clang::ConstantArrayType *array =
+      astContext().getAsConstantArrayType(var->getType().getCanonicalType());
+  uint64_t count = array->getSize().getZExtValue();
+  if (count == 0)
+    return emitError(loc) << "unsupported: zero-length array";
+  const auto *initList = llvm::cast<clang::InitListExpr>(
+      significantInit(var)->IgnoreParenImpCasts());
+  llvm::StringRef name = var->getName();
+  uint64_t width = 1; // the NUL of the empty string
+  for (uint64_t index = 0; index != count; ++index) {
+    const clang::Expr *element =
+        index < initList->getNumInits() ? initList->getInit(index) : nullptr;
+    // MISCOMPILE FENCE 1. A NULL element has no padded image: padding it
+    // to `""` flips `!!t[i]` from false to true and `t[i][0]` from a trap
+    // to `'\0'`, which is a silently wrong answer rather than a missing
+    // feature. Sentinel-terminated tables and designated-initializer
+    // holes both land here, and both must refuse.
+    bool isHole = !element || llvm::isa<clang::ImplicitValueInitExpr>(element);
+    if (!isHole &&
+        element->isNullPointerConstant(astContext(),
+                                       clang::Expr::NPC_NeverValueDependent) !=
+            clang::Expr::NPCK_NotNull)
+      isHole = true;
+    // A designated-initializer hole is an `ImplicitValueInitExpr` with NO
+    // source location at all; the declaration's own location keeps the
+    // diagnostic located (an unlocated rejection is not a rejection this
+    // repo accepts).
+    Location elementLoc = element && element->getBeginLoc().isValid()
+                              ? translateLoc(element->getBeginLoc())
+                              : loc;
+    if (isHole)
+      return emitError(elementLoc)
+             << "unsupported: null element at index " << index
+             << " of string table '" << name
+             << "' (the padded lowering would turn it into \"\")";
+    const clang::StringLiteral *literal = tableElementLiteral(element);
+    if (!literal)
+      return emitError(elementLoc)
+             << "unsupported: non-literal element at index " << index
+             << " of string table '" << name << "'";
+    if (!literal->isOrdinary())
+      return emitError(elementLoc)
+             << "unsupported: non-ordinary string literal at index " << index
+             << " of string table '" << name << "'";
+    for (unsigned byte = 0, bytes = literal->getLength(); byte != bytes; ++byte)
+      if (literal->getCodeUnit(byte) > 127)
+        return emitError(elementLoc)
+               << "unsupported: non-ASCII byte in string literal initializer";
+    width = std::max<uint64_t>(width, literal->getLength() + 1);
+  }
+  // The padded form costs `N*W` bytes where the pointer table cost
+  // `N*sizeof(char *)`, and one long element widens EVERY row. Bound the
+  // blowup with a located rejection rather than emitting a crate whose
+  // static data dwarfs the program.
+  constexpr uint64_t kMaxPaddedBytes = 1u << 20;
+  if (count > kMaxPaddedBytes / width)
+    return emitError(loc) << "unsupported: string table '" << name
+                          << "' pads to " << (count * width)
+                          << " bytes (limit " << kMaxPaddedBytes << ")";
+  return width;
+}
+
+LogicalResult CImporter::createStringTableGlobal(const clang::VarDecl *key,
+                                                 const clang::VarDecl *decl,
+                                                 llvm::StringRef symbolName,
+                                                 uint64_t width, Location loc) {
+  const clang::ConstantArrayType *array =
+      astContext().getAsConstantArrayType(decl->getType().getCanonicalType());
+  uint64_t count = array->getSize().getZExtValue();
+  auto byteType = IntegerType::get(builder.getContext(), 8);
+  auto rowType = emitrust::ArrayType::get(builder.getContext(), width, byteType);
+  auto tableType =
+      emitrust::ArrayType::get(builder.getContext(), count, rowType);
+  const auto *initList = llvm::cast<clang::InitListExpr>(
+      significantInit(decl)->IgnoreParenImpCasts());
+  SmallVector<Attribute> rows;
+  rows.reserve(count);
+  for (uint64_t index = 0; index != count; ++index) {
+    const clang::StringLiteral *literal =
+        tableElementLiteral(initList->getInit(index));
+    SmallVector<Attribute> bytes;
+    bytes.reserve(width);
+    for (unsigned byte = 0, length = literal->getLength(); byte != length;
+         ++byte)
+      bytes.push_back(IntegerAttr::get(
+          byteType, llvm::APInt(8, literal->getCodeUnit(byte))));
+    bytes.append(width - literal->getLength(),
+                 IntegerAttr::get(byteType, llvm::APInt(8, 0)));
+    rows.push_back(builder.getArrayAttr(bytes));
+  }
+  OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+  moduleBuilder.create<emitrust::GlobalOp>(
+      loc, moduleBuilder.getStringAttr(symbolName), TypeAttr::get(tableType),
+      moduleBuilder.getArrayAttr(rows), moduleBuilder.getUnitAttr());
+  globals[key] = GlobalInfo{symbolName.str(), tableType};
+  stringTables[key] = width;
+  return success();
+}
+
+const clang::ArraySubscriptExpr *
+CImporter::stringTableRow(const clang::Expr *e) {
+  if (!e || stringTables.empty())
+    return nullptr;
+  const auto *subscript =
+      llvm::dyn_cast<clang::ArraySubscriptExpr>(e->IgnoreParenImpCasts());
+  if (!subscript)
+    return nullptr;
+  return referencedStringTable(subscript->getBase()) ? subscript : nullptr;
+}
+
+const clang::VarDecl *CImporter::referencedStringTable(const clang::Expr *e) {
+  if (!e || stringTables.empty())
+    return nullptr;
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e->IgnoreParenImpCasts());
+  if (!ref)
+    return nullptr;
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var)
+    return nullptr;
+  const clang::VarDecl *canonical = var->getCanonicalDecl();
+  return stringTables.contains(canonical) ? canonical : nullptr;
+}
+
 LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
                                       const clang::VarDecl *decl,
                                       llvm::StringRef symbolName,
@@ -676,6 +850,19 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
   // extended past sizeof by a static flexible-array-member tail.
   if (isByteRegionAggregate(qualType))
     return createByteRegionGlobal(key, decl, symbolName, loc);
+  // FR-217: `static const char *const t[N] = {"a", "bb", ...}` has no
+  // pointer-table representation — `ArrayType::isValidElementType` admits
+  // no reference element, and the value model gives each pointer ONE base
+  // where a table needs N — so it lowers to the PADDED two-dimensional
+  // form `[[i8; W]; N]` the emitter already supports. Everything the
+  // padding cannot represent faithfully (above all a NULL element) keeps a
+  // located rejection inside `classifyStringTable`.
+  if (isStringTableCandidate(decl)) {
+    FailureOr<uint64_t> width = classifyStringTable(decl, loc);
+    if (failed(width))
+      return failure();
+    return createStringTableGlobal(key, decl, symbolName, *width, loc);
+  }
   FailureOr<Type> mlirType = mapType(qualType, loc);
   if (failed(mlirType))
     return failure();

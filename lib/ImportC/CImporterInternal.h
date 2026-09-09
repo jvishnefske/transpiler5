@@ -4198,6 +4198,55 @@ private:
                                   llvm::StringRef symbolName,
                                   clang::QualType qualType, Location loc);
 
+  /// FR-217: whether `var` has the SHAPE of a string table — a constant
+  /// array whose element type is `const char *const` (the pointer itself
+  /// const, so no element can ever be reassigned) with a brace
+  /// initializer. Shape only: a candidate may still fail
+  /// `classifyStringTable`, and a non-candidate keeps the historical
+  /// `pointer type outside a parameter position` rejection unchanged.
+  bool isStringTableCandidate(const clang::VarDecl *var);
+
+  /// FR-217: validates a `isStringTableCandidate` declaration element by
+  /// element and returns the padded row width W (longest element length +
+  /// 1 for the NUL). Every element must be an ordinary, ASCII string
+  /// literal. A NULL element is the named MISCOMPILE FENCE — padding it
+  /// to `""` would flip `!!t[i]` from false to true — and gets a located
+  /// rejection naming the offending index; so does any element that is
+  /// not a literal at all.
+  FailureOr<uint64_t> classifyStringTable(const clang::VarDecl *var,
+                                          Location loc);
+
+  /// FR-217: emits the padded global for an admitted string table:
+  /// `!emitrust.array<Nx!emitrust.array<Wxi8>>` with a nested i8 element
+  /// list, registered in both `globals` and `stringTables`.
+  LogicalResult createStringTableGlobal(const clang::VarDecl *key,
+                                        const clang::VarDecl *decl,
+                                        llvm::StringRef symbolName,
+                                        uint64_t width, Location loc);
+
+  /// FR-217: the admitted string table `e` names, if any — `e` stripped of
+  /// parens and implicit casts must be a reference to a declaration
+  /// registered in `stringTables`. Null otherwise.
+  const clang::VarDecl *referencedStringTable(const clang::Expr *e);
+
+  /// FR-217: the string-table ROW designator `e` names, if any — `e`
+  /// stripped of parens and implicit casts must be `t[<index>]` over a
+  /// declaration registered in `stringTables`. Its C type is
+  /// `const char *const`, but in the padded lowering it is an ARRAY
+  /// lvalue (`!emitrust.lvalue<!emitrust.array<Wxi8>>`), exactly what the
+  /// same subscript over a `const char t[N][W]` would be; the consumers
+  /// that already handle a decayed char-array row route through here.
+  const clang::ArraySubscriptExpr *stringTableRow(const clang::Expr *e);
+
+  /// FR-217: folds the `ELEMENTSOF` idiom `sizeof(t)/sizeof(t[0])` (or
+  /// `/sizeof(*t)`) over an admitted string table to its constant element
+  /// count. The two `sizeof`s cancel, so the element count survives the
+  /// padded lowering exactly; a BARE `sizeof(t)` does not (it describes
+  /// N*sizeof(char*) bytes of storage the emitted crate no longer has) and
+  /// is the second named MISCOMPILE FENCE, rejected in
+  /// `emitSizeofAlignof`. Returns a null Value when `op` is not the idiom.
+  FailureOr<Value> foldStringTableElementsOf(const clang::BinaryOperator *op);
+
   /// Handles a pointer-typed `extern`-only global reference (project
   /// import): a global historically rejected unconditionally, now resolved
   /// against `WholeProgramInfo`'s narrow "shared header pointer global"
@@ -7505,6 +7554,14 @@ private:
   /// whole-value representation of its own, only a region base and an
   /// optional cursor global).
   llvm::DenseMap<const clang::VarDecl *, PointerGlobalInfo> pointerGlobals;
+  /// FR-217: string tables (`static const char *const t[N] = {"a", ...}`)
+  /// admitted in the PADDED two-dimensional form, keyed by canonical
+  /// declaration; the mapped value is the padded row width W (the longest
+  /// element's length plus its NUL). The declaration also registers in
+  /// `globals` with the padded `!emitrust.array<Nx!emitrust.array<Wxi8>>`
+  /// type; this map is what tells the use sites that the C type
+  /// (`const char *const[N]`) and the emitted type disagree.
+  llvm::DenseMap<const clang::VarDecl *, uint64_t> stringTables;
   /// Program-wide pointer-region facts of every global pointer variable,
   /// keyed by canonical declaration: `planOwners` (Pass A) merges each
   /// function body's region view, and `importPointerGlobal` (Pass B)

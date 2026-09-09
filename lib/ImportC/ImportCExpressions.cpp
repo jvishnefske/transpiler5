@@ -987,6 +987,19 @@ FailureOr<Value> CImporter::emitBinaryRValue(const clang::BinaryOperator *op) {
     return extendBool(loc, *flag, op->getType());
   }
 
+  // FR-217: `sizeof(t)/sizeof(t[0])` over a padded string table. Folded
+  // BEFORE the operands are imported, because each `sizeof` on its own is
+  // fenced off (its byte answer no longer describes the emitted storage)
+  // while their QUOTIENT — the element count — survives the padding
+  // exactly. This is the ELEMENTSOF idiom, the common way such a table is
+  // walked, so the fence would gut the feature without it.
+  if (opcode == clang::BO_Div) {
+    FailureOr<Value> folded = foldStringTableElementsOf(op);
+    if (failed(folded))
+      return failure();
+    if (*folded)
+      return *folded;
+  }
   FailureOr<Value> lhs = emitRValue(op->getLHS());
   if (failed(lhs))
     return failure();
@@ -2235,6 +2248,60 @@ FailureOr<Value> CImporter::emitStmtExpr(const clang::StmtExpr *expr) {
   return loadPlace(loc, cell);
 }
 
+/// FR-217: the `sizeof` operand of `e`, when `e` is a `sizeof` expression
+/// over an expression operand; null otherwise.
+static const clang::Expr *sizeofOperandExpr(const clang::Expr *e) {
+  const auto *trait =
+      llvm::dyn_cast<clang::UnaryExprOrTypeTraitExpr>(e->IgnoreParenImpCasts());
+  if (!trait || trait->getKind() != clang::UETT_SizeOf ||
+      trait->isArgumentType())
+    return nullptr;
+  return trait->getArgumentExpr();
+}
+
+FailureOr<Value>
+CImporter::foldStringTableElementsOf(const clang::BinaryOperator *op) {
+  if (stringTables.empty())
+    return Value();
+  const clang::Expr *whole = sizeofOperandExpr(op->getLHS());
+  const clang::Expr *element = sizeofOperandExpr(op->getRHS());
+  if (!whole || !element)
+    return Value();
+  const clang::VarDecl *table = referencedStringTable(whole);
+  if (!table)
+    return Value();
+  // The divisor must designate ONE element of that same table: `t[<any>]`
+  // or `*t`. A divisor over a different object, or over a deeper
+  // designator, is not the idiom and falls through to the fence.
+  const clang::Expr *elementBase = element->IgnoreParenImpCasts();
+  if (const auto *subscript =
+          llvm::dyn_cast<clang::ArraySubscriptExpr>(elementBase))
+    elementBase = subscript->getBase();
+  else if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(elementBase);
+           unary && unary->getOpcode() == clang::UO_Deref)
+    elementBase = unary->getSubExpr();
+  else
+    return Value();
+  if (referencedStringTable(elementBase) != table)
+    return Value();
+  Location loc = translateLoc(op->getOperatorLoc());
+  // The subscript index is a constant in every real spelling of the idiom
+  // (`t[0]`); a side-effecting one would be discarded by this fold, so it
+  // keeps a located rejection instead.
+  if (const auto *subscript =
+          llvm::dyn_cast<clang::ArraySubscriptExpr>(element->IgnoreParenImpCasts()))
+    if (subscript->getIdx()->HasSideEffects(astContext()))
+      return emitError(loc) << "unsupported: side effect in the divisor of a "
+                               "string table element count";
+  const clang::ConstantArrayType *array =
+      astContext().getAsConstantArrayType(table->getType().getCanonicalType());
+  FailureOr<Type> resultType = mapType(op->getType(), loc);
+  if (failed(resultType))
+    return failure();
+  return createScalarIntConstant(loc, *resultType,
+                                 array->getSize().getZExtValue());
+}
+
 FailureOr<Value>
 CImporter::emitSizeofAlignof(const clang::UnaryExprOrTypeTraitExpr *expr) {
   Location loc = translateLoc(expr->getBeginLoc());
@@ -2250,6 +2317,36 @@ CImporter::emitSizeofAlignof(const clang::UnaryExprOrTypeTraitExpr *expr) {
   if (operand->isVariablyModifiedType())
     return emitError(loc)
            << "unsupported: sizeof/alignof of a variable-length array";
+  // FR-217, MISCOMPILE FENCE 2. An admitted string table's C type still
+  // says `const char *const[N]`, so this fold would promise
+  // `N*sizeof(char *)` bytes of storage the padded lowering does not have
+  // (it has `N*W`). The ELEMENTSOF idiom `sizeof(t)/sizeof(t[0])` is
+  // UNAFFECTED — the two sizes cancel — and is folded ahead of this fence
+  // by `foldStringTableElementsOf`; anything else that measures the table
+  // in bytes refuses.
+  if (!expr->isArgumentType()) {
+    // One level of `[...]` or `*` is peeled so `sizeof(t[0])` and
+    // `sizeof(*t)` — which promise sizeof(char *) where the emitted row is
+    // W bytes — are fenced alongside the bare `sizeof(t)`. A deeper
+    // designator (`sizeof(t[0][0])`, the char) is not a table measurement
+    // and is left alone.
+    const clang::Expr *measured = expr->getArgumentExpr()->IgnoreParenImpCasts();
+    if (const auto *subscript =
+            llvm::dyn_cast<clang::ArraySubscriptExpr>(measured))
+      measured = subscript->getBase();
+    else if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(measured);
+             unary && unary->getOpcode() == clang::UO_Deref)
+      measured = unary->getSubExpr();
+    if (const clang::VarDecl *table = referencedStringTable(measured))
+      return emitError(loc)
+             << (kind == clang::UETT_SizeOf ? "unsupported: sizeof of string "
+                                              "table '"
+                                            : "unsupported: alignof of string "
+                                              "table '")
+             << table->getName()
+             << "' (its padded lowering has a different byte size; the "
+                "element count is sizeof(t)/sizeof(t[0]))";
+  }
   if (operand->isIncompleteType() || operand->isFunctionType())
     return emitError(loc)
            << "unsupported: sizeof/alignof of an incomplete or function type";

@@ -9389,7 +9389,12 @@ CImporter::emitPrintfStringArg(const clang::Expr *expr,
   // A char-array lvalue is borrowed whole (`emitrust.slice_of` at index 0)
   // and rendered by the `__emitrust_cstr` helper, which — like C's %s —
   // stops at the first NUL.
-  if (astContext().getAsConstantArrayType(arg->getType()) &&
+  // FR-217: a padded string table's ROW is an i8-array lvalue even though
+  // its C type is `const char *const`, so it prints through this very
+  // branch — one `slice_of` at index 0, NUL-stopped by `__emitrust_cstr`,
+  // exactly like the `const char t[N][W]` spelling it lowers to.
+  if ((astContext().getAsConstantArrayType(arg->getType()) ||
+       stringTableRow(arg)) &&
       arg->isLValue()) {
     FailureOr<Value> place = emitLValue(arg);
     if (failed(place))
