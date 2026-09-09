@@ -93,8 +93,8 @@ emitrust.actor_runtime @CounterActor mode = async
 // runtime CONTEXT, not an async caller); and every handle method_call —
 // the wrapper call and the consuming shutdown alike — appends `.await`.
 // CHECK:      async fn c_main() -> i32 {
-// CHECK:          let mut counter_actor: CounterActorHandle;
-// CHECK:          counter_actor = v{{[0-9]+}};
+// CHECK:          let v{{[0-9]+}}: CounterActorHandle = CounterActorHandle::spawn(
+// CHECK:          let mut counter_actor: CounterActorHandle = v{{[0-9]+}};
 // CHECK:          counter_actor.bump().await
 // CHECK:          counter_actor.shutdown().await;
 emitrust.func @c_main() -> i32 {

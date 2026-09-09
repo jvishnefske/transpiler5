@@ -1,0 +1,23 @@
+[package]
+name = "binding-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A REAL Rust parser, deliberately. The binding-hygiene metric asks scope
+# questions (is this the only use? is it in the very next statement? is the
+# path from here to there free of side effects?) that a regex cannot answer:
+# it cannot see shadowing, closure capture, macro bodies, or evaluation
+# order, so a regex necessarily OVERCOUNTS. `syn` is in the offline cargo
+# registry the rest of the harness already builds against.
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits", "visit", "parsing", "printing"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+
+[[bin]]
+name = "binding-probe"
+path = "src/main.rs"
+
+[profile.release]
+debug = false
