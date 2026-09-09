@@ -2107,7 +2107,108 @@ CImporter::anonymousUnionArmLeaf(const clang::FieldDecl *arm,
   return leaf;
 }
 
+void CImporter::appendOpaqueUnionBlob(
+    const clang::RecordDecl *definition,
+    SmallVectorImpl<llvm::StringRef> &fieldNames,
+    SmallVectorImpl<Type> &fieldTypes) {
+  // Arms recorded as one-slot aliases (identical-type or same-width scalar)
+  // must NOT survive: under the opaque model every arm is access-rejected
+  // instead, and a stale `unionSlotStorage` entry would silently redirect a
+  // member access to a field that no longer exists.
+  fieldNames.clear();
+  fieldTypes.clear();
+  for (const clang::FieldDecl *member : definition->fields()) {
+    unionSlotStorage.erase(member);
+    unionByteArrayArms.erase(member);
+    opaqueUnionArms.insert(member);
+  }
+  opaqueUnions.insert(definition);
+  // C sizeof of the union (largest arm rounded up to alignment, C99
+  // 6.7.2.1), NOT the largest arm's bare size: keeps the existing
+  // sizeof/alignof constant folds consistent with the blob.
+  uint64_t bytes = astContext()
+                       .getTypeSizeInChars(astContext().getRecordType(definition))
+                       .getQuantity();
+  fieldNames.push_back(memberNameArena.emplace_back("opaque"));
+  fieldTypes.push_back(emitrust::ArrayType::get(
+      builder.getContext(), bytes,
+      IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned)));
+}
+
+bool CImporter::opaqueUnionBlobEligible(
+    const clang::RecordDecl *definition) const {
+  if (astContext().getLangOpts().CPlusPlus)
+    return false;
+  bool hasArm = false;
+  for (const clang::FieldDecl *arm : definition->fields()) {
+    hasArm = true;
+    // Not addressable storage the blob can stand in for; and the one-slot
+    // rejection points at the ARM, a location the blob would erase.
+    if (arm->isBitField())
+      return false;
+    // `sizeof` does not cover a flexible/zero-extent tail, so a blob sized
+    // by it would silently drop storage the C program can reach.
+    if (arm->getType()->isIncompleteArrayType())
+      return false;
+  }
+  if (!hasArm)
+    return false;
+  // A zero-sized blob has no bytes to alias; keep today's rejection rather
+  // than emit a field-less stand-in.
+  return astContext()
+             .getTypeSizeInChars(astContext().getRecordType(definition))
+             .getQuantity() != 0;
+}
+
 LogicalResult CImporter::collectUnionSlot(
+    const clang::RecordDecl *definition,
+    SmallVectorImpl<llvm::StringRef> &fieldNames,
+    SmallVectorImpl<Type> &fieldTypes) {
+  // FR-167 PHASE 2, the same trial/rollback phase 1 put in
+  // `collectRecordFields`, one level down. A union the ONE-SLOT model
+  // cannot take is not thereby unrepresentable: FR-78 already built the
+  // opaque sizeof-sized blob, and until now it was reachable only from the
+  // narrow `allArmsAggregate` predicate inside the arm loop -- so a union
+  // one pointer arm or one size mismatch away from all-aggregate killed
+  // its whole containing record and everything downstream of it.
+  //
+  // BYTE IDENTITY IS BY CONSTRUCTION, and the construction is this: an
+  // INELIGIBLE union never enters the trial (it runs `collectUnionOneSlot`
+  // directly, with no handler in the way, so its diagnostics keep their
+  // exact wording, location and ORDER), and an eligible union that the
+  // one-slot model ADMITS returns straight out of the trial with the same
+  // fields it always had. The fallback runs only on the path that used to
+  // `return failure()`.
+  if (!opaqueUnionBlobEligible(definition))
+    return collectUnionOneSlot(definition, fieldNames, fieldTypes);
+  size_t savedFieldCount = fieldNames.size();
+  LogicalResult oneSlot = failure();
+  {
+    // The trial's diagnostics are DISCARDED, not replayed: unlike phase 1
+    // -- where the retry could also fail and the original wording had to
+    // survive -- the fallback here always succeeds, so any replay would be
+    // an error printed for an item that imported.
+    ScopedDiagnosticHandler trialHandler(
+        builder.getContext(),
+        [](Diagnostic &diag) -> LogicalResult {
+          return success(diag.getSeverity() == DiagnosticSeverity::Error);
+        });
+    oneSlot = collectUnionOneSlot(definition, fieldNames, fieldTypes);
+  }
+  if (succeeded(oneSlot))
+    return success();
+  // Roll the trial back. Only `fieldNames`/`fieldTypes`, `unionSlotStorage`
+  // and `unionByteArrayArms` are trial state; everything else the trial
+  // touches (the type and record caches `mapType` warms) is idempotent, and
+  // `opaqueUnions`/`opaqueUnionArms` are written only on a SUCCEEDING
+  // all-aggregate diversion, which cannot be on this path.
+  fieldNames.truncate(savedFieldCount);
+  fieldTypes.truncate(savedFieldCount);
+  appendOpaqueUnionBlob(definition, fieldNames, fieldTypes);
+  return success();
+}
+
+LogicalResult CImporter::collectUnionOneSlot(
     const clang::RecordDecl *definition,
     SmallVectorImpl<llvm::StringRef> &fieldNames,
     SmallVectorImpl<Type> &fieldTypes) {
@@ -2234,27 +2335,7 @@ LogicalResult CImporter::collectUnionSlot(
                  astContext().getAsConstantArrayType(f->getType());
         });
     if (allArmsAggregate) {
-      // Arms admitted earlier in this loop (identical-type aliases) were
-      // recorded as slot aliases; under the opaque model EVERY arm is
-      // access-rejected instead, so those entries must not survive.
-      fieldNames.clear();
-      fieldTypes.clear();
-      for (const clang::FieldDecl *member : definition->fields()) {
-        unionSlotStorage.erase(member);
-        opaqueUnionArms.insert(member);
-      }
-      opaqueUnions.insert(definition);
-      // C sizeof of the union (largest arm rounded up to alignment, C99
-      // 6.7.2.1), NOT the largest arm's bare size: keeps the existing
-      // sizeof/alignof constant folds consistent with the blob.
-      uint64_t bytes =
-          astContext()
-              .getTypeSizeInChars(astContext().getRecordType(definition))
-              .getQuantity();
-      fieldNames.push_back(memberNameArena.emplace_back("opaque"));
-      fieldTypes.push_back(emitrust::ArrayType::get(
-          builder.getContext(), bytes,
-          IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned)));
+      appendOpaqueUnionBlob(definition, fieldNames, fieldTypes);
       return success();
     }
     return emitError(unionLoc)

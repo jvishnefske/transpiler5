@@ -1,7 +1,7 @@
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/ptr-to-ptr.c 2>&1 | FileCheck %s --check-prefix=PTRPTR
 // RUN: not emitrust-import-c %t/two-dim.c 2>&1 | FileCheck %s --check-prefix=TWOD
-// RUN: not emitrust-import-c %t/union-arm.c 2>&1 | FileCheck %s --check-prefix=UNIONARM
+// RUN: emitrust-import-c %t/union-arm.c 2>&1 | FileCheck %s --check-prefix=UNIONARM
 // RUN: not emitrust-import-c %t/volatile-elem.c 2>&1 | FileCheck %s --check-prefix=VOLATILE
 // RUN: not emitrust-import-c %t/file-ptr.c 2>&1 | FileCheck %s --check-prefix=FILEPTR
 // RUN: not emitrust-import-c %t/local-var.c 2>&1 | FileCheck %s --check-prefix=LOCALVAR
@@ -28,6 +28,10 @@
 //  - a UNION arm: union arms map through `mapType`, not
 //    `mapStructFieldType`, so the admission deliberately does not reach
 //    them; a one-slot aliasing model over cursor slots has no meaning.
+//    FR-167 PHASE 2 moved this leg's PIN, not this frontier: the arm
+//    still gets no `[i64; N]`, but the containing union now falls back to
+//    FR-78's opaque blob instead of rejecting, so the leg is a positive
+//    check with a `-NOT` guarding that the pointer wording stays gone.
 //  - a VOLATILE-qualified element: the volatile scan runs FIRST in
 //    `mapStructFieldType`, before any pointer shortcut, and must keep
 //    running first.
@@ -58,9 +62,18 @@ struct H g;
 // TWOD: two-dim.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer type outside a parameter position
 
 //--- union-arm.c
+// FR-167 PHASE 2 MOVED THIS PIN FORWARD. A pointer-array arm still has no
+// `[i64; N]` admission -- the FR-107 widening deliberately stops at a
+// STRUCT MEMBER -- but the union that contains it is no longer killed by
+// that: `collectUnionSlot`'s refusal is now a TRIAL, and the fallback is
+// FR-78's sizeof-sized opaque blob (16 bytes here). The pointer arm gets
+// no representation and every access through it is a located rejection;
+// only the DECLARATION moved. `-NOT` guards that the pointer rejection
+// does not ALSO surface -- a union that imports must not print an error.
 union U { int *m[2]; int n; };
 union U g;
-// UNIONARM: union-arm.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer type outside a parameter position
+// UNIONARM: emitrust.struct_def @U ["opaque"] [!emitrust.array<16xui8>] {{.*}}emitrust.opaque_union}
+// UNIONARM-NOT: pointer type outside a parameter position
 
 //--- volatile-elem.c
 struct H { int *volatile m[4]; };

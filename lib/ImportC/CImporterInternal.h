@@ -2992,9 +2992,49 @@ private:
   /// sizes, aggregate/enum arms that do not match the slot's type
   /// exactly, and empty unions are rejected with located
   /// `unsupported: union ...` diagnostics at the union definition.
+  ///
+  /// FR-167 PHASE 2: this is a WRAPPER. The one-slot collection above runs
+  /// as a TRIAL (`collectUnionOneSlot`) under a silencing handler, and a
+  /// union that is BLOB-ELIGIBLE (`opaqueUnionBlobEligible`) falls back to
+  /// FR-78's sizeof-sized opaque byte blob instead of rejecting. The
+  /// fallback runs ONLY where the trial failed, so every union the one-slot
+  /// model admits keeps its emitted bytes exactly; an INELIGIBLE union
+  /// never enters the trial at all, so its rejection wording and location
+  /// are the untouched originals.
   LogicalResult collectUnionSlot(const clang::RecordDecl *definition,
                                  SmallVectorImpl<llvm::StringRef> &fieldNames,
                                  SmallVectorImpl<Type> &fieldTypes);
+
+  /// The one-slot union collection proper — `collectUnionSlot`'s body
+  /// before FR-167 phase 2, including FR-78's all-aggregate-arm diversion
+  /// to the opaque blob. Called only through `collectUnionSlot`.
+  LogicalResult collectUnionOneSlot(const clang::RecordDecl *definition,
+                                    SmallVectorImpl<llvm::StringRef> &fieldNames,
+                                    SmallVectorImpl<Type> &fieldTypes);
+
+  /// FR-167 phase 2: may `definition` fall back to FR-78's opaque byte blob
+  /// when the one-slot model refuses it? The blob is a sizeof-sized `[u8;
+  /// N]` with alignment 1 whose arms are access-rejected at every use, so
+  /// the eligibility screen is about what `sizeof` can FAITHFULLY stand in
+  /// for, not about what the arms mean:
+  ///   * C only. C++ keeps today's rejection (FR-78 scopes C++ out for the
+  ///     destructor/copy-ctor/`Copy` surface, and phase 1 gated to match).
+  ///   * A BIT-FIELD arm is not addressable storage; the one-slot wording
+  ///     points at the ARM, and that location must survive.
+  ///   * An INCOMPLETE-ARRAY arm (`char tail[];`) is storage `sizeof` does
+  ///     not cover, so a blob sized by `sizeof` would silently drop it.
+  ///   * An EMPTY union has no arms to stand in for, and a zero-sized blob
+  ///     has no bytes.
+  bool opaqueUnionBlobEligible(const clang::RecordDecl *definition) const;
+
+  /// FR-167 phase 2 / FR-78: replaces `fieldNames`/`fieldTypes` with the
+  /// single sizeof-sized `opaque` byte-blob field, records every arm in
+  /// `opaqueUnionArms` and the union in `opaqueUnions` (so the struct_def
+  /// carries `emitrust.opaque_union` and every arm access rejects at its
+  /// own site), and clears any slot aliases the caller recorded.
+  void appendOpaqueUnionBlob(const clang::RecordDecl *definition,
+                             SmallVectorImpl<llvm::StringRef> &fieldNames,
+                             SmallVectorImpl<Type> &fieldTypes);
 
   /// Returns the field that provides `field`'s storage in its flattened
   /// parent struct_def: the aliased first-arm slot for a union arm
