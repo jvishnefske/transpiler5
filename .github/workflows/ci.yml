@@ -35,6 +35,33 @@ jobs:
       - name: Build
         run: nix develop -c meson compile -C build
 
+      # The --actor-mode=async crate flavor (FR-62) emits an UNCONDITIONAL
+      # tokio dependency, and `emitrust-cc --build` runs
+      # `cargo build --release --offline`. On a runner with a cold registry
+      # that cannot resolve, and the two async EndToEnd tests fail with
+      # "no matching package named `tokio` found" -- which is exactly the
+      # offline-resolution failure FR-62 recorded when it chose that design.
+      # It never bites locally because a developer's ~/.cargo is warm, so CI
+      # is the first environment that sees it. Warm the registry with
+      # precisely the dependency the emitter declares (two crates: tokio and
+      # pin-project-lite). Verified: cold => 2 FAIL, warmed => 0 FAIL.
+      - name: Warm the cargo registry for the async actor flavor
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/tokio-warm"
+          mkdir -p "$d/src"
+          printf '%s\n' \
+            '[package]' \
+            'name = "tokio-warm"' \
+            'version = "0.0.0"' \
+            'edition = "2021"' \
+            '' \
+            '[dependencies]' \
+            'tokio = { version = "1", features = ["rt", "sync"] }' \
+            > "$d/Cargo.toml"
+          echo 'fn main() {}' > "$d/src/main.rs"
+          nix develop -c cargo fetch --manifest-path "$d/Cargo.toml"
+
       # Full lit suite, both tiers: dialect round-trips, conversions,
       # importer, driver, differential end-to-end tests, and the
       # c-testsuite ledger driver (test/CTestSuite/c-testsuite.c). This is
