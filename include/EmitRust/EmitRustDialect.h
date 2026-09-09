@@ -231,6 +231,36 @@ inline constexpr llvm::StringLiteral kAbiLayoutAttrName = "emitrust.abi_layout";
 inline constexpr llvm::StringLiteral kAbiUnfaithfulReasonAttrName =
     "emitrust.abi_unfaithful_reason";
 
+/// FR-209: name of the discardable `emitrust.func` ARRAY attribute recording
+/// why a pointer parameter is a SLICE rather than a reference when the reason
+/// is DELEGATION and nothing the signature shows.
+///
+/// FR-100's forwarding fixpoint keeps a scalar reference across a forwarding
+/// call only when the pointee is ARITHMETIC; a struct pointee records no edge
+/// and falls through to the conservative slice demand. The C author sees a
+/// function whose signature looks perfectly exportable refused for "its
+/// signature is not all-scalar" -- factually true and completely
+/// uninformative, since it names neither the delegation nor the pointee-kind
+/// rule that actually decided it. This attribute carries the two facts the
+/// refusal needs to say so: WHICH call forwarded the parameter, and to WHOM.
+///
+/// Each element is a dictionary of
+///   * `index`  (i64)     -- the parameter position, into the FUNCTION TYPE;
+///   * `param`  (string)  -- its C spelling, for the message;
+///   * `callee` (string)  -- the C spelling of the function it is forwarded
+///                           to (a definition in this TU, by construction:
+///                           an edge is only ever considered for one);
+///   * `site`   (loc)     -- the forwarding CALL, so the diagnostic can hang
+///                           a located note on the line that decided it.
+///
+/// It is a RECORD OF A REASON and never an input to classification: dropping
+/// it changes no emitted signature, only the words of a refusal. Attached
+/// only to externally visible C-linkage functions, which is the only place
+/// `--c-abi-exports` can look (see `kCSymbolAttrName` for the same gate), so
+/// every other module stays byte-identical.
+inline constexpr llvm::StringLiteral kSliceParamDelegationAttrName =
+    "emitrust.slice_param_delegation";
+
 /// FR-52: name of the discardable `emitrust.func` string attribute marking a
 /// function that is GENERIC over the external-requirement trait. Its value is
 /// the trait's name, so the emitter needs no module-level channel to render

@@ -592,6 +592,26 @@ enum class ParamKind {
   OwnedRecord,
 };
 
+/// FR-209: the delegation that made a pointer parameter a `Slice` when
+/// NOTHING IN ITS OWN BODY asked for one -- it was forwarded whole into a
+/// callee, and FR-100's fixpoint records a forwarding edge only for an
+/// ARITHMETIC pointee, so a struct pointee falls through to the conservative
+/// slice demand. Recorded purely so the refusal can say that; it is never
+/// consulted by the classification itself.
+struct SliceParamDelegation {
+  /// The callee the parameter was forwarded to. Always an in-TU definition:
+  /// the walker only reaches this point with a usable `calleeDef`.
+  const clang::FunctionDecl *callee = nullptr;
+  /// The forwarding CALL, for the located note.
+  clang::SourceLocation site;
+  /// Whether the delegation is the SOLE reason. False when the body ALSO
+  /// demands the whole run on its own (`helper(c); return c[1].a;`), where
+  /// saying "it is a slice because you forward it" would be a LIE: removing
+  /// the call would leave the subscript, and the parameter a slice. Only a
+  /// sole-reason record is ever surfaced, so the diagnostic can be believed.
+  bool soleReason = false;
+};
+
 /// Why a pointer-parameter class with global bases does NOT lower to a
 /// cell-slice (CTS-P10 boundaries), keyed by the global base so the
 /// call-site rejection can name the precise reason.
@@ -7193,6 +7213,14 @@ private:
   /// invariant), the same property `paramKindsCache` relies on.
   llvm::DenseSet<const clang::ParmVarDecl *> forwardSliceParams;
   llvm::DenseSet<const clang::ASTContext *> forwardSliceComputedFor;
+  /// FR-209: for each parameter that FR-100's fixpoint declined to keep as a
+  /// reference BECAUSE ITS POINTEE IS NOT ARITHMETIC, the forwarding call
+  /// that decided it. Filled alongside the fixpoint (same walk, same keys,
+  /// same lifetime) and read only by the `--c-abi-exports` refusal, which is
+  /// otherwise reduced to "its signature is not all-scalar" for a signature
+  /// with nothing visibly wrong with it.
+  llvm::DenseMap<const clang::ParmVarDecl *, SliceParamDelegation>
+      forwardSliceDelegations;
   void computeForwardSliceParams();
   /// FR-71: byte elements of `void *` parameters admitted as byte-slice
   /// cursors, keyed like `paramKindsCache` (canonical declaration) and
@@ -9566,7 +9594,9 @@ static inline void collectSliceParamsImpl(
     llvm::SmallPtrSetImpl<const clang::ParmVarDecl *> &sliceParams,
     llvm::SmallVectorImpl<
         std::pair<const clang::ParmVarDecl *, const clang::ParmVarDecl *>>
-        *edges) {
+        *edges,
+    llvm::DenseMap<const clang::ParmVarDecl *, SliceParamDelegation> *notes =
+        nullptr) {
   if (!stmt)
     return;
   if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt))
@@ -9621,18 +9651,46 @@ static inline void collectSliceParamsImpl(
       if (!fwd->getType()
                .getCanonicalType()
                ->getPointeeType()
-               ->isArithmeticType())
+               ->isArithmeticType()) {
+        // FR-209: NO behavior change here -- the parameter still falls
+        // through to the conservative slice demand below, exactly as it has
+        // since FR-100. What is recorded is WHY, because this is the one
+        // slice class whose cause is invisible in the signature the user
+        // wrote: `int outer(Ctx *c) { return helper(c); }` is refused by
+        // `--c-abi-exports` for "its signature is not all-scalar" and the
+        // signature has nothing wrong with it. The FIRST such call wins;
+        // it is the one whose line the note points at, and a second
+        // forwarding site would not change the answer.
+        //
+        // The demand this appearance carries is SUSPENDED here (the argument
+        // joins `deferred`, so the walk below skips the bare reference that
+        // would insert it) and RESTORED WHOLESALE by
+        // `computeForwardSliceParams`, which is the only caller that can
+        // pass `notes`. That is not a behavior change dressed up: the set it
+        // hands on is identical. It is what makes "the delegation is the
+        // SOLE reason" decidable at all -- with the demand left in place
+        // every recorded parameter is in the seed set by construction, and
+        // `helper(c); return c[1].a;` would be told the forward made it a
+        // slice when the subscript did.
+        if (notes) {
+          notes->try_emplace(fwd,
+                             SliceParamDelegation{calleeDef,
+                                                  call->getExprLoc(),
+                                                  /*soleReason=*/false});
+          deferred.insert(arg);
+        }
         continue;
+      }
       edges->emplace_back(fwd, calleeDef->getParamDecl(index));
       deferred.insert(arg);
     }
     if (!deferred.empty()) {
       // Walk the callee and the non-forwarding arguments only; the
       // forwarded references carry no local demand of their own.
-      collectSliceParamsImpl(call->getCallee(), sliceParams, edges);
+      collectSliceParamsImpl(call->getCallee(), sliceParams, edges, notes);
       for (const clang::Expr *arg : call->arguments())
         if (!deferred.contains(arg))
-          collectSliceParamsImpl(arg, sliceParams, edges);
+          collectSliceParamsImpl(arg, sliceParams, edges, notes);
       return;
     }
   }
@@ -9642,7 +9700,7 @@ static inline void collectSliceParamsImpl(
       if (isPointerType(param->getType()))
         sliceParams.insert(param);
   for (const clang::Stmt *child : stmt->children())
-    collectSliceParamsImpl(child, sliceParams, edges);
+    collectSliceParamsImpl(child, sliceParams, edges, notes);
 }
 
 /// The conservative flavor: every call-argument appearance that is not
@@ -9660,8 +9718,9 @@ static inline void collectSliceParamsWithEdges(
     llvm::SmallPtrSetImpl<const clang::ParmVarDecl *> &sliceParams,
     llvm::SmallVectorImpl<
         std::pair<const clang::ParmVarDecl *, const clang::ParmVarDecl *>>
-        &edges) {
-  collectSliceParamsImpl(stmt, sliceParams, &edges);
+        &edges,
+    llvm::DenseMap<const clang::ParmVarDecl *, SliceParamDelegation> &notes) {
+  collectSliceParamsImpl(stmt, sliceParams, &edges, &notes);
 }
 
 static inline bool voidParamOnlyTruthTested(const clang::Stmt *stmt,

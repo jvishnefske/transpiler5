@@ -1914,6 +1914,15 @@ void CImporter::computeForwardSliceParams() {
   llvm::SmallPtrSet<const clang::ParmVarDecl *, 16> seeds;
   SmallVector<std::pair<const clang::ParmVarDecl *, const clang::ParmVarDecl *>>
       edges;
+  // FR-209: the non-arithmetic-pointee forwards, whose demand the walker
+  // SUSPENDS so that "is the delegation the sole reason?" is answerable, and
+  // which is restored below before anything reads `seeds`.
+  llvm::DenseMap<const clang::ParmVarDecl *, SliceParamDelegation> delegations;
+  // FR-209: the FR-75 conservative re-walk's demands, held aside for the
+  // same reason. They are not a SECOND cause -- that walk sees the very same
+  // forwarding appearance -- so folding them into `seeds` before the
+  // sole-reason question is asked would answer it with its own echo.
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 8> traitSeeds;
   // FR-75 interaction: under a trait policy, ANOTHER TU that sees only a
   // DECLARATION of an externally visible function classifies its
   // arithmetic-pointee data-pointer parameters as Slice eagerly (the
@@ -1932,13 +1941,23 @@ void CImporter::computeForwardSliceParams() {
     const auto *fn = llvm::dyn_cast<clang::FunctionDecl>(decl);
     if (!fn || !fn->doesThisDeclarationHaveABody())
       continue;
-    collectSliceParamsWithEdges(fn->getBody(), seeds, edges);
+    collectSliceParamsWithEdges(fn->getBody(), seeds, edges, delegations);
     if (traitEligible && fn->isExternallyVisible()) {
       llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> local;
       collectSliceParams(fn->getBody(), local);
-      seeds.insert(local.begin(), local.end());
+      traitSeeds.insert(local.begin(), local.end());
     }
   }
+  // FR-209: ask the question, then RESTORE the suspended demand. After this
+  // loop `seeds` is bit-for-bit what it was before FR-209 -- every recorded
+  // parameter is back in it -- so no signature anywhere moves; the only
+  // thing gained is a truthful `soleReason` on each record.
+  for (auto &entry : delegations) {
+    entry.second.soleReason = !seeds.contains(entry.first);
+    seeds.insert(entry.first);
+  }
+  seeds.insert(traitSeeds.begin(), traitSeeds.end());
+  forwardSliceDelegations.insert(delegations.begin(), delegations.end());
   forwardSliceParams.insert(seeds.begin(), seeds.end());
   bool changed = true;
   while (changed) {
