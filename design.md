@@ -13577,8 +13577,8 @@ piece and becomes FR-45.
   storage, conversion, passing and printing. A real 80-bit type is not
   available -- Rust has no `f80`.
 
-- [ ] FR-212 (opened 2026-09-08 by the FR-178 re-measurement spike, which
-  surfaced it and could not pursue it): **`--c-abi-exports` CLASS 1 HANDS A
+- [x] FR-212 (opened and SPIKED 2026-09-08; found by the FR-178
+  re-measurement spike; RESOLVED AS A RECORDED BOUNDED DIVERGENCE): **`--c-abi-exports` CLASS 1 HANDS A
   `&mut T` TO MEMORY A C CALLER IS ENTITLED TO LEAVE UNINITIALIZED -- IN
   ALREADY-SHIPPED CODE.**
   FR-182's CLASS 1 generates `unsafe { f_rs(&mut *p) }`. A C caller may
@@ -13608,6 +13608,122 @@ piece and becomes FR-45.
   `initialize_hash_function` shape the tier was built for.
   Gated behind `--c-abi-exports`, which is default OFF, so nothing reaches a
   default build.
+  **SPIKE VERDICT 2026-09-08: LATENT MODEL VIOLATION (confirmed by the
+  letter), NOT AN OBSERVABLE MISCOMPILE. Record it; do not fix it. Every fix
+  option is strictly worse, and one of them was MEASURED to produce a silent
+  wrong answer.**
+  THE RULE, SOURCED rather than asserted (rustc 1.96.0 shipped docs).
+  `MaybeUninit::assume_init_mut` is the least hedged and most on-point
+  citation, and **its own worked counterexample is a no-niche plain-integer
+  struct out-parameter** -- `struct Foo { a: u32, b: u8 }` with
+  `&mut foo.assume_init_mut().a`, called "*(mutable) reference to
+  uninitialized memory! This is undefined behavior*". `slice::from_raw_parts`
+  requires "*`len` consecutive PROPERLY INITIALIZED values*", also unhedged.
+  So `repr(C)` and absence of niches do NOT change the answer at this layer:
+  the requirement is "initialized", not "in range". **Padding IS exempt**
+  (`[undefined.validity.undef]`), which covers `struct tflac`'s 2 padding
+  bytes and `TflacMd5`'s 4. The Reference's own reference-validity clause is
+  the hedged one -- "*remains a subject of some debate*" -- and that is the
+  load-bearing sentence for the severity call.
+  **MIRI'S REFERENCE-VALIDITY CHECK IS SHALLOW**, under Stacked AND Tree
+  Borrows (there is no `-Zmiri-recursive-validity` in this Miri). Eight
+  probes reproducing the emitter's wrappers verbatim: creating `&mut T`,
+  `&T` or `&[u8]` over uninitialized memory is **CLEAN** every time; only
+  actually READING uninit is reported, and the diagnostic points at the read,
+  never at the reference creation. Both detected shapes are UB in C as well,
+  i.e. symmetric, not translation-introduced.
+  **NO NATIVE DIVERGENCE ANYWHERE.** A C host `dlopen`ing the clang native
+  and the emitted cdylib side by side, over a fresh stack local, a
+  deliberately `0xDEADBEEF`-poisoned frame, and a `malloc`'d block:
+  byte-identical at `-O0/-O1/-O2/-O3`, at `-C debug-assertions=on`, and at
+  `-C lto=fat -C codegen-units=1 -C target-cpu=native`. 200 runs of each
+  binary produced exactly one distinct output each, so nothing exercised
+  `undef`'s licence to differ per use.
+  **WHY IT DOES NOT BITE, established in the IR rather than reasoned.** With
+  the body inlined the exported symbol's parameter carries nothing about the
+  pointee (`ptr noundef writeonly captures(none) initializes((0, 40))` --
+  and `initializes` is a WRITE fact, not an initialization precondition).
+  **LLVM IR has no attribute that expresses "this pointee is initialized".**
+  `&[u8]` never even survives at any opt level >= 1: ArgPromotion/SROA splits
+  it into exactly the bytes the source loads, so never-read bytes never reach
+  LLVM. The only initialization assertion anywhere is `!noundef` on
+  individual scalar loads, which appear only at indices the source genuinely
+  reads -- the case that is C UB too.
+  **A STRUCTURAL MITIGATION NOBODY HAD RECORDED, and it is the load-bearing
+  reason the severity is low.** FR-182's faithfulness whitelist requires each
+  leaf's emitted Rust width to equal clang's `getTypeSize`, which refuses
+  `_Bool` (8 bits vs 1) and refuses enums by name. So `bool`, `char`, enum
+  discriminants, `NonZero`, references and fn-pointers -- **every type with
+  an invalid bit pattern** -- are structurally unreachable behind a class
+  0/1/2 reference. Only integers and IEEE floats, for which every bit pattern
+  is a valid value, can be there. That removes the single mechanism (niche /
+  `!range` folding) by which rustc and LLVM actually exploit uninit today.
+  **The whitelist was built for WIDTH FIDELITY and buys this for free.**
+  SCOPE: **CLASS 0 is NOT exposed** -- a C caller must lvalue-convert to pass
+  by value, which is already C UB if indeterminate, so it is symmetric.
+  CLASS 1 (`&mut *p` / `&*p`) is exposed. **CLASS 2 IS EXPOSED MORE SHARPLY,
+  and this is the finding most worth carrying:** `cAbiProvenSliceBound`
+  computes `max(index)+1` **with no contiguity requirement**, so indices
+  strictly inside the slice that are provably never read are routine. Three
+  of the five shapes pinned in `test/Driver/c-abi-exports-slice-bound.c` have
+  such a hole -- including **`hdr_bitrate`, the corpus's own case**, which
+  reads `{1,2}` with bound 3, leaving index 0 inside the slice and never
+  read. A C caller may legally leave those bytes uninitialized with **no C UB
+  at all**, and `from_raw_parts`' precondition is the unhedged one. So class
+  2's contract violation is better-sourced than class 1's.
+  **THE BYTE-DIFF ORACLE IS STRUCTURALLY BLIND TO THIS CLASS, and that -- not
+  the UB -- is the fact worth recording.** Four of 252 corpus crates carry a
+  wrapper and all four are plausibly callable with uninitialized memory, but
+  **zero of 252 are actually exercised that way by any oracle**: the corpus
+  harness's `state_member!` derives `Deserialize` and every vector supplies
+  every field, and the shipped lit driver assigns all five `struct tflac`
+  members before the call. This repo's highest authority cannot see it.
+  OPTIONS, COSTED -- and option 3 is why this is a record rather than a fix:
+   - **`MaybeUninit` in the wrapper: NO.** It forces the body's parameter to
+     `&mut MaybeUninit<T>` and every field access to a raw-pointer write, so
+     FR-182's pinned "translated body is TEXTUALLY UNCHANGED" property is
+     gone outright -- and it does not even close the problem, since all three
+     corpus class-1 cases READ fields and would need `assume_init_ref`,
+     reintroducing the identical UB.
+   - **Wrapper pre-writes `T::default()`: NO, and this one was MEASURED.**
+     Where a must-write-before-read proof holds it is byte-identical; where
+     it does not (a function that reads a field), native `check: rc=0
+     seeded=2 total=43` versus the patched cdylib's `check: rc=-1 seeded=9
+     total=0` -- **exit 0, `cargo build` clean, no warning, no panic: a
+     SILENT WRONG ANSWER, the exact class this repo forbids.** It would need
+     a whole new must-write dataflow analysis, in the FR-202 mould, for +0
+     corpus cases, and would only ever cover PURE out-parameters -- which
+     none of the three corpus class-1 cases are.
+   - **Refuse out-parameter shapes: NO.** They are unidentifiable from the
+     signature, so it means refusing all of class 1: TRACTOR 41 -> 38, and it
+     deletes the very shape the tier exists to reach.
+   - **Tighten class 2 to "the accessed index set is exactly `{0..N-1}`":
+     the only option that removes a genuinely asymmetric exposure without
+     touching the body**, and a ~4-line change at
+     `TranslateToRust.cpp:4785-4815`. Measured cost: it refuses
+     `hdr_bitrate` (TRACTOR **41 -> 40**, losing its 103 passing vectors) and
+     turns 3 of 5 pinned shapes into refusals. Correct, but it costs the ONLY
+     class-2 case there is against a divergence nobody can measure. **This is
+     the shape to reach for if the rule ever hardens.**
+   - A `// SAFETY:` line on the generated wrapper is zero-risk but moves the
+     `CABI-NEXT` goldens; worth doing in whatever wave next touches those.
+  FR-181's one-reference cap was not lifted, questioned, or relied on by any
+  option.
+  **DEFERRED EXPOSURE, and the trigger for revisiting: FR-178's SPHINCS+ +20
+  ceiling is `SPX_initialize_hash_function(spx_ctx *)`, the paradigm
+  out-parameter, and would arrive as a byte-region "class 3" spelled
+  `from_raw_parts_mut(p, sizeof)` over a WHOLLY uninitialized object -- same
+  unhedged precondition, worse coverage. Class 3 is NO-GO at +0 today, so the
+  decision is deferrable, but IT MUST BE MADE BEFORE CLASS 3 EVER LANDS.**
+  NOT RESOLVED: whether the opsem team lands recursive reference validity (if
+  they do, this becomes UB under an unhedged rule and a `cargo miri` gate
+  would go red); whether rustc/LLVM ever gain an initialization PRECONDITION
+  attribute; **Miri could not be driven through a real cdylib export called
+  from a C process** (`-Zmiri-native-lib` runs the other direction), so the
+  probe calls the wrapper item directly over `MaybeUninit` storage -- the
+  same operation minus the FFI boundary, stated as a modelling gap and not a
+  proof; whether any real C caller of the four corpus functions passes uninit
+  memory; and non-x86-64/LP64 targets, inherited unchanged from FR-182/202.
 
 - [x] FR-210 (opened and LANDED 2026-09-08; FR-193 item 2 -- **THE LAST
   UNCLOSED ITEM OF THE 997-PROBE HUNT**): **`%s` WITH A FIELD WIDTH WAS
