@@ -13709,6 +13709,29 @@ piece and becomes FR-45.
   exactly ONE rejected item, so at most one function's interior is hidden.
   That is where FR-229's family lives, and it is why the spike could
   hand-verify its residue as zero for 10 of 12 programs.
+  **CENSUS SNAPSHOT AT 55/252 (2026-09-10, after FR-224 and both FR-229
+  waves), showing what the work actually did to the board:**
+      <= 7  pointer assigned a non-address value      (exec 2, lib 5)
+      <= 4  use of main's argv parameter              (exec 4)
+      <= 4  pointer variable 'X' has no known target object   (exec 2, lib 2)
+      <= 2  void pointer parameter / address of a global / bit-field
+            initializer / locale ctype table lookup / scanf conversion 'X'
+      <= 1  the abort stdout-flush refusal, the libm accuracy refusal,
+            pointer-to-pointer parameter, the last system-header call,
+            pointer cast reinterprets the pointee, comparison of pointers
+            into different objects
+  Two movements are worth reading. **`the address of a scalar object is not a
+  string region` is GONE from the table entirely** -- it was <=5 before the
+  byte-view waves and is now zero, which is the cleanest confirmation
+  available that FR-229 hit a real class rather than five special cases. And
+  **`scanf conversion 'X'` APPEARED at <=2**, which is not a regression: those
+  are `035`/`038` `exec`, the last two members of FR-229's family, whose
+  byte-view blocker cleared and revealed the `%f` behind it. A blocker
+  appearing because the one in front of it was fixed is the expected shape of
+  progress and should not be read as new breakage.
+  The rejected-items histogram is essentially unchanged (60 / 35 / 17 / 1 / 4
+  and the 7-8-14-15 SPHINCS+ groups at 80), so **none of this session's work
+  touched the deep cohort**, exactly as predicted.
   **AND THE 5-FIX SET CLEARS +82 EMIT -- BUT ALL 82 ARE `lib`, ZERO ARE
   `exec`.** Clearing emit is not PASS: a lib case must then export a
   dlsym-able symbol. That is FR-178's finding, and the three-stage check
