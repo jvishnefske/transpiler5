@@ -1275,6 +1275,19 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
                            "unsupported: owner-index-returning call has no "
                            "pointer argument to root the result at");
       }
+      // `p = strchr(s, c)` / `strrchr`: the hosted search IS the FR-104
+      // shape with the plan supplied by the library instead of proven
+      // from a body -- `__emitrust_strchr` already answers an index into
+      // argument 0's own region, or -1. So it is a region source exactly
+      // like copying from that argument, and it is NULLABLE, which is the
+      // whole point: the CTS-P8 flag cell carries the discriminant the
+      // caller's `if (s)` reads.
+      if (!callee->hasBody() && callee->getDeclName().isIdentifier() &&
+          (callee->getName() == "strchr" || callee->getName() == "strrchr") &&
+          call->getNumArgs() == 2) {
+        recordNullable(ptr, loc);
+        return recordPointerWrite(ptr, call->getArg(0));
+      }
       // `p = f(...)` on a free function proven to return an i64 cursor
       // into the region of ONE of its own slice parameters (FR-104): the
       // call is a region source exactly like copying from that
@@ -4045,7 +4058,57 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
   // region the SAME argument `recordPointerWrite` chose (mirrored here via
   // `emitMethodCallSite`'s single argument-materialization pass, so the
   // argument is evaluated exactly once).
+  // `p = <pointer expr>` in VALUE position -- `while ((s = strchr(s, c)))`
+  // and `for (...; s = strchr(s, c); ...)`. C's value of an assignment is
+  // the value stored, so this performs the ordinary rebind through the one
+  // function responsible for pointer stores and then decomposes the
+  // pointer local itself. Order matters and is the whole content of the
+  // arm: store first, read back second, so the condition sees the NEW
+  // cursor and the new CTS-P8 non-null flag rather than the old ones.
+  if (const auto *assign = llvm::dyn_cast<clang::BinaryOperator>(e);
+      assign && assign->getOpcode() == clang::BO_Assign &&
+      !isFunctionPointer(assign->getLHS()->getType())) {
+    if (const clang::VarDecl *var = asVarRef(assign->getLHS()))
+      if (pointerLocals.contains(var) || pointerRegions.tracks(var)) {
+        if (failed(storePointerAssign(loc, var, assign->getRHS())))
+          return failure();
+        return emitPointerLocalRead(loc, var);
+      }
+  }
+
   if (const auto *call = llvm::dyn_cast<clang::CallExpr>(e)) {
+    // `strchr(s, c)` as a POINTER VALUE. The hosted helper already returns
+    // index-or-(-1) into argument 0's region, so the decomposition is the
+    // FR-104 nullable one: same region, cursor advanced by the index, and
+    // the CTS-P8 non-null flag is `index != -1`. The dead payload is
+    // clamped to 0 exactly as the Option-of-cursor arm's `unwrap_or(0)`
+    // does -- unobservable in a defined program, because dereferencing the
+    // null a failed search returns is UB.
+    bool reverse = false;
+    if (const clang::CallExpr *search = asHostedStrchrCall(call, reverse)) {
+      PtrExprValue region;
+      FailureOr<Value> index = emitStrchrIndex(search, reverse, region);
+      if (failed(index))
+        return failure();
+      if (!region.cursor)
+        return emitError(loc)
+               << "unsupported: strchr over a region with no cursor";
+      Value minusOne = createIntConstant(loc, cursorType, -1);
+      Value zero = createIntConstant(loc, cursorType, 0);
+      Value found = builder
+                        .create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne,
+                                               *index, minusOne)
+                        .getResult();
+      Value payload =
+          builder.create<arith::SelectOp>(loc, found, *index, zero)
+              .getResult();
+      PtrExprValue value = region;
+      value.cursor =
+          builder.create<arith::AddIOp>(loc, region.cursor, payload)
+              .getResult();
+      value.nonNull = found;
+      return value;
+    }
     if (const clang::FunctionDecl *callee = call->getDirectCallee()) {
       const clang::FunctionDecl *canonical = callee->getCanonicalDecl();
       if (ownerIndexReturns.contains(canonical)) {

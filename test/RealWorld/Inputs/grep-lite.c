@@ -1,7 +1,10 @@
 // RealWorld corpus (Track 4): a grep-lite line scanner that binds strchr's
 // RESULT to a pointer local (`const char *nl = strchr(...)`) and walks it.
-// Demand signal for the strchr-result-bind blocker (strchr is only supported
-// in fused, result-consuming positions today).
+// The strchr bind itself is supported since FR-230 (the search is a param-0
+// nullable cursor return); this file's demand signal MOVED FORWARD with it
+// and is now `null pointer constant assigned to a pointer into a string
+// literal` -- `line` is bound to a string literal region and the walk's
+// null-termination assigns NULL into it.
 #include <stdio.h>
 #include <string.h>
 
