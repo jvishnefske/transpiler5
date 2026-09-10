@@ -53,12 +53,20 @@ void CImporter::requestScanHelper(llvm::StringRef name) {
   // primitive, so the slot and the reader come along with any of them.
   neededScanHelpers.insert("__EMITRUST_STDIN_PUSHBACK");
   neededScanHelpers.insert("__emitrust_stdin_getc");
-  // The three directives that skip leading whitespace also push a
-  // character back (C affords exactly one slot; see `__emitrust_scan_d`).
+  // The directives that skip leading whitespace also push a character back
+  // (C affords exactly one slot; see `__emitrust_scan_d`).
   if (name == "__emitrust_scan_ws" || name == "__emitrust_scan_d" ||
-      name == "__emitrust_scan_u") {
+      name == "__emitrust_scan_u" || name == "__emitrust_scan_f" ||
+      name == "__emitrust_scan_lf") {
     neededScanHelpers.insert("__emitrust_stdin_ungetc");
     neededScanHelpers.insert("__emitrust_scan_skip_ws");
+  }
+  // `%f` and `%lf` are the same greedy scan of C's float grammar over two
+  // out-argument types, so both pull the one shared scanner (and its
+  // `inf`/`nan` keyword arm).
+  if (name == "__emitrust_scan_f" || name == "__emitrust_scan_lf") {
+    neededScanHelpers.insert("__emitrust_scan_float_text");
+    neededScanHelpers.insert("__emitrust_scan_float_word");
   }
   neededScanHelpers.insert(name);
 }
@@ -426,6 +434,18 @@ FailureOr<Value> CImporter::emitScanArg(const clang::Expr *expr, ScanKind kind,
       return emitError(loc) << "unsupported: scanf conversion '%c' requires "
                                "a character argument";
     break;
+  case ScanKind::Float:
+    if (!astContext().hasSameUnqualifiedType(argType, astContext().FloatTy))
+      return emitError(loc)
+             << "unsupported: scanf conversion '%f' requires a 'float' "
+                "argument";
+    break;
+  case ScanKind::Double:
+    if (!astContext().hasSameUnqualifiedType(argType, astContext().DoubleTy))
+      return emitError(loc)
+             << "unsupported: scanf conversion '%lf' requires a 'double' "
+                "argument";
+    break;
   case ScanKind::Whitespace:
     llvm_unreachable("a whitespace directive consumes no argument");
   }
@@ -433,7 +453,7 @@ FailureOr<Value> CImporter::emitScanArg(const clang::Expr *expr, ScanKind kind,
   if (failed(valueType))
     return failure();
   auto intType = llvm::dyn_cast<IntegerType>(*valueType);
-  if (!intType)
+  if (!intType && !llvm::isa<FloatType>(*valueType))
     return emitError(loc) << "unsupported: a scanf argument must be the "
                              "address of a function-local scalar variable";
   switch (kind) {
@@ -449,6 +469,12 @@ FailureOr<Value> CImporter::emitScanArg(const clang::Expr *expr, ScanKind kind,
     // making `%c` a platform-dependent rejection.
     helper = intType.isUnsigned() ? "__emitrust_scan_c_u"
                                   : "__emitrust_scan_c";
+    break;
+  case ScanKind::Float:
+    helper = "__emitrust_scan_f";
+    break;
+  case ScanKind::Double:
+    helper = "__emitrust_scan_lf";
     break;
   case ScanKind::Whitespace:
     break;
@@ -500,13 +526,20 @@ FailureOr<Value> CImporter::emitScanfCall(const clang::CallExpr *call,
       return emitError(loc) << "unsupported: non-printable or non-ASCII byte "
                                "in a scanf format";
 
-  // The admitted grammar: whitespace runs, `%d`, `%u`, `%c`. No length
-  // modifier, no field width, no assignment-suppressing `*`, no
-  // literal-match characters. `%f`/`%lf` is refused DELIBERATELY -- glibc
-  // accepts hex floats (`0x1p3` is 8) and `inf`/`infinity`/`nan(1)`, which
-  // Rust's `parse` does not, and FR-183 measured it worth zero corpus
-  // cases -- so admitting it would be the feature's largest correctness
-  // risk for no gain.
+  // The admitted grammar: whitespace runs, `%d`, `%u`, `%c` and C's float
+  // family `a e f g` in either case, optionally preceded by `l`. No other
+  // length modifier, no field width, no assignment-suppressing `*`, no
+  // literal-match characters.
+  //
+  // The float family is ONE conversion with fourteen spellings -- C reads
+  // the same input syntax for every one of them, and the `l` selects only
+  // the out-argument's type. FR-183 refused it because glibc's grammar
+  // accepts hex floats (`0x1p3` is 8) and `nan(1)`, which Rust's `parse`
+  // does not; the decimal / `inf` / `nan` subset IS bit-exact (both
+  // `strtof` and Rust's parser are correctly rounded), and the two forms
+  // Rust cannot reproduce arrive from RUNTIME stdin, so they cannot be
+  // refused HERE at all -- `__emitrust_scan_float_text` panics loudly on
+  // them instead. `%L` stays refused: long double is x87 80-bit.
   SmallVector<ScanKind> directives;
   for (size_t i = 0; i < format.size();) {
     if (isScanSpace(format[i])) {
@@ -538,9 +571,19 @@ FailureOr<Value> CImporter::emitScanfCall(const clang::CallExpr *call,
     if (llvm::isDigit(format[i]))
       return emitError(loc)
              << "unsupported: scanf field width in '" << spelling << "'";
-    if (llvm::StringRef("hljztL").contains(format[i]))
+    // `l` is admitted ONLY as the float family's `double` selector; before
+    // anything else it is still a length-modifier rejection, and so is
+    // every other modifier including `L`.
+    llvm::StringRef floatConversions = "aAeEfFgG";
+    bool isDouble = false;
+    if (format[i] == 'l' && i + 1 < format.size() &&
+        floatConversions.contains(format[i + 1])) {
+      isDouble = true;
+      ++i;
+    } else if (llvm::StringRef("hljztL").contains(format[i])) {
       return emitError(loc)
              << "unsupported: scanf length modifier in '" << spelling << "'";
+    }
     char conversion = format[i++];
     if (conversion == 'd')
       directives.push_back(ScanKind::Int);
@@ -548,10 +591,12 @@ FailureOr<Value> CImporter::emitScanfCall(const clang::CallExpr *call,
       directives.push_back(ScanKind::Unsigned);
     else if (conversion == 'c')
       directives.push_back(ScanKind::Char);
+    else if (floatConversions.contains(conversion))
+      directives.push_back(isDouble ? ScanKind::Double : ScanKind::Float);
     else
-      return emitError(loc) << "unsupported: scanf conversion '%"
-                            << conversion
-                            << "' (only %d, %u and %c are supported)";
+      return emitError(loc)
+             << "unsupported: scanf conversion '%" << conversion
+             << "' (only %d, %u, %c and %a/%e/%f/%g are supported)";
   }
 
   unsigned conversions = 0;

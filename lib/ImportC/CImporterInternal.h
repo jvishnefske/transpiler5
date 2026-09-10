@@ -5833,12 +5833,17 @@ private:
   //===--------------------------------------------------------------------===//
 
   /// One directive of an admitted scanf format. The grammar is exactly
-  /// whitespace runs plus `%d`, `%u` and `%c`; everything else -- length
-  /// modifiers, field widths, `*`, literal-match characters, and every
-  /// other conversion (notably `%f`/`%lf`, whose glibc grammar accepts hex
-  /// floats and `inf`/`nan(1)` that Rust's `parse` does not) -- is a
-  /// located rejection.
-  enum class ScanKind { Whitespace, Int, Unsigned, Char };
+  /// whitespace runs, `%d`, `%u`, `%c` and C's float family; everything
+  /// else -- field widths, `*`, literal-match characters and every other
+  /// conversion -- is a located rejection.
+  ///
+  /// `Float` and `Double` are ONE C conversion with fourteen spellings:
+  /// `a e f g` in either case, optionally preceded by `l`. The letter
+  /// selects nothing at all (C reads the same input syntax for every one of
+  /// them); only the `l` matters, and only because it changes the
+  /// out-argument from `float *` to `double *`. `L` (x87 80-bit long
+  /// double) stays a rejection: no Rust type holds it.
+  enum class ScanKind { Whitespace, Int, Unsigned, Char, Float, Double };
 
   /// Requests one `__emitrust_scan_*` / `__emitrust_stdin_*` helper (and
   /// the primitives it calls), emitted once per module in `kScanHelpers`

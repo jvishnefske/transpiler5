@@ -2744,11 +2744,15 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
              << "unsupported: '" << name
              << "' has no bit-exact Rust mapping (C imposes no accuracy "
                 "requirement and libm implementations disagree)";
+    // FR-230 added the pointer BINDING to the admitted consumptions (the
+    // search is a param-0 nullable cursor return); a result consumed any
+    // other way -- discarded, returned, stored into a global or a struct
+    // member -- still has nowhere to carry its non-null flag.
     if (name == "strchr" || name == "strrchr")
       return emitError(loc)
              << "unsupported: a " << name
-             << " result must feed a printf '%s' argument or a "
-                "comparison against a null pointer";
+             << " result must feed a pointer binding, a printf '%s' "
+                "argument or a comparison against a null pointer";
     // Hosted <stdio.h> FILE* streams (design.md C99-48, CTS-T1.3):
     // sequential byte-wise I/O on an owned function-local handle. File
     // positioning contradicts the sequential-only model and stays a

@@ -14445,8 +14445,35 @@ piece and becomes FR-45.
   flat, CTestSuite 220/220, Cpp17Suite 35/35, golden sweep over 1108 sources
   with **0 MOVED** (2 newly emitting, both the new tests). All re-verified
   independently in the main tree.
-  **WAVE 3, the residue (NOT scheduled):** `scanf %f` for the last two family
-  members, and the four shapes listed above if demand ever appears.
+  **WAVE 3 LANDED 2026-09-10: `scanf %f`, +2 PASS, AND THE FAMILY IS NOW 12 OF
+  12.** `035_cast_to_char_ptr_float` and `038_..._no_strict_aliasing`, both
+  `exec`. TRACTOR 57 -> 59, EMIT 70 -> 72.
+  **THE PARSE HAD TO BE BIT-EXACT, NOT CLOSE**, because these programs print
+  the float's RAW BYTES through the very byte view Waves 1-2 built. Verified
+  rather than assumed: **120,000 random values** -- f32 and f64 bit patterns,
+  long digit strings, exponent forms, halfway cases -- **byte-identical**, and
+  all six corpus vectors reproduce exactly including `-0` -> `00000080`
+  (negative zero, not `00000000`). I re-checked all six by hand in the main
+  tree.
+  **FR-183's REFUSAL WAS RIGHT AND ITS REASON SURVIVES**: glibc's `%f` accepts
+  `0x1p3`, `inf`, `nan(chars)`; Rust's parser takes some and not others, and
+  the input arrives from RUNTIME STDIN so it cannot be refused at compile
+  time. The resolution is a greedy C-syntax scan plus Rust's correctly-rounded
+  parser, with a **LOUD PANIC** on the two forms Rust cannot reproduce.
+  Measured: 4,352 malformed inputs gave 4,233 byte-identical and **119 loud
+  panics, every one classified (87 hex, 32 nan-payload), with ZERO silent
+  divergences.** Confirmed by hand: on `0x1p3` the native prints `00000041`
+  and the crate panics at rc 101.
+  **HEX FLOATS ARE A PANIC, NOT AN IMPLEMENTATION, AND THE MEASUREMENT IS WHY:
+  glibc accepts `0x.p3` as the value 0**, a quirk outside the C grammar, so
+  even a full ~20-line hex scanner would still diverge. Implementing it would
+  have bought the appearance of coverage and not exactness.
+  Admitted: `%a %e %f %g` in either case onto `float*`, the same with `l` onto
+  `double*`. `%Lf` stays refused (x87 80-bit). Four frontier pins in
+  `stdin-scan-invalid.c` were **FLIPPED FORWARD into positive tests**, not
+  deleted, and replaced by four new ones (`%Lf`, `%lc`, and both
+  argument-type mismatches).
+  Gate 1076/1076 at that point; golden sweep 0 byte-moved.
 
 - [ ] FR-230 (opened and SPIKED 2026-09-10): **`pointer assigned a
   non-address value` IS NOT ONE LEVER. NO-GO AS A SINGLE INCREMENT -- it is
@@ -14535,6 +14562,32 @@ piece and becomes FR-45.
       Best ratio, and the only sub-feature where every part is scoped.
    2. **C + E (+ F)** -> 028 + 028_lib = **+2 EMIT, +1 PASS**. Model proven
       byte-identical; price E and F as real frontiers.
+      **LANDED 2026-09-10, AND "PRICE E AND F AS REAL FRONTIERS" WAS
+      PESSIMISTIC. THE SPIKE'S UNRESOLVED QUESTION IS ANSWERED: F DOES NOT
+      FIRE FOR 028 AT ALL.** The hosted argument goes through
+      `emitCharRegionArg`, not the user-function argument gate -- so F still
+      fires for a user-defined `my_strchr`, which is pinned as such, and never
+      for the hosted one. **Frontier C alone (classify hosted
+      `strchr`/`strrchr` as a param-0 nullable cursor return) lifted BOTH the
+      single bind and the walking statement form**, and **E turned out to be
+      ONE ARM, ~14 lines**: a `BO_Assign` on a tracked pointer local in
+      `emitPointerRValue` that stores through the existing
+      `storePointerAssign` and then reads back. TRACTOR 59 -> 60, EMIT 72 ->
+      74; `028_lib` moved `EMIT_FAIL` -> `SYMBOL_MISSING`, export-walled
+      exactly as this entry predicted, so PASS is +1.
+      Verified on **415 adversarial inputs on 028 verbatim and 612 on a
+      seven-shape probe** (four loop spellings, `strrchr`, a non-search RHS):
+      **zero divergences**, zero `unsafe`, zero clippy lints in the emitted
+      crates. I re-checked the corpus vectors by hand.
+      **ONE EndToEnd VECTOR WAS WRITTEN AND THEN REMOVED, WHICH IS THE RIGHT
+      CALL:** walking on the needle `0`. The clang native **SEGFAULTS** --
+      `strchr(s, 0)` matches the terminator, so `s++` steps off the object.
+      That is undefined C, not a comparable difference, and the byte-diff
+      oracle caught it. The file now says so explicitly rather than quietly
+      omitting the case.
+      The `STRCHRBIND` pin moved forward into the new positive test plus a
+      seven-unit frontier file; the consumption wording is widened to name the
+      pointer binding it now admits.
    3. **A + B** -> +4 EMIT, **+0 PASS**. Fund only as an EMIT/diagnostic item,
       and say so explicitly per the protocol's rule about publishing yield.
   **A DIAGNOSTIC IMPROVEMENT WORTH +0 CASES AND A GREAT DEAL OF CLARITY.**

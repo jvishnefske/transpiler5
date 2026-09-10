@@ -9,13 +9,14 @@ this document, they win** — this one summarises, they record.
 
 | | |
 |---|---|
-| **TRACTOR PASS** | **57 / 252** (exec 21, lib 36) |
-| EMIT-cleared | 69 / 252 |
-| SYMBOL_MISSING | 11 — emit clean, export refused |
+| **TRACTOR PASS** | **60 / 252** (exec 24, lib 36) |
+| EMIT-cleared | 74 / 252 |
+| SYMBOL_MISSING | 13 — emit clean, export refused |
 | VACUOUS_PASS | 1 (`update_md5_lib`; its only vector is `has_ub` and skipped) |
 
-One session moved this **41 → 57**: FR-224's libc shim table (+4), FR-229's
-char-pointer byte view in two waves (+5, +5), FR-230's `alloca` (+2).
+One session moved this **41 → 60**: FR-224's libc shim table (+4), FR-229's
+char-pointer byte view in three waves (+5, +5, +2), FR-230's `alloca` (+2) and
+`strchr` cursor bind (+1). FR-228 and FR-232 landed at +0 PASS by design.
 
 ### The denominator is not what it looks like
 
@@ -51,21 +52,19 @@ it moves after each individual fix rather than only when a whole set lands:
 
 ## Ranked work
 
-### 1. FR-230 item 2 — hosted `strchr` cursor bind · +1 PASS
+### 1. ~~FR-230 item 2 — `strchr` cursor bind~~ · **DONE, +1 PASS**
 
-`028_strchr` + its `_lib` twin. **The model is already proven byte-identical**
-to the clang native on both corpus vectors and five adversarial inputs:
-`__emitrust_strchr` already returns index-or-`-1`, exactly what a cursor bind
-needs. The cost is not `strchr` itself but the two frontiers behind it — a
-pointer assignment used as an rvalue/condition, and a possibly-null pointer
-passed as an argument. `028_strchr_lib` is export-walled, so PASS is +1.
+Landed. "Price E and F as real frontiers" was pessimistic: **F never fires for
+the hosted call at all**, and E was one arm of ~14 lines.
 
-### 2. FR-229 residue — `scanf %f` · +2 PASS
+### 2. ~~FR-229 residue — `scanf %f`~~ · **DONE, +2 PASS**
 
-Completes the byte-view family to 12/12 (`035`/`038` exec). FR-183
-deliberately refused `%f` because glibc accepts `0x1p3`/`inf`/`nan(1)` and
-Rust's `parse` does not — **check the corpus vectors before assuming the
-narrow decimal case is enough.**
+Family complete at 12/12. FR-183's refusal was right and its reason survives —
+resolved with a greedy C-syntax scan plus Rust's correctly-rounded parser and a
+**loud panic** on hex floats and `nan(payload)`, the two forms Rust cannot
+reproduce. 120,000 random values byte-identical; 119 panics, zero silent
+divergences. Hex floats are deliberately *not* implemented: glibc accepts
+`0x.p3` as 0, outside the C grammar, so a scanner would still diverge.
 
 ### 3. FR-226 — the SPHINCS+ package · up to +12 PASS, cost unknown
 
