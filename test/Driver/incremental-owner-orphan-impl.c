@@ -34,7 +34,19 @@
 // RUN: emitrust-cc --emit=crate --incremental %s -o %t.crate --crate-type=lib \
 // RUN:   --build 2>%t.err
 // RUN: FileCheck %s --check-prefix=WARN --input-file=%t.err
-// RUN: FileCheck %s --check-prefix=RUST --input-file=%t.crate/src/lib.rs
+// FR-220 made this crate root BYTE-EMPTY. It used to be exactly
+// `#![allow(dead_code)]\n\n` -- the blanket crate-root allow and its blank
+// line -- and with both items recovered away that header was all that was
+// left. The allow is now a per-item attribute on the records, enums and
+// inherent impls the emitter writes, so a crate with no surviving item has no
+// crate root text at all. FileCheck refuses an empty input by default, hence
+// `--allow-empty`: the three RUST-NOT lines below still say what they always
+// said (no orphaned `impl`, no dangling type name), and an empty file
+// satisfies them vacuously and correctly. `--build` above is still the real
+// oracle -- cargo builds an empty `lib` crate, which is exactly FR-44's
+// guarantee that recovery emits something buildable.
+// RUN: FileCheck %s --check-prefix=RUST --allow-empty \
+// RUN:   --input-file=%t.crate/src/lib.rs
 // RUN: FileCheck %s --check-prefix=JSON \
 // RUN:   --input-file=%t.crate/emitrust-progress.json
 //
@@ -44,7 +56,8 @@
 // RUN: emitrust-cc --emit=crate --incremental --search %s -o %t.searched \
 // RUN:   --crate-type=lib --build 2>%t.search.err
 // RUN: FileCheck %s --check-prefix=WARN --input-file=%t.search.err
-// RUN: FileCheck %s --check-prefix=RUST --input-file=%t.searched/src/lib.rs
+// RUN: FileCheck %s --check-prefix=RUST --allow-empty \
+// RUN:   --input-file=%t.searched/src/lib.rs
 //
 // Recovery OFF is unchanged, and that is what makes this change free: every
 // shape that reaches the sweep already dies earlier in strict mode, so no
@@ -79,7 +92,8 @@ void make(long long v, void *sink) {
 
 // Nothing dangling reaches the crate: no impl, and no reference to a type
 // that was never defined. (`--build` above is the real oracle -- the crate
-// this used to emit did not compile.)
+// this used to emit did not compile.) Since FR-220 the crate root is empty,
+// so "nothing dangling" is literal.
 // RUST-NOT: OwnerMakeBuf
 // RUST-NOT: impl
 // RUST-NOT: tu0_fill

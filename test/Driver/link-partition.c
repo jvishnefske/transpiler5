@@ -45,6 +45,19 @@
 // BINDEP: [dependencies]
 // BINDEP: ga = { path = "../ga" }
 //
+// FR-220 note, added when the crate-root allow header became EMPTY under the
+// idiomatic rename: a DEPENDENT member's header used to be built by extending
+// the base header's lint list (`drop_back(")]\n")` + ", unused_imports"),
+// which cannot extend an empty string. The member header is now written
+// directly, and this pins the result -- one lint, then the glob imports that
+// are how the emitter's bare cross-crate names resolve against FR-51's pubs.
+// The LIB member depends on nothing, so its root starts at its first item.
+// RUN: FileCheck %s --check-prefix=MEMBERROOT --strict-whitespace \
+// RUN:   < %t.ws/gapp/src/main.rs
+//      MEMBERROOT:#![allow(unused_imports)]
+// MEMBERROOT-NEXT:use ga::*;
+// RUN: not grep '#!\[allow' %t.ws/ga/src/lib.rs
+//
 // Override map: assigning BOTH directories to one crate name removes the
 // boundary entirely -- one member named `combined`, no condensation
 // warning at all.

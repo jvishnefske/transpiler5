@@ -10,7 +10,14 @@
 // `_`-prefixed unused bindings, no unused parens).
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s
 
+// FR-220 retired the crate root's blanket `#![allow(dead_code)]`; the data
+// enum, the state struct and the INHERENT impl each now carry their own
+// targeted `#[allow(dead_code)]` (an unconstructed message variant and a
+// declared-but-uncalled handler are faithful translation, not codegen sloppy).
+// Pure attribute POSITION movement -- every item, method and match arm below
+// is byte-identical.
 // CHECK:      #[derive(Clone, Copy)]
+// CHECK-NEXT: #[allow(dead_code)]
 // CHECK-NEXT: enum Msg {
 // CHECK-NEXT:     Quit,
 // CHECK-NEXT:     Add { amount: i32 },
@@ -18,13 +25,15 @@
 // CHECK-NEXT: }
 emitrust.data_enum_def @Msg ["Quit", "Add", "Move"] [[], ["amount"], ["x", "y"]] [[], [i32], [i32, i32]]
 
-// CHECK:      #[derive(Clone, Copy, Default)]
+// CHECK:      #[allow(dead_code)]
+// CHECK-NEXT: #[derive(Clone, Copy, Default)]
 // CHECK-NEXT: struct Counter {
 // CHECK-NEXT:     count: i32,
 // CHECK-NEXT: }
 emitrust.struct_def @Counter ["count"] [i32]
 
-// CHECK: impl Counter {
+// CHECK:      #[allow(dead_code)]
+// CHECK-NEXT: impl Counter {
 emitrust.impl "Counter" {
   // The statement-mode handler: one arm per message variant, state
   // mutated through the payload bindings.

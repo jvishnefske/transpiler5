@@ -4028,6 +4028,19 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "/// why `fclose(stdin)` is an import-time rejection rather than a\n"
        "/// helper: through a per-use temporary it would be a silent\n"
        "/// no-op.\n"
+       // FR-220: the crate root's blanket `#![allow(dead_code)]` is gone, so
+       // this fixed prelude enum carries its own targeted allow. It is a
+       // verbatim blob rather than an `emitrust.data_enum_def`, so it never
+       // reaches `emitDataEnumDef` and cannot inherit the attribute from
+       // there. It is emitted whole or not at all -- the helper
+       // FUNCTIONS are requested individually by `requestFileHelper`, but the
+       // handle type is one blob -- so a program that only ever writes a file
+       // never constructs `Stdin`/`Read`, and a program that only reads never
+       // constructs `Write`. Measured: 4 of the 294 epoch-7 crates hit exactly
+       // this (`stdin-scan.c` leaves Null/Read/Write unconstructed). Trimming
+       // the enum per program instead would make the emitted handle type
+       // program-dependent and break `--link` shard compatibility.
+       "#[allow(dead_code)]\n"
        "enum __EmitrustFile {\n"
        "    Null,\n"
        "    Stdin,\n"

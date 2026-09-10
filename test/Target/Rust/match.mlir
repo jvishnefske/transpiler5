@@ -8,9 +8,19 @@
 // the tuple-struct constructor.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s
 
+// FR-220: an open C enum lowers to TWO items, and with the crate root's
+// blanket `#![allow(dead_code)]` retired each one needs its OWN targeted
+// `#[allow(dead_code)]` -- an attribute on the transparent newtype does not
+// reach the sibling associated-constant `impl`, and an enumerator the program
+// never mentions (legal C, warned about by no C compiler) lives in that impl.
+// The `impl Default` needs none: rustc's dead-code pass never reports
+// trait-impl members. Attribute POSITION only; both items, all three
+// constants and the Default body are byte-identical.
 // CHECK:      #[repr(transparent)]
 // CHECK-NEXT: #[derive(Clone, Copy, PartialEq)]
+// CHECK-NEXT: #[allow(dead_code)]
 // CHECK-NEXT: struct Color(i32);
+// CHECK-NEXT: #[allow(dead_code)]
 // CHECK-NEXT: impl Color {
 // CHECK-NEXT:     const Red: Color = Color(0);
 // CHECK-NEXT:     const Green: Color = Color(1);
@@ -177,7 +187,9 @@ emitrust.func @enum_ops(%arg0: !emitrust.enum<"Color">, %arg1: !emitrust.enum<"C
 // of the borrow that consumes it.
 // CHECK:      #[repr(transparent)]
 // CHECK-NEXT: #[derive(Clone, Copy, PartialEq)]
+// CHECK-NEXT: #[allow(dead_code)]
 // CHECK-NEXT: struct Mode(u32);
+// CHECK-NEXT: #[allow(dead_code)]
 // CHECK-NEXT: impl Mode {
 // CHECK-NEXT:     const Off: Mode = Mode(0);
 // CHECK-NEXT:     const On: Mode = Mode(1);

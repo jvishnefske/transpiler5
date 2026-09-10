@@ -33,9 +33,14 @@
 // RUN: emitrust-cc --link %t/base.o %t/d1/same.o %t/d2/same.o %t/main.o -o %t.crate --crate-name module_sink_name --build
 //
 // Both sinks happened, both are named after their FILES, and no ordinal name
-// survives:
+// survives. (FR-220 inserted a targeted `#[allow(dead_code)]` ahead of each
+// derive -- the per-item replacement for the crate root's retired blanket
+// allow -- at the module's own indentation, which the --strict-whitespace
+// chain pins. Attribute POSITION only: the module NAMES and the byte-diff
+// oracle below are untouched.)
 // RUN: FileCheck %s --check-prefix=NAMES --strict-whitespace < %t.crate/src/main.rs
 //      NAMES:mod d1_same {
+// NAMES-NEXT:    #[allow(dead_code)]
 // NAMES-NEXT:    #[derive(Clone, Copy, Default)]
 // NAMES-NEXT:    pub(crate) struct Buf {
 // NAMES-NEXT:        pub(crate) a: i32,
@@ -43,6 +48,7 @@
 // NAMES-NEXT:    }
 // NAMES-NEXT:}
 //      NAMES:mod d2_same {
+// NAMES-NEXT:    #[allow(dead_code)]
 // NAMES-NEXT:    #[derive(Clone, Copy, Default)]
 // NAMES-NEXT:    pub(crate) struct Buf {
 // NAMES-NEXT:        pub(crate) a: i32,

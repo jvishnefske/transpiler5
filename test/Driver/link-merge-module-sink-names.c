@@ -56,13 +56,20 @@
 // and its uses inside its own shard are repathed to the ABSOLUTE stem path.
 // RUN: emitrust-cc --link %t/alpha.o %t/beta-two.o --emit=rust -o %t.stem.rs
 // RUN: FileCheck %s --check-prefix=STEM --strict-whitespace < %t.stem.rs
-//      STEM:#[derive(Clone, Copy, Default)]
+// FR-220: each record now leads with its own `#[allow(dead_code)]`, the
+// targeted replacement for the crate root's retired blanket allow. Attribute
+// POSITION only; the module NAMING this file exists to pin -- `beta_two` from
+// the source stem, the absolute repathed uses, the absence of any ordinal
+// `tu1::` -- is byte-identical.
+//      STEM:#[allow(dead_code)]
+// STEM-NEXT:#[derive(Clone, Copy, Default)]
 // STEM-NEXT:struct Buf {
 // STEM-NEXT:    a: i32,
 // STEM-NEXT:}
 //      STEM:fn tu1_local_use(v0: crate::beta_two::Buf) -> i32 {
 //      STEM:let b: crate::beta_two::Buf = crate::beta_two::Buf { a:
 //      STEM:mod beta_two {
+// STEM-NEXT:    #[allow(dead_code)]
 // STEM-NEXT:    #[derive(Clone, Copy, Default)]
 // STEM-NEXT:    pub(crate) struct Buf {
 // STEM-NEXT:        pub(crate) a: i32,
@@ -84,6 +91,7 @@
 // DUPFWD-NEXT:}
 //      DUPFWD:fn tu1_use_rec(v0: crate::d2_dup::Rec) -> i32 {
 //      DUPFWD:mod d2_dup {
+// DUPFWD-NEXT:    #[allow(dead_code)]
 // DUPFWD-NEXT:    #[derive(Clone, Copy, Default)]
 // DUPFWD-NEXT:    pub(crate) struct Rec {
 // DUPFWD-NEXT:        pub(crate) a: i32,
@@ -101,6 +109,7 @@
 // DUPREV-NEXT:}
 //      DUPREV:fn tu1_use_rec(v0: crate::d1_dup::Rec) -> i32 {
 //      DUPREV:mod d1_dup {
+// DUPREV-NEXT:    #[allow(dead_code)]
 // DUPREV-NEXT:    #[derive(Clone, Copy, Default)]
 // DUPREV-NEXT:    pub(crate) struct Rec {
 // DUPREV-NEXT:        pub(crate) a: i32,
@@ -115,6 +124,7 @@
 // RUN: FileCheck %s --check-prefix=KEYWORD --strict-whitespace < %t.kw.rs
 //      KEYWORD:fn tu1_kw_use(v0: crate::tu1::Buf) -> i32 {
 //      KEYWORD:mod tu1 {
+// KEYWORD-NEXT:    #[allow(dead_code)]
 // KEYWORD-NEXT:    #[derive(Clone, Copy, Default)]
 // KEYWORD-NEXT:    pub(crate) struct Buf {
 // KEYWORD-NEXT:        pub(crate) a: i32,
@@ -131,6 +141,7 @@
 // RUN: FileCheck %s --check-prefix=TUSHAPE --strict-whitespace < %t.ts.rs
 //      TUSHAPE:fn tu1_kw_use(v0: crate::tu1::Buf) -> i32 {
 //      TUSHAPE:mod tu1 {
+// TUSHAPE-NEXT:    #[allow(dead_code)]
 // TUSHAPE-NEXT:    #[derive(Clone, Copy, Default)]
 // TUSHAPE-NEXT:    pub(crate) struct Buf {
 // TUSHAPE-NEXT:        pub(crate) a: i32,
@@ -150,6 +161,7 @@
 // ROOTTYPE-NEXT:}
 //      ROOTTYPE:fn tu1_rt_use(v0: crate::tu1::Buf) -> i32 {
 //      ROOTTYPE:mod tu1 {
+// ROOTTYPE-NEXT:    #[allow(dead_code)]
 // ROOTTYPE-NEXT:    #[derive(Clone, Copy, Default)]
 // ROOTTYPE-NEXT:    pub(crate) struct Buf {
 // ROOTTYPE-NEXT:        pub(crate) a: i32,

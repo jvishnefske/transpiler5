@@ -47,12 +47,20 @@ int main(void) {
   return 0;
 }
 
-// CHECK:      #![allow(dead_code)]
-// CHECK-EMPTY:
+// FR-220 did to `dead_code` exactly what FR-106 did to `unused_assignments`,
+// and for the same stated reason: a crate-root allow deletes the tripwire on
+// every item at once. The `#![allow(dead_code)]` header and its blank line are
+// gone; the actor struct and the INHERENT impl each carry their own targeted
+// `#[allow(dead_code)]`, and the three free functions carry none -- which is
+// the point, because a dead emitted `fn` is the one shape that would signal an
+// emitter defect. `unused_assignments` is untouched: the CHECK-NOT sweep that
+// opens this file and the one that closes it both still hold.
+// CHECK:      #[allow(dead_code)]
 // CHECK-NEXT: #[derive(Clone, Copy, Default)]
 // CHECK-NEXT: struct Tu0TotalActor {
 // CHECK-NEXT:     tu0_total: i32,
 // CHECK-NEXT: }
+// CHECK-NEXT: #[allow(dead_code)]
 // CHECK-NEXT: impl Tu0TotalActor {
 // CHECK-NEXT:     fn tally(&mut self, n: i32) {
 // CHECK-NEXT:         for i in 0i32..n {

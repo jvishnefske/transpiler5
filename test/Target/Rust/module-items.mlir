@@ -29,7 +29,15 @@
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s --strict-whitespace
 
 // The root items come first, in their historical order and rendering.
-// CHECK:      #[derive(Clone, Copy, Default)]
+// FR-220: "historical rendering" now includes a targeted `#[allow(dead_code)]`
+// ahead of every record and every associated-constant `impl`, replacing the
+// crate root's retired blanket `#![allow(dead_code)]`. It is attribute
+// POSITION only, and this file is the sink's byte-level pin: the attribute is
+// emitted INSIDE the `mod` at the module's own indentation, so the
+// `--strict-whitespace` CHECK-NEXT chains are what prove the sink did not
+// reflow anything.
+// CHECK:      #[allow(dead_code)]
+// CHECK-NEXT: #[derive(Clone, Copy, Default)]
 // CHECK-NEXT: struct Buf {
 // CHECK-NEXT:     a: i32,
 // CHECK-NEXT: }
@@ -68,6 +76,7 @@ emitrust.func @"crate::tu0::add1"(%arg0: i32) -> i32 attributes {emitrust.param_
 
 // (c)+(e): the module's own `Buf`, a DIFFERENT shape from the root's, with
 // `pub(crate)` on the struct and on every field.
+// CHECK-NEXT:     #[allow(dead_code)]
 // CHECK-NEXT:     #[derive(Clone, Copy, Default)]
 // CHECK-NEXT:     pub(crate) struct Buf {
 // CHECK-NEXT:         pub(crate) a: i32,
@@ -94,7 +103,9 @@ emitrust.global const @"crate::tu0::LIMIT" <9 : i32> : i32
 // associated constants and its Default impl.
 // CHECK-NEXT:     #[repr(transparent)]
 // CHECK-NEXT:     #[derive(Clone, Copy, PartialEq)]
+// CHECK-NEXT:     #[allow(dead_code)]
 // CHECK-NEXT:     pub(crate) struct Mode(pub(crate) i32);
+// CHECK-NEXT:     #[allow(dead_code)]
 // CHECK-NEXT:     impl Mode {
 // CHECK-NEXT:         pub(crate) const RAW: Mode = Mode(0);
 // CHECK-NEXT:         pub(crate) const SCALED: Mode = Mode(1);

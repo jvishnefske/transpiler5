@@ -31,13 +31,45 @@
 
 namespace emitrustcc {
 
-/// Attribute header prepended to every generated crate root. Under the default
-/// idiomatic rename only one lint is allowed, because it is intrinsic to a
-/// faithful transpile rather than masking sloppy codegen:
-///   - `dead_code`: rejected items intentionally keep their `struct_def` /
-///     `global` definitions (dropping them was measured and rejected as risking
-///     dangling symbols), and a binary crate legitimately holds unreferenced
-///     imported items.
+/// Attribute header prepended to a generated crate root.
+///
+/// FR-220: under the default idiomatic rename this is EMPTY. `dead_code` was
+/// the last surviving blanket allow, and a crate-root allow is a blindfold --
+/// it hid every kind of dead item at once, including the ONE kind that would
+/// signal an emitter defect. Measured over the whole epoch-7 population (294
+/// crates) with the blanket allow stripped: 33 crates warn, 56 warnings, and
+/// **zero** of them are `function X is never used`. Every warning that DOES
+/// fire is faithful translation of a declaration the C program made and did
+/// not use -- an unmentioned enumerator, an unread field, an unconstructed
+/// record, an uncalled C++ method. Those now carry a TARGETED
+/// `#[allow(dead_code)]` on the item the emitter knows it is writing (the
+/// enum's transparent struct and its associated-constant `impl`, the
+/// `struct_def`, the data enum, and the inherent `impl` block -- see
+/// `RustEmitter::emitStructDef` / `emitEnumDef` / `emitDataEnumDef` /
+/// `emitImpl` in `TranslateToRust.cpp`). A plain `fn` is deliberately left
+/// UNCOVERED, so a future dead emitted function draws a rustc `dead_code`
+/// warning instead of being hidden.
+///
+/// It is NOT `dead_code = "deny"` in `Cargo.toml`, and must not become one.
+/// That was measured and rejected twice over. (1) It regresses the
+/// c-testsuite ledger by 10: an external-linkage C function uncalled in its
+/// own TU is not even a C warning, and the deadness is an artifact of the
+/// emitter privatizing it for a `bin` crate. (2) It breaks FR-44's headline
+/// guarantee -- `RealWorld/Cpp` `polygon`'s `--incremental` crate stops
+/// building -- because recovery drops a rejected CALLER and orphans every
+/// function only that caller reached, so RECOVERY STRUCTURALLY MANUFACTURES
+/// DEAD FUNCTIONS. The tripwire comes from the RATCHET instead:
+/// `nix/clippy-eval/clippy_eval.py` tracks `dead_code` in
+/// `TRACKED_RUSTC_LINTS` and the frozen epoch corpus measures zero of them,
+/// so a newly dead emitted function raises the tally and fails the gate --
+/// without a hard error, so recovery still builds. The lit-level pins are
+/// test/Driver/dead-code-allow-targeted.c (emit) and
+/// test/Driver/dead-code-tripwire.c (rustc, including the recovery case).
+///
+/// No reachability analysis is involved, and none may be added: the FR-40
+/// item graph is CLOSED and skips C++ member functions and non-file-scope
+/// records, so it under-reports reachability and would call live items dead.
+///
 /// `unused_assignments` was formerly allowed here to mask a single residual: a
 /// dead store inside a loop body, whose sound cross-iteration liveness would
 /// risk a miscompile and is deliberately not attempted. FR-61f lifts canonical
@@ -50,18 +82,19 @@ namespace emitrustcc {
 /// puts `#[allow(unused_assignments)]` on the individual `fn` it can prove
 /// holds such a store (measured: 4 of 3475 emitted functions across 472
 /// rustc-clean crates). Moving the allow back into this header would delete
-/// the tripwire on the other 3471.
+/// the tripwire on the other 3471. `dead_code` followed it out of this header
+/// for exactly the same reason.
 /// Every other lint the old blanket header silenced is now DENIED in
 /// `Cargo.toml`'s `[lints.rust]` table (see `renderCargoToml`), so a regression
-/// fails the build.
+/// fails the build. `dead_code` is the sole exception, for the measured
+/// reasons above; it is held at zero by the ratchet instead.
 ///
-/// Under `--preserve-c-names` the three naming lints join the allow list
+/// Under `--preserve-c-names` the three NAMING lints stay in the allow list
 /// instead of the deny table: verbatim C spellings legitimately trip them, and
-/// the flag's whole point is to keep those spellings.
-static constexpr llvm::StringLiteral kAllowHeader =
-    "#![allow(dead_code)]\n";
+/// the flag's whole point is to keep those spellings. Only `dead_code` left.
+static constexpr llvm::StringLiteral kAllowHeader = "";
 static constexpr llvm::StringLiteral kAllowHeaderPreserveNames =
-    "#![allow(dead_code, non_snake_case, "
+    "#![allow(non_snake_case, "
     "non_upper_case_globals, non_camel_case_types)]\n";
 
 /// Verbatim entry-point wrapper: forwards the imported C `main`'s return
@@ -242,12 +275,20 @@ std::string renderCargoToml(llvm::StringRef crateName, CrateType type,
   }
   // FR-53: the lints the old blanket allow header silenced are now DENIED, so
   // any regression in the emitter's warning-clean codegen fails `cargo build`.
-  // Only `dead_code` stays allowed in the crate root (see `kAllowHeader`);
-  // everything else must be clean. `unused_assignments` joined the deny table
-  // once FR-61f's range-for lift removed the last loop-body residual. The three
-  // naming lints are denied only under the idiomatic rename --
-  // `--preserve-c-names` keeps verbatim C spellings, which legitimately trip
-  // them (allowed in the header instead).
+  // `unused_assignments` joined the deny table once FR-61f's range-for lift
+  // removed the last loop-body residual. The three naming lints are denied
+  // only under the idiomatic rename -- `--preserve-c-names` keeps verbatim C
+  // spellings, which legitimately trip them (allowed in the header instead).
+  // FR-220: `dead_code` was the last lint still allowed crate-wide, and it left
+  // the header WITHOUT joining this table -- it is the one lint deliberately
+  // neither allowed nor denied. The item kinds that legitimately produce it (C
+  // enumerators, unread fields, unconstructed records, uncalled C++ methods)
+  // carry their own targeted `#[allow(dead_code)]`; a plain `fn` does NOT, so a
+  // dead emitted function -- measured ZERO times across 294 epoch-7 crates, and
+  // the one kind that would indicate an emitter defect -- now draws a rustc
+  // warning. Denying it here was measured and rejected: c-testsuite -10, and it
+  // breaks FR-44 because recovery structurally manufactures dead functions (see
+  // `kAllowHeader`). The zero is held by the clippy-eval ratchet instead.
   os << "\n"
      << "[lints.rust]\n"
      << "unused_variables = \"deny\"\n"
@@ -308,14 +349,24 @@ renderCrateRoot(mlir::ModuleOp module, CrateType type,
                                ? kAllowHeader
                                : kAllowHeaderPreserveNames;
   if (depCrates.empty()) {
-    os << header << "\n";
+    // FR-220: the idiomatic header is EMPTY now that `dead_code` moved onto
+    // the individual items. Emitting nothing (rather than a lone blank line)
+    // keeps the crate root's first byte the first emitted item.
+    if (!header.empty())
+      os << header << "\n";
   } else {
     // FR-59 workspace member: the allow list additionally admits
     // unused_imports (a member gets every dependency it references
     // anywhere, not per item), and the glob imports follow — they are how
     // the emitter's bare cross-crate names resolve against FR-51's pubs.
-    llvm::StringRef closer = ")]\n";
-    os << header.drop_back(closer.size()) << ", unused_imports" << closer;
+    // FR-220: with an empty base header there is no list to extend, so the
+    // member header is the single-lint allow.
+    if (header.empty()) {
+      os << "#![allow(unused_imports)]\n";
+    } else {
+      llvm::StringRef closer = ")]\n";
+      os << header.drop_back(closer.size()) << ", unused_imports" << closer;
+    }
     for (const std::string &dep : depCrates)
       os << "use " << dep << "::*;\n";
     os << "\n";

@@ -5726,10 +5726,21 @@ LogicalResult RustEmitter::emitImpl(emitrust::ImplOp implOp) {
   // body is exactly `fn drop(&mut self)`). Absent the attribute -- which no
   // pre-W2.17 module can carry -- this is the historical inherent header,
   // byte for byte.
-  if (std::optional<StringRef> traitName = implOp.getTraitName())
+  if (std::optional<StringRef> traitName = implOp.getTraitName()) {
+    // A TRAIT impl needs no dead-code cover: rustc's dead-code pass never
+    // reports trait-impl members, since the trait itself is the use site.
     os << "impl " << *traitName << " for " << implOp.getStructName() << " {\n";
-  else
+  } else {
+    // FR-220: an INHERENT impl holds the lifted C++ methods and the FR-62
+    // actor arms, 6 of the 56 dead-code diagnostics measured over epoch-7 --
+    // a public method a single-TU program declares and never calls is
+    // faithful translation of the C++ the input actually wrote. The FR-40
+    // item graph explicitly "does not make C++ member functions nodes", so
+    // there is no reachability answer to consult here and none is attempted;
+    // the attribute is unconditional and covers the whole block.
+    os << "#[allow(dead_code)]\n";
     os << "impl " << implOp.getStructName() << " {\n";
+  }
   increaseIndent();
   for (Operation &op : implOp.getBody().front()) {
     if (failed(emitOperation(op)))
@@ -8155,6 +8166,22 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
             cast<StringAttr>(nameAttr).getValue());
       }))
     os << "#[allow(non_snake_case)]\n";
+  // FR-220: the TARGETED replacement for the crate root's former blanket
+  // `#![allow(dead_code)]`. A C `struct` the translation unit declares and
+  // never constructs, and a field it never reads, are faithful translation --
+  // C compilers do not complain about either -- and they are 25 of the 56
+  // dead-code diagnostics measured across the 294-crate epoch-7 population.
+  // The allow rides on the STRUCT, which covers its fields too (the field-level
+  // allow is the shape FR-140 measured as ineffective for `non_snake_case`;
+  // for `dead_code` the enclosing item's level is what rustc consults for its
+  // fields, so one attribute covers the whole record). It is emitted
+  // UNCONDITIONALLY rather than under a reachability test on purpose: the FR-40
+  // item graph is CLOSED and skips non-file-scope records, so it under-reports
+  // reachability and would leave a LIVE-looking struct uncovered. A plain `fn`
+  // gets no such cover, on purpose: that is FR-220's tripwire, held at zero by
+  // the clippy-eval ratchet rather than by a `Cargo.toml` deny (denying it was
+  // measured unlandable -- see `kAllowHeader` in emitrust-cc/CrateEmitter.cpp).
+  os << "#[allow(dead_code)]\n";
   // FR-182: an ABI-faithful struct REACHABLE from a `--c-abi-exports`
   // signature is laid out the way clang laid it out. `#[repr(C)]` is the
   // only thing that promises that; the default Rust repr is free to reorder
@@ -8237,8 +8264,20 @@ LogicalResult RustEmitter::emitEnumDef(emitrust::EnumDefOp enumDefOp) {
   StringRef storage = enumStorageSpelling(enumDefOp);
   os << "#[repr(transparent)]\n";
   os << "#[derive(Clone, Copy, PartialEq)]\n";
+  // FR-220: a C enum lowers to TWO items -- the transparent newtype and the
+  // `impl` holding one associated constant per ENUMERATOR -- and each needs
+  // its own targeted `#[allow(dead_code)]`, because an attribute on the struct
+  // does not reach a sibling `impl` block. The enumerators are the single
+  // largest source of the dead-code diagnostics the old blanket crate-root
+  // allow was hiding (21 of 56 across epoch-7's 294 crates), and every one is
+  // faithful: `enum Code { ..., C_LAST_UNUSED = 99 }` is legal C that no C
+  // compiler warns about, so the emitted `const C_LAST_UNUSED` must not fail
+  // the Rust build either. The `impl Default` below needs nothing: rustc's
+  // dead-code pass does not report trait-impl members.
+  os << "#[allow(dead_code)]\n";
   StringRef pub = typePartVisibility();
   os << pub << "struct " << name << "(" << pub << storage << ");\n";
+  os << "#[allow(dead_code)]\n";
   os << "impl " << name << " {\n";
   increaseIndent();
   for (auto [nameAttr, value] : llvm::zip_equal(enumDefOp.getVariantNames(),
@@ -8281,6 +8320,12 @@ LogicalResult RustEmitter::emitDataEnumDef(emitrust::DataEnumDefOp defOp) {
   // one, the same shape as `emitStructDef`'s, or resurrect the exit-0
   // unbuildable crate this FR exists to remove.
   os << "#[derive(Clone, Copy)]\n";
+  // FR-220: a data enum's VARIANTS are the "never constructed" kind (4 of the
+  // 56 epoch-7 dead-code diagnostics) -- an FR-62 throws enum whose error arm
+  // no admitted path raises, or a `std::variant` alternative the TU never
+  // assigns. The allow on the enum covers every variant, matching the struct's
+  // treatment above; a plain `fn` still gets none.
+  os << "#[allow(dead_code)]\n";
   StringRef pub = typePartVisibility();
   os << pub << "enum " << itemLeafName(defOp.getSymName()) << " {\n"; // FR-159
   increaseIndent();

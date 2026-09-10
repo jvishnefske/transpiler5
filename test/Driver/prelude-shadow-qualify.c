@@ -65,16 +65,23 @@ int main(int argc, char **argv) {
   return 0;
 }
 
-// CHECK:#![allow(dead_code)]
-// CHECK-EMPTY:
+// FR-220: the crate root's blanket `#![allow(dead_code)]` and the blank line
+// after it are gone, replaced by a targeted `#[allow(dead_code)]` on each of
+// the three `struct_def`s. Attribute POSITION only -- every qualified prelude
+// path this file exists to pin (`::std::option::Option`, `::std::string::`,
+// `::std::vec::`) is byte-identical, and the full-width CHECK-NEXT chain is
+// what proves the qualification decision did not move with the attribute.
+// CHECK:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct Option {
 // CHECK-NEXT:    id: i32,
 // CHECK-NEXT:}
+// CHECK-NEXT:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct String {
 // CHECK-NEXT:    n: i32,
 // CHECK-NEXT:}
+// CHECK-NEXT:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct Ops {
 // CHECK-NEXT:    apply: ::std::option::Option<fn(i32) -> i32>,

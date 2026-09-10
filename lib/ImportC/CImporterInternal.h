@@ -1989,8 +1989,25 @@ private:
   /// while leaving the registry entry would leave a later item referring to
   /// a struct that is no longer defined, which is precisely the silent
   /// corruption recovery exists to avoid. Leaving them costs an unused
-  /// definition in the emitted crate, which `#![allow(dead_code)]` already
-  /// covers. (The rejected alternative — rolling every registry back too —
+  /// definition in the emitted crate. FR-220 retired the crate-root
+  /// `#![allow(dead_code)]` that used to be the cover for that; the cover is
+  /// now the TARGETED `#[allow(dead_code)]` the emitter puts on every
+  /// `struct_def`, `enum_def` (both the transparent newtype and its
+  /// associated-constant `impl`), data enum, and inherent `impl` block it
+  /// writes — which is exactly the set of item kinds listed above as
+  /// deliberately not erased. A `global` left behind is covered the same way
+  /// only if it is a type definition; a FUNCTION is NOT covered, by design —
+  /// an uncovered dead `fn` is FR-220's tripwire on the emitter. `rollbackTo`
+  /// erases every `func::FuncOp` the rejected item itself appended, but that
+  /// is not the whole story: dropping a rejected CALLER orphans every function
+  /// only that caller reached, so recovery STRUCTURALLY manufactures dead
+  /// `fn`s that no rollback can see. That measured fact is exactly why FR-220
+  /// could not make `dead_code` a `Cargo.toml` deny — it would turn every such
+  /// recovery into an unbuildable crate and break FR-44's headline guarantee.
+  /// The orphan warns and the crate still builds; the zero is held by the
+  /// clippy-eval ratchet over the frozen epoch corpus, which never measures
+  /// the recovery path. Pinned by test/Driver/dead-code-tripwire.c.
+  /// (The rejected alternative — rolling every registry back too —
   /// was measured against this and rejected: it would have to unwind a
   /// dozen maps plus the anonymous-record counter, and any one of them
   /// missed is a dangling symbol rather than a dead one.)

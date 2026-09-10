@@ -127,6 +127,26 @@ def crate_dir_name(cfile):
     return f"{crate_name(cfile)}__{ext or 'noext'}"
 
 
+# RUSTC lints tracked alongside the clippy:: ones. Deliberately a NAMED
+# allowlist, not "every rustc lint": the point is to ratchet a specific piece
+# of emitted-code debt, and sweeping in the whole rustc set would import noise
+# nobody has agreed to hold at zero.
+#
+# `dead_code` is here because FR-220 could not gate it the obvious way. It
+# measured ZERO dead functions over the epoch, and that zero is REAL for this
+# population -- but `dead_code = "deny"` in the emitted Cargo.toml regresses
+# c-testsuite by 10 (an external-linkage C function uncalled in its own TU is
+# not even a C warning; the deadness is an artifact of the emitter privatizing
+# it for a `bin` crate) and BREAKS FR-44's headline guarantee, because
+# recovery drops a rejected CALLER and orphans every function only that caller
+# reached -- so recovery structurally manufactures dead functions.
+#
+# Ratcheting it here gives the tripwire without the hard error, and scopes it
+# to exactly the population where the zero holds: this evaluator measures the
+# frozen epoch corpus only, never c-testsuite and never the --recover path.
+TRACKED_RUSTC_LINTS = frozenset({"dead_code"})
+
+
 def crate_lints(cfile, workdir):
     stem = crate_name(cfile)
     crate = os.path.join(workdir, crate_dir_name(cfile))
@@ -149,7 +169,7 @@ def crate_lints(cfile, workdir):
         if m.get("level") not in ("warning", "error"):
             continue
         code = (m.get("code") or {}).get("code") or ""
-        if code.startswith("clippy::"):
+        if code.startswith("clippy::") or code in TRACKED_RUSTC_LINTS:
             lints[code] += 1
     return lints
 

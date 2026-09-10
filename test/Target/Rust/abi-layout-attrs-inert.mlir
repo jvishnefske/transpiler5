@@ -38,11 +38,19 @@ module {
 }
 
 // The rendered items are the historical ones, attributes or no attributes.
-// RUST:      #[derive(Clone, Copy, Default)]
+// FR-220 retired the crate root's blanket `#![allow(dead_code)]` in favour of a
+// targeted `#[allow(dead_code)]` on each record the emitter writes, so every
+// `struct_def` now leads with that attribute ahead of its derive list. That is
+// an attribute-POSITION move and nothing else: no item appears or disappears
+// here, and the inertness properties above (no repr(C), no layout assert, no
+// wrapper) are unchanged and still checked by the `not grep` lines.
+// RUST:      #[allow(dead_code)]
+// RUST-NEXT: #[derive(Clone, Copy, Default)]
 // RUST-NEXT: struct Pt {
 // RUST-NEXT:     x: i32,
 // RUST-NEXT:     y: i32,
 // RUST-NEXT: }
+// RUST-NEXT: #[allow(dead_code)]
 // RUST-NEXT: #[derive(Clone, Copy, Default)]
 // RUST-NEXT: struct Bw {
 // RUST-NEXT:     val: u64,

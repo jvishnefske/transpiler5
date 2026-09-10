@@ -16,7 +16,14 @@
 // in binding position and a bare tail expression under the FR-61a fold.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s
 
+// FR-220: the crate root's blanket `#![allow(dead_code)]` is gone, so a data
+// enum carries its own targeted `#[allow(dead_code)]` between the derive list
+// and the enum -- a variant no admitted path constructs (an FR-62 throws arm,
+// a std::variant alternative the TU never assigns) is faithful translation and
+// must not become a warning. Attribute POSITION only: the enum, its variants
+// and every fn below are byte-identical to before.
 // CHECK:      #[derive(Clone, Copy)]
+// CHECK-NEXT: #[allow(dead_code)]
 // CHECK-NEXT: enum Signal {
 // CHECK-NEXT:     Go,
 // CHECK-NEXT:     Stop,
@@ -24,6 +31,7 @@
 emitrust.data_enum_def @Signal ["Go", "Stop"] [[], []] [[], []]
 
 // CHECK:      #[derive(Clone, Copy)]
+// CHECK-NEXT: #[allow(dead_code)]
 // CHECK-NEXT: enum Msg {
 // CHECK-NEXT:     Quit,
 // CHECK-NEXT:     Add { amount: i32 },

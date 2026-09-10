@@ -40,6 +40,13 @@ emitrust.global @table : !emitrust.array<4xi32>
 // CHECK-NEXT: static fixed: [f64; 2] = [0.0; 2];
 emitrust.global const @fixed : !emitrust.array<2xf64>
 
+// FR-220: the `struct_def` in the middle of this global sequence now leads
+// with its own targeted `#[allow(dead_code)]`, the replacement for the crate
+// root's retired blanket `#![allow(dead_code)]`. It is an attribute-POSITION
+// move inside the struct's own header; the interleaving of globals and the
+// record is unchanged, and the `--strict-whitespace` CHECK-NEXT chain above
+// and below still runs unbroken, which is what proves nothing else shifted.
+// CHECK-NEXT: #[allow(dead_code)]
 // CHECK-NEXT: #[derive(Clone, Copy, Default)]
 // CHECK-NEXT: struct Point {
 // CHECK-NEXT:     x: i32,

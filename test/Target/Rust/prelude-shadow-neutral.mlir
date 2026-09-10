@@ -16,6 +16,13 @@
 // C's `my_option` is SAFE: `toUpperCamelCase` drops the underscore and yields
 // `MyOption`, not `Option`.
 //
+// FR-220 moved the crate root's blanket `#![allow(dead_code)]` onto the items:
+// each of the six `struct_def`s below now leads with its own targeted
+// `#[allow(dead_code)]`. That is the ONLY thing that moved in this file, and
+// because every line here is pinned full-width the unbroken CHECK-NEXT chain
+// through the globals, the fn-ptr signatures and the verbatim helper is the
+// proof: had FR-220 disturbed any other byte, this file would still be red.
+//
 // Every line of the crate is pinned full-width under --strict-whitespace, and a
 // second unanchored scan says outright that no qualified prelude path appears
 // anywhere in the output -- a CHECK-NOT only guards the span between its
@@ -102,26 +109,32 @@ emitrust.func @c_main(%arg0: i32, %arg1: !emitrust.argv_table) -> i32 {
 
 emitrust.verbatim "fn __emitrust_cstr_out(s: &[i8]) {\0A    use std::io::Write;\0A    let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());\0A    let bytes: Vec<u8> = s[..end].iter().map(|&b| b as u8).collect();\0A    std::io::stdout().write_all(&bytes).expect(\22stdout write failed\22);\0A}"
 
-// CHECK:#[derive(Clone, Copy, Default)]
+// CHECK:#[allow(dead_code)]
+// CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct MyOption {
 // CHECK-NEXT:    id: i32,
 // CHECK-NEXT:}
+// CHECK-NEXT:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct MyVec {
 // CHECK-NEXT:    x: i32,
 // CHECK-NEXT:}
+// CHECK-NEXT:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct MyString {
 // CHECK-NEXT:    n: i32,
 // CHECK-NEXT:}
+// CHECK-NEXT:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct MyBox {
 // CHECK-NEXT:    w: i32,
 // CHECK-NEXT:}
+// CHECK-NEXT:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct Node {
 // CHECK-NEXT:    v: i32,
 // CHECK-NEXT:}
+// CHECK-NEXT:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct Ops {
 // CHECK-NEXT:    apply: Option<fn(i32) -> i32>,

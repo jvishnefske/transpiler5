@@ -34,10 +34,15 @@
 // RUN: emitrust-cc --link %t/a.o %t/b.o %t/main.o -o %t.crate --crate-name sink_root_type --build
 //
 // The sink happened AND the module carries the import, at the module's own
-// indentation, ahead of every item:
+// indentation, ahead of every item. FR-220 added a targeted
+// `#[allow(dead_code)]` on the record -- the per-item replacement for the
+// crate root's retired blanket allow -- and it lands AFTER the `use super::*;`
+// and before the derive, which is the ordering this --strict-whitespace chain
+// now pins. Attribute POSITION only; the byte-diff oracle below is untouched.
 // RUN: FileCheck %s --check-prefix=SUNK --strict-whitespace < %t.crate/src/main.rs
 //      SUNK:mod b {
 // SUNK-NEXT:    use super::*;
+// SUNK-NEXT:    #[allow(dead_code)]
 // SUNK-NEXT:    #[derive(Clone, Copy, Default)]
 // SUNK-NEXT:    pub(crate) struct S {
 // SUNK-NEXT:        pub(crate) p: P,

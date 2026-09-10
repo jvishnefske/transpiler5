@@ -47,9 +47,13 @@ LogicalResult translateToRust(Operation *op, raw_ostream &os);
 struct RustEmitOptions {
   /// FR-51: emit `pub` on the items a LIBRARY crate must export.
   ///
-  /// A binary crate's items are private and the crate's `#![allow(dead_code)]`
-  /// header keeps that warning-clean; a library whose items are all private
-  /// exports nothing and is useless. When this is set the emitter marks:
+  /// A binary crate's items are private and stay warning-clean through the
+  /// FR-220 per-item `#[allow(dead_code)]` attributes the emitter writes on
+  /// records, enums, and inherent impls (the crate-root blanket allow they
+  /// replaced is gone; a plain `fn` is deliberately left uncovered, and the
+  /// ratchet rather than a `Cargo.toml` deny is what holds it at zero); a library
+  /// whose items are all private exports nothing and is useless. When this is
+  /// set the emitter marks:
   ///
   ///  - every `emitrust.func` — free function or `emitrust.impl` method —
   ///    whose symbol does NOT carry an internal-linkage marker

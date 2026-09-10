@@ -40,17 +40,25 @@ int main(void) {
   return 0;
 }
 
-// CHECK:#![allow(dead_code)]
-// CHECK-EMPTY:
+// FR-220 deleted the crate root's blanket `#![allow(dead_code)]` and the blank
+// line that followed it, and put a targeted `#[allow(dead_code)]` on each
+// record and each INHERENT impl instead. What moved: two header lines gone
+// from the top, three item-level attributes added. Nothing about
+// `non_snake_case` changed, which is the invariant this file exists to pin --
+// the NOATTR sweep below is untouched and still says the FR-140 attribute
+// appears nowhere.
+// CHECK:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct GCountActor {
 // CHECK-NEXT:    g_count: i32,
 // CHECK-NEXT:}
+// CHECK-NEXT:#[allow(dead_code)]
 // CHECK-NEXT:impl GCountActor {
 // CHECK-NEXT:    fn bump(&mut self, step_x: i32) -> i32 {
 // CHECK-NEXT:        (step_x + self.g_count) * 2i32
 // CHECK-NEXT:    }
 // CHECK-NEXT:}
+// CHECK-NEXT:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct PairT {
 // CHECK-NEXT:    a__: i32,

@@ -54,15 +54,26 @@ int main(void){ return use__it(); }
 // The FR-62 actor struct holds the tripping field `g__global`: the allow
 // goes on the STRUCT ITEM, and NOT on the field (where rustc ignores it) --
 // the field line follows the struct header immediately.
+//
+// FR-220 interleaves a second item-level attribute here: the `#[allow(
+// dead_code)]` that replaced the crate root's blanket one now sits between
+// FR-140's naming allow and the derive list. The two are independent and
+// stack; the naming allow stays exactly where FR-140 put it, on the item and
+// never on the field, which is what this file pins.
 // CHECK:      #[allow(non_snake_case)]
+// CHECK-NEXT: #[allow(dead_code)]
 // CHECK-NEXT: #[derive(Clone, Copy, Default)]
 // CHECK-NEXT: struct GGlobalActor {
 // CHECK-NEXT:     g__global: i32,
 
 // Each tripping method carries its own allow: `f__unc` for both its name
 // and its parameter `a__b`, `use__it` for its name and its local `v__ar`.
-// The `impl` itself gets nothing -- the attribute is honoured on the fn.
-// CHECK:      impl GGlobalActor {
+// The `impl` itself gets no NAMING allow -- that attribute is honoured on the
+// fn. It does get FR-220's `#[allow(dead_code)]`, because an inherent impl is
+// where the lifted C++ methods and the FR-62 actor arms live and a declared,
+// never-called method is faithful translation.
+// CHECK:      #[allow(dead_code)]
+// CHECK-NEXT: impl GGlobalActor {
 // CHECK-NEXT:     #[allow(non_snake_case)]
 // CHECK-NEXT:     fn f__unc(&mut self, a__b: i32) -> i32 {
 // CHECK:          #[allow(non_snake_case)]
@@ -70,6 +81,7 @@ int main(void){ return use__it(); }
 
 // The plain struct is covered the same way as the actor struct.
 // CHECK:      #[allow(non_snake_case)]
+// CHECK-NEXT: #[allow(dead_code)]
 // CHECK-NEXT: #[derive(Clone, Copy, Default)]
 // CHECK-NEXT: struct ST {
 // CHECK-NEXT:     m__em: i32,
