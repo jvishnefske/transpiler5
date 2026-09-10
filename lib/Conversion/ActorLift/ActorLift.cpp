@@ -780,9 +780,19 @@ struct ActorLift
           return call.emitError("actor lift: caller of arm '")
                  << callee << "' has no access to actor '"
                  << actors[it->second].name.getValue() << "'";
+        // FR-231: the arm's FuncOp keeps its full symbol when it moves into
+        // the impl, and `emitFunc` prints it through `itemLeafName` -- so a
+        // namespaced arm renders as `fn pick`, and the CALL must spell `.pick`
+        // to match. Passing the symbol through wrote `self.crate::ns::pick(..)`,
+        // which is not Rust: an exit-0 unbuildable crate, the one failure
+        // direction this project does not accept.
+        StringRef method_name = callee;
+        if (size_t leafSep = method_name.rfind("::");
+            leafSep != StringRef::npos)
+          method_name = method_name.drop_front(leafSep + 2);
         auto method = builder.create<emitrust::MethodCallOp>(
             call.getLoc(), call.getResultTypes(), receiver,
-            builder.getStringAttr(callee), call.getOperands());
+            builder.getStringAttr(method_name), call.getOperands());
         call.replaceAllUsesWith(method.getResults());
         call.erase();
         continue;

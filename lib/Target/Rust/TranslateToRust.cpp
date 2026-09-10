@@ -78,6 +78,7 @@
 #include <cassert>
 #include <charconv>
 #include <cstdlib>
+#include <functional>
 #include <string>
 #include <system_error>
 
@@ -5785,19 +5786,81 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   };
   // One `mod` per distinct path, as an epilogue in first-appearance order,
   // each item in the order it had at the top level.
-  for (StringRef path : modulePaths) {
-    os << "mod " << path << " {\n";
-    increaseIndent();
-    if (moduleNeedsRootImport(path))
-      os << "use super::*;\n";
-    llvm::SaveAndRestore moduleScope(moduleItemVisibility,
-                                     StringRef("pub(crate) "));
-    for (Operation *item : moduleItems[path])
-      if (failed(emitOperation(*item)))
-        return failure();
-    decreaseIndent();
-    os << "}\n";
-  }
+  //
+  // FR-231: a path may now be NESTED (`crate::geo::inner::twice`, which
+  // FR-231's `--namespace-modules` produces for `namespace geo { namespace
+  // inner { ... } }`), so this renders a real TREE. Writing the dotted path
+  // straight after `mod`, as the pre-FR-231 loop did, spelled `mod geo::inner
+  // {`, which is not Rust -- a crate that does not parse, which is strictly
+  // worse than a located refusal. Two properties are load-bearing and
+  // MEASURED against rustc:
+  //
+  //  - a nested `mod` must be `pub(crate)`. The crate root spells
+  //    `crate::geo::inner::twice`, and a plain `mod inner` is private to
+  //    `geo`, so the root's own use site is rustc E0603. The OUTERMOST level
+  //    keeps the bare `mod`: it is private to the crate root, which is an
+  //    ancestor of every use site, and keeping it bare is what reproduces
+  //    FR-159's per-TU module bytes exactly.
+  //  - a nested module's root import is `use crate::*`, not `use super::*`.
+  //    `super` is the enclosing NAMESPACE module at depth > 1, not the crate
+  //    root, and a glob is not transitively re-exported through the parent's
+  //    own glob.
+  //
+  // A single-segment path renders byte-for-byte as before: the grouping below
+  // preserves first-appearance order, no `#[allow]` fires on a snake_case
+  // `tu<N>`, and depth 0 emits neither `pub(crate)` nor `use crate::*`.
+  std::function<LogicalResult(StringRef, ArrayRef<StringRef>, unsigned)>
+      renderModuleLevel = [&](StringRef prefix, ArrayRef<StringRef> paths,
+                              unsigned depth) -> LogicalResult {
+    llvm::SmallVector<StringRef> segmentOrder;
+    llvm::StringMap<llvm::SmallVector<StringRef>> bySegment;
+    for (StringRef path : paths) {
+      StringRef segment = path.drop_front(prefix.size()).split("::").first;
+      auto [it, inserted] = bySegment.try_emplace(segment);
+      if (inserted)
+        segmentOrder.push_back(it->first());
+      it->second.push_back(path);
+    }
+    for (StringRef segment : segmentOrder) {
+      std::string full = (prefix + segment).str();
+      // FR-140: `--preserve-c-names` keeps a C++ namespace's own
+      // capitalization, so `namespace Game` reaches here as `mod Game` --
+      // rustc's `non_snake_case` lint, which the emitted crate denies. The
+      // cover goes on the `mod` item, the same posture every other item that
+      // can carry a non-snake C spelling takes.
+      if (emitrust::tripsNonSnakeCase(segment))
+        os << "#[allow(non_snake_case)]\n";
+      if (depth > 0)
+        os << "pub(crate) ";
+      os << "mod " << segment << " {\n";
+      increaseIndent();
+      llvm::SmallVector<StringRef> deeper;
+      for (StringRef path : bySegment[segment])
+        if (path.size() > full.size())
+          deeper.push_back(path);
+      auto owned = moduleItems.find(full);
+      if (owned != moduleItems.end()) {
+        if (moduleNeedsRootImport(full))
+          os << (depth == 0 ? "use super::*;\n" : "use crate::*;\n");
+        llvm::SaveAndRestore moduleScope(moduleItemVisibility,
+                                         StringRef("pub(crate) "));
+        for (Operation *item : owned->second)
+          if (failed(emitOperation(*item)))
+            return failure();
+      }
+      if (!deeper.empty()) {
+        std::string childPrefix = full + "::";
+        if (failed(renderModuleLevel(childPrefix, deeper, depth + 1)))
+          return failure();
+      }
+      decreaseIndent();
+      os << "}\n";
+    }
+    return success();
+  };
+  if (!modulePaths.empty() &&
+      failed(renderModuleLevel(StringRef(), modulePaths, 0)))
+    return failure();
   // FR-179: the C-ABI wrappers for FR-62 actor-lifted owner methods, at
   // MODULE scope (a `#[no_mangle] extern "C"` item cannot live inside an
   // `impl`). Nothing is collected without `--c-abi-exports`, so a default

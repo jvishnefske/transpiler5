@@ -103,8 +103,21 @@ inline llvm::StringRef preludeQualifiedPath(llvm::StringRef name) {
 inline llvm::StringSet<> collectShadowedPreludeNames(ModuleOp module) {
   llvm::StringSet<> shadowed;
   auto note = [&](llvm::StringRef name) {
-    if (!preludeQualifiedPath(name).empty())
-      shadowed.insert(name);
+    // FR-231/FR-159: a module item's symbol is the absolute path
+    // `crate::geo::Vec`, and what shadows the prelude is its LEAF -- inside
+    // `mod geo` the bare spelling `Vec` resolves to the emitted struct, not to
+    // `std::vec::Vec`. Testing the whole symbol saw no collision at all and
+    // left the module's own emitter-written `Vec<u8>`/`Box<T>` spellings
+    // resolving to the user's type: a loud rustc E0107, but an unbuildable
+    // crate all the same. Qualifying crate-WIDE on a leaf collision is
+    // deliberately over-broad and safe in that direction -- an absolute
+    // `::std::` path is correct everywhere -- and it is byte-neutral for every
+    // module whose symbols carry no path, which is every flagless compile.
+    llvm::StringRef leaf = name;
+    if (size_t leafSep = leaf.rfind("::"); leafSep != llvm::StringRef::npos)
+      leaf = leaf.drop_front(leafSep + 2);
+    if (!preludeQualifiedPath(leaf).empty())
+      shadowed.insert(leaf);
   };
   for (auto def : module.getOps<StructDefOp>())
     note(def.getSymName());
