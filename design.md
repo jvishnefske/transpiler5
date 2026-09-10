@@ -14281,8 +14281,84 @@ piece and becomes FR-45.
   new wording needs a row in BOTH `RejectionLedger.cpp` and
   `run_realworld.py`'s `classify_blocker`, which are hand-mirrored by
   contract; all four current diagnostics classify as `[other]` today.
+  **WAVE 1 LANDED 2026-09-09: TRACTOR 45 -> 50, +5 PROGRAMS AT PASS, THE
+  SPIKE'S PROJECTION EXACTLY.** Newly PASS: `034_cast_to_char_ptr_int`,
+  `034_..._lib`, `035_cast_to_char_ptr_float_lib`,
+  `036_cast_to_char_ptr_struct`, `036_..._lib`. Zero regressions, zero other
+  outcome changes; EMIT 57 -> 62. **The `_lib` twins are now MEASURED rather
+  than projected** -- they clear `dlopen`+`dlsym` with zero `unsafe`. `035`
+  exec still blocks on `scanf %f`, which was always out of wave.
+  **THE WRITE-BACK UNKNOWN RESOLVED WITHOUT ARCHITECTURAL WORK.**
+  `pendingStagedGlobalStores` already proved a post-call flush point exists in
+  `emitCall`; it is mirrored as an **explicit opt-in out-param** (the
+  FR-146/147 `allocBacking` idiom) rather than a member vector, so a call path
+  with NO flush point takes a LOCATED refusal instead of silently dropping the
+  store. `RejectionLedger.cpp:236`'s note is confirmed TRUE -- the C++
+  method-call path really has no flush -- and a byte view there now refuses,
+  pinned. The FR-93 dispatch arm deliberately does not opt in, rather than
+  acquiring an untested second flush site.
+  **FIVE DEVIATIONS FROM MY SPEC, all of them improvements and two of them
+  corrections to facts I asserted:**
+   1. **My anchor was WRONG.** I said 034/035 reach
+      `ImportCExpressions.cpp:6788` ("the address of a scalar object cannot be
+      passed as a slice parameter"); they die EARLIER, at `ImportC.cpp:4113`
+      `unsupported pointer expression: CStyleCastExpr`. **The `:6788` message
+      is unreachable for the `(u8*)&x` spelling.** I passed the spike's anchor
+      through without re-verifying it, which is the exact failure CLAUDE.md
+      warns about.
+   2. **The view is matched syntactically in `emitBorrowArgument`, NOT in
+      `emitPointerRValue`'s cast branch.** A byte view is a materialized
+      COPY, so a `PtrExprValue` carrying one would be a miscompile the moment
+      any other consumer treated it as the object's address. This is also why
+      the golden sweep measured **0 moved**: every non-byte-slice consumer
+      keeps its refusal verbatim.
+   3. **`root` is the viewed `VarDecl`, not null.** `f((unsigned char*)&x,
+      &x)` would otherwise have the callee's writes stomped by a
+      reconstitution from a stale image; keying the borrow routes it into the
+      existing aliasing rejection. Probed, not assumed.
+   4. **A `CK_NoOp` qualification peel was required** -- `(unsigned char *)&x`
+      feeding a `const unsigned char *` parameter arrives wrapped in an
+      implicit cast `stripTrivia` deliberately does not strip. Without it the
+      whole const-parameter half of the family fell through silently.
+   5. **Non-scalar members keep the OLD wording** (`byte view of an aggregate
+      with non-byte members`) rather than getting new prose, to minimise pin
+      churn; padding gets new wording because "non-byte members" is factually
+      wrong for `{char; int;}`.
+  Three new refusals, each with mirrored rows in BOTH `RejectionLedger.cpp`
+  and `run_realworld.py`'s `classify_blocker`, and each verified end-to-end
+  through `--recover` AND through `classify_blocker` directly -- none lands in
+  the `other` bucket: `byte view of an aggregate with interior padding`,
+  `byte view of the global object 'X'`, `byte view with no write-back point
+  for the callee's writes`.
+  **THE PIN WAS SPLIT FORWARD, NOT WEAKENED.**
+  `byte-region-aggregates-invalid.c`'s `int-leaf-view.c` sub-unit is unchanged
+  as source and still refuses, now naming the GLOBAL. Because the original
+  wording would otherwise lose its only test, a second sub-unit
+  `int-leaf-array.c` was added -- a LOCAL struct with a non-scalar member --
+  keeping `byte view of an aggregate with non-byte members` pinned at its own
+  site. **Both halves of the original claim survive.**
+  ADVERSARIAL PROBES, all correct: `f((u8*)&x, &x)` and `f((u8*)&x, (u8*)&x)`
+  take the aliasing rejection; two DISTINCT objects are admitted and
+  runtime-correct; `_Bool`, `enum`, `long double`, `volatile`, unions, pointer
+  members and `&arr` all keep their prior refusals; and an over-length read
+  (`ph((u8*)&x, 8)` on a 4-byte object, which is UB in the C) **panics with
+  `index out of bounds`** rather than reading stack garbage -- the documented
+  safe direction.
+  Gate 1052/1052 (1046 + 6 new tests), clippy 57 (+0) at epoch-7, binding both
+  axes flat, CTestSuite 220/220, Cpp17Suite 35/35. **Golden sweep over 1104
+  sources: 730 byte-identical, 0 MOVED, 4 newly emitting (the new tests), 0
+  newly rejected, 370 rejected by both sides.** All re-verified independently
+  in the main tree.
+  **ONE STALE ARTEFACT, FLAGGED NOT RE-BLESSED:**
+  `test/Kernel/linux-6.6.94-allnoconfig/rejection-report.txt` records
+  **1060x** `CStyleCastExpr` and **842x** the scalar-as-slice wording over
+  kernel SITES. Those rows are now stale for sites matching the byte-view
+  shape. **Nothing in the build or test system reads that directory** --
+  verified, it holds only `rejection-report.txt` and a `ratchet-manifest.txt`
+  that nothing ratchets -- so it is a recorded snapshot in this ledger, not a
+  gated golden. Regenerating it is an evidence-ledger decision, not a test fix.
   ACCEPTANCE, split into two waves as the spike recommends.
-  **WAVE 1 (A + Af + B, +5 projected):** scalar and padding-free-aggregate
+  **WAVE 1 (A + Af + B, +5 projected) -- DONE, measured +5:** scalar and padding-free-aggregate
   byte view at a slice argument, with MANDATORY write-back; float widening of
   `neBytesTypeName`; padded aggregates, global bases, `*p++` walks and
   escaping views each refused LOCATED with its own ledger needle; the

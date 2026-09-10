@@ -3016,12 +3016,18 @@ CImporter::resolveWideByteAccess(const ByteViewDeref &view, Location loc,
   return WideByteAccess{basePlace, cursor, valueType, byteWidth};
 }
 
-/// Returns the Rust integer type name (`u32`, `i64`, ...) the ne_bytes
-/// helper is called on for `type`.
-static std::string neBytesTypeName(IntegerType type) {
-  return ((type.isUnsigned() ? llvm::Twine("u") : llvm::Twine("i")) +
-          llvm::Twine(type.getWidth()))
-      .str();
+/// Returns the Rust scalar type name (`u32`, `i64`, `f32`, ...) the
+/// ne_bytes helper is called on for `type`. FR-229 widened this past the
+/// integers: `f32::to_ne_bytes`/`f64::from_ne_bytes` are ordinary
+/// associated functions and ride `emitrust.call_opaque` with no dialect
+/// change at all, so the float byte view needed only the NAME.
+static std::string neBytesTypeName(Type type) {
+  if (auto intType = llvm::dyn_cast<IntegerType>(type))
+    return ((intType.isUnsigned() ? llvm::Twine("u") : llvm::Twine("i")) +
+            llvm::Twine(intType.getWidth()))
+        .str();
+  auto floatType = llvm::cast<mlir::FloatType>(type);
+  return (llvm::Twine("f") + llvm::Twine(floatType.getWidth())).str();
 }
 
 FailureOr<Value> CImporter::emitWideByteLoad(const WideByteAccess &access,
@@ -4461,6 +4467,169 @@ CImporter::stageGlobalCopyAndRecord(Location loc, const clang::VarDecl *base,
   if (writeback)
     *writeback = GlobalWriteback{staged->first, staged->second};
   return staged->first;
+}
+
+//===----------------------------------------------------------------------===//
+// FR-229: the materialized OBJECT-REPRESENTATION byte view.
+//===----------------------------------------------------------------------===//
+
+FailureOr<bool> CImporter::planByteView(clang::QualType objectType,
+                                        Location loc, ByteViewPlan &plan) {
+  clang::ASTContext &context = astContext();
+  clang::QualType canonical = objectType.getCanonicalType();
+  plan = ByteViewPlan();
+
+  // Whether `type` is a scalar with a determinate, gap-free byte image
+  // this wave can move: an integer or an f32/f64, whose mapped width in
+  // BITS is exactly its size in bytes times eight. `long double` fails
+  // that test on purpose (80 value bits in 16 bytes of storage: the rest
+  // is padding, indeterminate exactly like a struct hole), and so does
+  // any type whose emitted Rust scalar is not what `to_ne_bytes` is
+  // defined on.
+  auto planScalar = [&](clang::QualType type,
+                        Type &mappedOut) -> bool {
+    clang::QualType leaf = type.getCanonicalType();
+    if (leaf->isBooleanType() || leaf->isEnumeralType())
+      return false;
+    if (!leaf->isIntegerType() && !leaf->isRealFloatingType())
+      return false;
+    // `mapType` on a builtin arithmetic type never diagnoses, so the
+    // planner stays side-effect free for the shapes it declines.
+    if (!llvm::isa<clang::BuiltinType>(leaf.getTypePtr()))
+      return false;
+    FailureOr<Type> mapped = mapType(leaf, loc);
+    if (failed(mapped))
+      return false;
+    uint64_t bytes =
+        static_cast<uint64_t>(context.getTypeSizeInChars(leaf).getQuantity());
+    if (auto intType = llvm::dyn_cast<IntegerType>(*mapped)) {
+      if (intType.getWidth() != bytes * 8)
+        return false;
+    } else if (auto floatType = llvm::dyn_cast<mlir::FloatType>(*mapped)) {
+      if (floatType.getWidth() != bytes * 8 ||
+          (floatType.getWidth() != 32 && floatType.getWidth() != 64))
+        return false;
+    } else {
+      return false;
+    }
+    mappedOut = *mapped;
+    return true;
+  };
+
+  if (Type mapped; planScalar(canonical, mapped)) {
+    unsigned width = static_cast<unsigned>(
+        context.getTypeSizeInChars(canonical).getQuantity());
+    plan.size = width;
+    plan.components.push_back({nullptr, 0, width, mapped});
+    return true;
+  }
+
+  const clang::RecordDecl *record = canonical->getAsRecordDecl();
+  if (!record)
+    return false;
+  const clang::RecordDecl *definition = record->getDefinition();
+  if (!definition || definition->isUnion() || definition->isInvalidDecl() ||
+      definition->isDependentType())
+    return false;
+  // A u8-only aggregate already IS its own byte image (CTS-BR): the cast
+  // is the region base itself and never needs a materialized view.
+  if (isByteRegionRecord(definition))
+    return false;
+  if (llvm::isa<clang::CXXRecordDecl>(definition) &&
+      !llvm::cast<clang::CXXRecordDecl>(definition)->isCLike())
+    return false;
+
+  // The layout numbers are READ, never inferred: `emitrust.abi_layout` is
+  // clang's own ASTRecordLayout, and its presence is also the FR-182
+  // verdict that the emitted field list corresponds one-to-one with the C
+  // members -- which is precisely what keeps the offsets index-aligned
+  // with the walk below.
+  FailureOr<Type> mappedRecord = mapType(canonical, loc);
+  if (failed(mappedRecord))
+    return false;
+  auto structType = llvm::dyn_cast<emitrust::StructType>(*mappedRecord);
+  if (!structType)
+    return false;
+  auto structDef = llvm::dyn_cast_or_null<emitrust::StructDefOp>(
+      SymbolTable::lookupSymbolIn(module, structType.getName()));
+  if (!structDef)
+    return false;
+  auto layout = structDef->getAttrOfType<DictionaryAttr>(
+      emitrust::kAbiLayoutAttrName);
+  if (!layout)
+    return false;
+  auto sizeAttr = llvm::dyn_cast_or_null<IntegerAttr>(layout.get("size"));
+  auto offsetsAttr = llvm::dyn_cast_or_null<ArrayAttr>(layout.get("offsets"));
+  if (!sizeAttr || !offsetsAttr)
+    return false;
+
+  SmallVector<const clang::FieldDecl *, 4> fields(definition->fields());
+  if (fields.empty() || fields.size() != offsetsAttr.size())
+    return false;
+
+  uint64_t running = 0;
+  SmallVector<ByteViewComponent, 4> components;
+  for (auto [index, field] : llvm::enumerate(fields)) {
+    if (field->isBitField() || field->isAnonymousStructOrUnion())
+      return false;
+    Type mapped;
+    // A non-scalar member (a nested record, an array, a pointer) keeps
+    // the standing `byte view of an aggregate with non-byte members`
+    // refusal its caller already authors: this wave's scatter is per
+    // SCALAR field, and guessing at a recursive offset map is exactly the
+    // kind of second layout model `abi_layout` exists to prevent.
+    if (!planScalar(field->getType(), mapped))
+      return false;
+    auto offsetAttr =
+        llvm::dyn_cast<IntegerAttr>(offsetsAttr[static_cast<unsigned>(index)]);
+    if (!offsetAttr || offsetAttr.getInt() < 0)
+      return false;
+    uint64_t offset = static_cast<uint64_t>(offsetAttr.getInt());
+    uint64_t width = static_cast<uint64_t>(
+        context.getTypeSizeInChars(field->getType()).getQuantity());
+    if (offset != running)
+      return emitError(loc) << "unsupported: byte view of an aggregate with "
+                               "interior padding";
+    running += width;
+    components.push_back({field, static_cast<unsigned>(offset),
+                          static_cast<unsigned>(width), mapped});
+  }
+  if (sizeAttr.getInt() < 0 ||
+      static_cast<uint64_t>(sizeAttr.getInt()) != running)
+    return emitError(loc) << "unsupported: byte view of an aggregate with "
+                             "interior padding";
+  plan.size = static_cast<unsigned>(running);
+  plan.components = std::move(components);
+  return true;
+}
+
+LogicalResult
+CImporter::flushByteViewWritebacks(Location loc,
+                                   ArrayRef<ByteViewWriteback> writebacks) {
+  auto u8Type = IntegerType::get(builder.getContext(), 8,
+                                 IntegerType::Unsigned);
+  IntegerType cursorType = builder.getIntegerType(64);
+  for (const ByteViewWriteback &writeback : writebacks) {
+    for (const ByteViewComponent &component : writeback.plan.components) {
+      WideByteAccess access{writeback.bytesPlace,
+                            createIntConstant(loc, cursorType,
+                                              component.offset),
+                            component.valueType, component.width, u8Type};
+      FailureOr<Value> value = emitWideByteLoad(access, loc);
+      if (failed(value))
+        return failure();
+      Value place = writeback.objectPlace;
+      if (component.field) {
+        FailureOr<Value> member =
+            projectMemberPlace(loc, place, component.field);
+        if (failed(member))
+          return failure();
+        place = *member;
+      }
+      builder.create<emitrust::AssignOp>(loc, place, *value);
+    }
+  }
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
