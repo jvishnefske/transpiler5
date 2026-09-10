@@ -297,7 +297,11 @@ def output_diff_snippet(expected, actual, limit=12):
 _SYS_HEADER_RE = re.compile(r"call to '([^']+)' declared in a system header")
 _LOC_RE = re.compile(r"^(.+?):(\d+):\d+: error:")
 _DYNMEM_NAMES = {"malloc", "calloc", "realloc", "free", "aligned_alloc"}
-_ALLOC_KEYWORDS = ("malloc", "calloc", "realloc", "aligned_alloc")
+# FR-230: `alloca` joins the list, hand-mirroring `citedLineAllocates`
+# in lib/ImportC/RejectionLedger.cpp. Without it a stack allocation tags
+# as `pointer-local-nonaddress` and the census reads it as the same lever
+# as an unrelated pointer-member load.
+_ALLOC_KEYWORDS = ("malloc", "calloc", "realloc", "aligned_alloc", "alloca")
 _BLOCKER_SUBSTRINGS = [
     ("use of main's argv", "argv"),
     # C99-43 slice 1: the cursor-parameter rejections split out of the

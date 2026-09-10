@@ -9695,10 +9695,19 @@ static inline const clang::VarDecl *asGlobalDataPointerRef(const clang::Expr *ex
   return var->getCanonicalDecl();
 }
 
-/// Returns the `calloc`/`malloc` call at the root of `expr` (looking
-/// through casts, e.g. the implicit `void *` conversion), or null. Only
-/// definition-less declarations qualify: a user-defined function of the
+/// Returns the `calloc`/`malloc`/`alloca` call at the root of `expr`
+/// (looking through casts, e.g. the implicit `void *` conversion), or null.
+/// Only definition-less declarations qualify: a user-defined function of the
 /// same name is an ordinary call, never a promotable allocation.
+///
+/// FR-230 (D): `alloca` joins the family. The fixed-backing model already
+/// synthesizes an ENTRY-BLOCK array whose lifetime is the function's, which
+/// is `alloca`'s lifetime EXACTLY -- it is a closer fit than `malloc`, whose
+/// heap lifetime the model already shortens to the frame. `<alloca.h>`
+/// defines the name as a macro for `__builtin_alloca`, so the builtin
+/// spelling is the one that actually reaches here in hosted code; the plain
+/// `alloca` spelling covers a hand-written `extern void *alloca(size_t);`.
+/// `alloca` is NOT in the `free()` family: the backing simply drops.
 static inline const clang::CallExpr *asAllocCall(const clang::Expr *expr) {
   const clang::Expr *e = stripTrivia(expr);
   while (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e))
@@ -9710,7 +9719,8 @@ static inline const clang::CallExpr *asAllocCall(const clang::Expr *expr) {
   if (!callee || callee->hasBody() || !callee->getIdentifier())
     return nullptr;
   llvm::StringRef name = callee->getName();
-  if (name != "calloc" && name != "malloc")
+  if (name != "calloc" && name != "malloc" && name != "alloca" &&
+      name != "__builtin_alloca")
     return nullptr;
   return call;
 }

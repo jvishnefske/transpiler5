@@ -780,9 +780,29 @@ void PointerRegionAnalysis::recordAllocBase(const clang::VarDecl *ptr,
   // The synthesized backing is a fixed-size Rust array; cap it so the
   // generated code stays reasonable (matching no real program in the
   // suite is expected to exceed this).
-  if (elementBytes == 0 || totalBytes == 0 ||
-      totalBytes % elementBytes != 0 ||
-      totalBytes / elementBytes > 65536)
+  //
+  // FR-230: a CONSTANT byte size that does not divide evenly by the element
+  // size rounds UP to whole elements instead of rejecting. The C access that
+  // motivates the rounding -- `int *p = alloca(10); p[0..9] = ...`, 40 bytes
+  // into a 10-byte object -- is UNDEFINED in C, so any behavior conforms,
+  // and a `[i32; 3]` backing makes the emitted Rust panic `index out of
+  // bounds` at the first out-of-range element rather than read or write
+  // stack garbage. That is the LOUD direction and the same class as FR-229's
+  // over-length byte-view read, accepted on exactly that ground.
+  //
+  // The rounding is SCOPED to this one thing: a compile-time-constant total
+  // that leaves a remainder. It is NOT a licence to round a NON-constant
+  // size (still refused above, as "not a compile-time constant"), and it
+  // CANNOT move an already-admitted lowering, because ceil == exact division
+  // whenever the size divides evenly -- every previously admitted allocation
+  // keeps its byte-identical backing extent. The `> 65536` element cap is
+  // unchanged and applies to the ROUNDED count.
+  if (elementBytes == 0 || totalBytes == 0)
+    return markInvalid(ptr, loc,
+                       "unsupported: allocation size does not fit the "
+                       "pointer's element type");
+  uint64_t elementCount = (totalBytes + elementBytes - 1) / elementBytes;
+  if (elementCount > 65536)
     return markInvalid(ptr, loc,
                        "unsupported: allocation size does not fit the "
                        "pointer's element type");
@@ -800,7 +820,7 @@ void PointerRegionAnalysis::recordAllocBase(const clang::VarDecl *ptr,
                        "unsupported: pointer bound to multiple allocations");
   region.allocSite = call;
   region.allocLoc = loc;
-  region.allocCount = totalBytes / elementBytes;
+  region.allocCount = elementCount;
 }
 
 const clang::VarDecl *
