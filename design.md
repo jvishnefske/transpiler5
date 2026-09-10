@@ -13577,6 +13577,152 @@ piece and becomes FR-45.
   storage, conversion, passing and printing. A real 80-bit type is not
   available -- Rust has no `f80`.
 
+- [ ] FR-223 (opened 2026-09-09; **THE CENSUS THE PROJECT HAS BEEN MISSING,
+  and it reframes the goal**): **21 FRs AND 43 NEW TESTS THIS SESSION MOVED
+  TRACTOR BY ONE CASE. THE GATE IS NOT THE GOAL, AND NOTHING MEASURED THE
+  GOAL PROPERLY UNTIL NOW.**
+  Every prior ranking used a FIRST-FAILURE histogram, which has produced a
+  wrong yield **seven** times (FR-61f x2, FR-165, FR-138, FR-177, FR-178,
+  FR-221). FR-177 tried per-case blocker SETS and was still wrong, because it
+  measured only the EMIT stage of a THREE-stage rubric.
+  `scripts/tractor-census.py` measures what those attempts wanted: every
+  case's COMPLETE emit blocker set via `--recover --incremental`, joined
+  against the rubric's own `results.json` so PASS is never redefined, plus a
+  SET-COVER ranking. **Marginal yield is a property of the SET, not the
+  histogram**: a blocker in 83 cases is worth ZERO if all 83 also need four
+  other fixes.
+  **THE SHAPE OF THE CORPUS, measured at HEAD (41/252):**
+      exec  13 PASS / 92     lib  28 PASS / 160
+  **BLOCKER-SET DEPTH over the 148 non-passing cases that reach the importer:**
+      48 need 1 fix   19 need 2   33 need 3   48 need 5
+  **AND THE 5-FIX SET CLEARS +82 EMIT -- BUT ALL 82 ARE `lib`, ZERO ARE
+  `exec`.** Clearing emit is not PASS: a lib case must then export a
+  dlsym-able symbol. That is FR-178's finding, and the three-stage check
+  caught the eighth instance of the same trap before it was acted on.
+  **THE EXPORT CEILING IS NOT WHAT FR-178 IMPLIED.** Of the 80 lib cases whose
+  entry-point declaration could be classified: **46 all-scalar (CLASS 0), 15
+  one-pointer (CLASS 1/2), 19 with two or more pointers (FR-181 HARD NO-GO).**
+  So **76% of classifiable lib entry points are exportable with machinery that
+  already exists.** The lib half is NOT structurally capped; roughly a quarter
+  is.
+  **THE EXEC COHORT IS THE CLEAN PATH -- it needs no exported symbol at all.**
+  25 exec cases reach the importer with a blocker set; **15 of them are
+  SOLE-BLOCKER, i.e. one fix each clears the case outright.**
+  **AND 54 CASES NEVER REACH THE IMPORTER AT ALL, which no previous
+  measurement saw:**
+   - **48 exec SPHINCS+ cases die on `missing header (openssl/conf.h)`.**
+     They DO get their real flags (`source_mode: compdb`, with
+     `-DPARAMS=sphincs-blake-128f`); the header is simply absent because
+     **openssl is not in the devshell**. This is 19% of the corpus blocked by
+     a missing dependency, not by a language feature. NOTE the earlier claim
+     that these were "SPHINCS+ variants where openssl is merely the FIRST
+     failure, worth +0" CONFLATED THEM WITH THE LIB CASES -- FR-178's +0 was
+     about the 80 `lib` cases needing dlsym. **These 48 are `exec` and need no
+     export.**
+   - **5 cases produce NO CRATE AT ALL because `main` uses `argv`.** The
+     importer drops `c_main`, and a bin crate with no `main` is never written.
+     One unsupported parameter destroys the entire translation unit.
+   - 1 on a returned pointer value.
+  **A HARNESS CORRECTION MEASURED IN PASSING:** the documented
+  `--extra-cflags=-I<openssl-dev>/include` recipe BREAKS the cmake configure
+  step -- with it, all 202 EMIT_FAIL cases report one `cmake configure failed`
+  instead of their real blocker, destroying the census while leaving PASS
+  unchanged. Without it, all 252 cases configure and use `compdb`.
+  **THE RANKED PATH FORWARD, by measured PASS-yield rather than by histogram:**
+   1. **openssl in the devshell** -- unblocks 48 exec cases to reach their
+      real blockers. Infrastructure, not compiler work. Currently they are not
+      even measurable.
+   2. **The 15 sole-blocker exec cases** -- one fix each, no export needed,
+      highest confidence per unit of work. Their blockers are listed in the
+      census, led by system-header calls (see FR-224).
+   3. **`argv`** -- 5 cases currently emit NOTHING, plus 6 more where it is
+      the first failure.
+   4. **The 61 exportable lib entry points** -- CLASS 0 and CLASS 1/2 already
+      have machinery; the gap is that their cases die at emit first.
+  **WHAT IS STRUCTURALLY OUT OF REACH, so nobody spends on it:** 19 lib cases
+  whose entry point takes two or more pointers, against FR-181's measured
+  HARD NO-GO (`noalias` on two `&mut` a C caller may legally alias, wrong at
+  `-O3` with exit 0 and no diagnostic).
+  NOT RESOLVED: 80 lib entry declarations the classifier could not find (a
+  regex over sources; a clang-based pass would settle them); whether the 48
+  exec SPHINCS+ cases clear once openssl is present -- a hand-patched compdb
+  got them past the header and all 16 files processed, then hit
+  `failed to parse one or more C inputs` **which does not say WHICH input**,
+  itself a diagnostic gap worth fixing before anyone measures that cohort.
+
+- [ ] FR-224 (opened 2026-09-09 from an owner question -- "methods of making
+  safer bindings for binary library dependencies with header"): **THE CORPUS
+  SAYS THIS IS TWO DIFFERENT PROBLEMS, AND ONLY ONE OF THEM IS A BINDING
+  PROBLEM.**
+  `call to 'X' declared in a system header; not part of the supported C
+  subset` is the **#1 single-fix lever in the census (+14 cases as a SOLE
+  blocker)**, and **every one of the 15 affected cases needs exactly ONE
+  function**. The complete list, measured:
+      sqrtf 2   setlocale 2   div 2   atof 2   strcspn 2   fputs 1
+      fabsf 1   srand 1       floorf 1  expf 1  abort 1
+  **ELEVEN OF THE THIRTEEN NEED NO BINDING AT ALL.** `sqrtf`/`fabsf`/
+  `floorf`/`expf` are `f32::sqrt`/`abs`/`floor`/`exp`; `div` is `(a/b, a%b)`;
+  `abort` is `std::process::abort()`; `strcspn` is a byte scan; `atof` is a
+  parse with C's leading-whitespace-and-prefix semantics; `fputs` is the
+  `write_all` byte primitive FR-194 already built. **Zero `unsafe`, zero FFI,
+  no dependency** -- this is a SHIM TABLE, exactly like the existing printf
+  family, not a binding mechanism. Two are genuinely hard for reasons that are
+  not about binding: `srand`/`rand` must reproduce glibc's exact sequence to
+  byte-diff, and `setlocale` is global C state with no Rust equivalent.
+  **THE ONLY REAL BINARY DEPENDENCY IN THE CORPUS is openssl, and it is ONE
+  FILE**: SPHINCS+'s `rng.c` calling five EVP symbols --
+  `EVP_CIPHER_CTX_new`, `EVP_CIPHER_CTX_free`, `EVP_EncryptInit_ex`,
+  `EVP_EncryptUpdate`, and the opaque `EVP_CIPHER_CTX` -- an AES-CTR DRBG for
+  the KAT vectors. It gates 48 exec cases (FR-223).
+  **THE CONSTRAINT THAT DISQUALIFIES THE OBVIOUS ANSWER:** the rubric scores
+  **zero `unsafe`**, so a naive `unsafe extern "C"` declaration is not a
+  solution however convenient. Any binding must confine `unsafe` to generated
+  code whose safety obligation is DISCHARGED, not merely relocated.
+  **THE PROPOSED DOCTRINE -- THE EXPORT CLASS TAXONOMY, REVERSED.**
+  FR-182 and FR-202 built a class taxonomy for what may cross the C ABI
+  OUTWARD, with a whitelist and a located refusal for everything else. The
+  same taxonomy classifies what may cross INWARD, and it is the natural fit
+  because the safety obligation is a property of the SIGNATURE either way:
+   - **IMPORT CLASS 0 -- all-scalar.** `sqrtf(f32) -> f32`. No pointer, no
+     lifetime, no aliasing; the only obligation is "the library implements its
+     declared contract", which is the same trust already extended to libc.
+     Safe by construction, and for this corpus a Rust-native shim beats a
+     binding outright.
+   - **IMPORT CLASS 1 -- one opaque handle.** `EVP_CIPHER_CTX *` is never
+     dereferenced by the C program; it is created, passed, and freed. That
+     maps to a Rust newtype owning a raw pointer with `Drop` calling the
+     library's own free function -- `unsafe` confined to a generated `ffi`
+     module, the public surface safe, and the obligation discharged by
+     ownership rather than by proof.
+   - **IMPORT CLASS 2 -- a declared (pointer, length) pair.** Sound only when
+     the pairing is DECLARED, because C cannot express it. This is the mirror
+     of FR-202's must-access bound and needs the same rigor.
+   - **EVERYTHING ELSE REFUSES, located.** Same doctrine as the export side.
+  **WHAT C CANNOT TELL US, and therefore what a contract file must:**
+  nullability, length pairing, ownership transfer, thread safety, and whether
+  a returned pointer aliases an argument. `bindgen` over a header supplies
+  none of these -- which is precisely why generated bindings are `unsafe` and
+  why "run bindgen" is not an answer to this question. The effort scales with
+  the LIBRARY, not with the program, and is amortized across every program
+  using it.
+  **RANKED RECOMMENDATION:**
+   1. **A libc shim table** covering the 11 Rust-native functions. No
+      `unsafe`, no FFI, no dependency, and it is the measured #1 lever. Start
+      with the four float functions, which are unambiguous.
+   2. **Decide `setlocale` and `srand` explicitly** rather than letting them
+      sit as refusals: `setlocale` is a scope decision (the corpus uses it to
+      select "C"), and `srand`/`rand` is a byte-diff obligation, not a
+      binding.
+   3. **IMPORT CLASS 0/1 for genuine dependencies**, prototyped on openssl's
+      five EVP symbols, with the contract file and the located refusal for
+      anything unclassifiable.
+  **A NOTE ON REIMPLEMENTATION, considered and NOT recommended as a general
+  method:** SPHINCS+'s openssl use is plain AES-ECB, so a pure-Rust AES would
+  be behaviourally identical with zero `unsafe`. That is a legitimate answer
+  for THIS corpus and a bad general doctrine -- reimplementing a dependency
+  does not scale and silently forks its semantics. It is recorded so the
+  option is visible, not because it should be the plan.
+
 - [x] FR-220 (opened and LANDED 2026-09-09 from an owner question -- "is there
   a way to not emit dead code and remove the override"): **THE ANSWER WAS NOT
   TO STOP EMITTING IT -- AND MY OWN MEASUREMENT WAS CORPUS-BOUND IN A WAY THAT
