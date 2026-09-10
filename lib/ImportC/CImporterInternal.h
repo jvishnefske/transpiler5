@@ -97,6 +97,7 @@ using namespace mlir;
 // qualified spellings in this file ambiguous to read.
 using mlir::emitrust::cFunctionSymbolName;
 using mlir::emitrust::cGlobalSymbolName;
+using mlir::emitrust::enumRustName;
 using mlir::emitrust::enumTypeRustName;
 using mlir::emitrust::enumVariantRustName;
 using mlir::emitrust::fnRustName;
@@ -7126,9 +7127,18 @@ private:
   /// `importedRecordShapes`, so the rename decision must be reproducible
   /// from each TU's own ordinary names).
   llvm::DenseMap<const clang::RecordDecl *, std::string> assignedStructNames;
-  /// Shape of every imported enum, keyed by symbol name, for cross-TU
-  /// deduplication and mismatch detection.
+  /// Shape of every imported enum, keyed by the EMITTED symbol name
+  /// (`enumRustName`, namespace-qualified since FR-108's enum arm), for
+  /// cross-TU deduplication and mismatch detection.
   llvm::StringMap<std::string> importedEnumShapes;
+  /// The per-TU mangling tag of the import that claimed each emitted enum
+  /// symbol -- the enum twin of `structNameOwnerTuTags`, and used for the
+  /// same reason: the shape dedup merges by NAME, which is correct for one
+  /// header enum reached through several TUs and is a different situation
+  /// entirely from two enums of ONE TU composing the same symbol. This map
+  /// is what lets the conflict diagnostic say which of the two it is
+  /// instead of asserting "another translation unit" unconditionally.
+  llvm::StringMap<std::string> enumNameOwnerTuTags;
   /// W2.14: the two alternative types of every SYNTHESIZED std::variant
   /// data enum, keyed by its shape-keyed symbol name (`VariantI32F64`).
   /// First insertion emits the module-level `emitrust.data_enum_def`;

@@ -262,8 +262,8 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
       return Type(builder.getIntegerType(32));
     if (failed(importEnum(definition, loc)))
       return failure();
-    return Type(emitrust::EnumType::get(
-        builder.getContext(), enumTypeRustName(definition->getName())));
+    return Type(emitrust::EnumType::get(builder.getContext(),
+                                        enumRustName(definition)));
   }
 
   // Function pointers are ordinary `!emitrust.fn_ptr` values (rendered

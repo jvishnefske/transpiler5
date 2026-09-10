@@ -928,7 +928,7 @@ ItemGraphBuilder::enumSymbolFor(const clang::EnumDecl *enumDecl) const {
   const clang::EnumDecl *definition = enumDecl->getDefinition();
   if (!definition)
     return {};
-  return mlir::emitrust::enumTypeRustName(definition->getName());
+  return mlir::emitrust::enumRustName(definition);
 }
 
 //===----------------------------------------------------------------------===//

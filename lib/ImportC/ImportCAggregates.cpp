@@ -2542,23 +2542,48 @@ CImporter::importEnumUncached(const clang::EnumDecl *definition) {
       os << variantName << '=' << variantValue << ';';
     os << (unsignedUnderlying ? 'u' : 'i') << (wideUnderlying ? 64 : 32);
   }
-  auto existingShape = importedEnumShapes.find(definition->getName());
+  // FR-108 enum arm: the dedup key is the NAMESPACE-QUALIFIED emitted
+  // symbol, not the bare C tag. Keyed on the tag, `namespace lib { enum
+  // Color { .. }; }` and a top-level `enum Color` collided inside ONE
+  // translation unit -- legal, unrelated C++ refused outright when the
+  // shapes differed, and merged into a single Rust type when they agreed.
+  // `enumRustName` is the same spelling the `enum_def` symbol, every
+  // `!emitrust.enum` reference and the item-graph node use, so the key and
+  // the emitted item cannot drift apart.
+  std::string enumSymbol = enumRustName(definition);
+  auto existingShape = importedEnumShapes.find(enumSymbol);
   if (existingShape != importedEnumShapes.end()) {
-    if (existingShape->second != shape)
+    if (existingShape->second != shape) {
+      // The wording used to say "in another translation unit"
+      // UNCONDITIONALLY, which is factually false for every collision
+      // inside the current one -- and with the bare-tag key that was the
+      // COMMON case. The per-TU owner tag (the same discriminator
+      // `importRecordUncached` uses for structs) is what lets the
+      // diagnostic say which of the two situations it actually is; tags
+      // are unique per translation unit, so an equal tag means both
+      // definitions are in the unit being imported right now.
+      auto ownerTu = enumNameOwnerTuTags.find(enumSymbol);
+      if (ownerTu != enumNameOwnerTuTags.end() &&
+          ownerTu->second == currentTuTag)
+        return emitError(defLoc)
+               << "unsupported: enum '" << enumSymbol
+               << "' collides with the emitted name of a different enum in "
+                  "this translation unit";
       return emitError(defLoc)
-             << "unsupported: conflicting definition of enum '"
-             << definition->getName()
+             << "unsupported: conflicting definition of enum '" << enumSymbol
              << "' with a different shape in another translation unit";
+    }
     return success();
   }
-  importedEnumShapes[definition->getName()] = shape;
+  importedEnumShapes[enumSymbol] = shape;
+  enumNameOwnerTuTags[enumSymbol] = currentTuTag;
 
   SmallVector<llvm::StringRef> variantNameRefs(variantNames.begin(),
                                                variantNames.end());
   OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
   moduleBuilder.create<emitrust::EnumDefOp>(
       defLoc,
-      moduleBuilder.getStringAttr(enumTypeRustName(definition->getName())),
+      moduleBuilder.getStringAttr(enumSymbol),
       moduleBuilder.getStrArrayAttr(variantNameRefs),
       moduleBuilder.getDenseI64ArrayAttr(variantValues), unsignedUnderlying,
       wideUnderlying);
