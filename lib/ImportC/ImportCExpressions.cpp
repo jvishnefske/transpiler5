@@ -2704,13 +2704,42 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
       return emitAbsCall(call, /*isLong=*/true);
     if (name == "atoi")
       return emitAtoiCall(call);
+    // FR-224: atof is atoi's shape at f64 -- a C-exact PREFIX parse over
+    // the argument's char region, through a helper that scans the
+    // strtod grammar itself (Rust's `parse` demands the whole string and
+    // would reject the trailing newline every fgets leaves).
+    if (name == "atof")
+      return emitAtofCall(call);
+    // FR-224: div/ldiv/lldiv build their ISO { quot, rem } result from
+    // the same divsi/remsi C's `/` and `%` lower to.
+    if (name == "div" || name == "ldiv" || name == "lldiv")
+      return emitDivCall(call, name);
+    // FR-224: strcspn/strspn are byte scans over two shared string
+    // regions, modelled on strcmp; their size_t result is an ordinary
+    // value.
+    if (name == "strcspn" || name == "strspn")
+      return emitStrSpanCall(call, name);
+    // FR-224: `abort` is statement-position only (lowered by
+    // emitCallStmt). It returns void, so a value use cannot arise from a
+    // conforming declaration; a K&R-style one that claims a result gets
+    // a located rejection rather than a silently dropped call.
+    if (name == "abort")
+      return emitError(loc)
+             << "unsupported: abort return value must be unused";
     // Curated <math.h> rejections (design.md C99-48): C imposes no
     // accuracy requirement on these, implementations disagree in the
     // last bits, and rustc may constant-fold them through a libm other
     // than the differential oracle's — no bit-exact safe-Rust mapping
     // can be argued, so they stay out of the curated subset by policy
     // (a sharper diagnostic than the generic system-header rejection).
-    if (name == "pow" || name == "exp" || name == "log")
+    // FR-224: the `f`-suffixed forms share the policy exactly. The
+    // suffix narrows the width, not the disagreement -- glibc's `expf`
+    // and Rust's `f32::exp` are different implementations of a function
+    // with no accuracy mandate, and rustc may additionally constant-fold
+    // through a third. `gaussian_kernel_lib` is the corpus case that
+    // wants `expf` and it stays a located rejection.
+    if (name == "pow" || name == "exp" || name == "log" || name == "powf" ||
+        name == "expf" || name == "logf")
       return emitError(loc)
              << "unsupported: '" << name
              << "' has no bit-exact Rust mapping (C imposes no accuracy "
@@ -2832,14 +2861,28 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   // user-defined function of the same name stays an ordinary call
   // (mirroring the puts/putchar policy), and every other system-header
   // call keeps the rejection below.
-  if (!callee->getDefinition() && callee->getNumParams() == 1 &&
-      astContext().hasSameUnqualifiedType(callee->getReturnType(),
-                                          astContext().DoubleTy) &&
-      astContext().hasSameUnqualifiedType(callee->getParamDecl(0)->getType(),
-                                          astContext().DoubleTy)) {
-    if (std::optional<llvm::StringRef> rustCallee =
-            hostedMathCallee(callee->getName()))
-      return emitHostedMathCall(call, *rustCallee);
+  //
+  // FR-224 widens the same gate to the `float f(float)` prototype of the
+  // `f`-suffixed forms. The prototype is matched EXACTLY in both cases:
+  // it is what guarantees clang already converted the argument, so the
+  // operand width is known without inspecting it, and it is what keeps a
+  // K&R-style or otherwise-typed redeclaration out of the intercept.
+  if (!callee->getDefinition() && callee->getNumParams() == 1) {
+    clang::QualType returnType = callee->getReturnType();
+    clang::QualType paramType = callee->getParamDecl(0)->getType();
+    bool isDouble =
+        astContext().hasSameUnqualifiedType(returnType,
+                                            astContext().DoubleTy) &&
+        astContext().hasSameUnqualifiedType(paramType,
+                                            astContext().DoubleTy);
+    bool isFloat =
+        astContext().hasSameUnqualifiedType(returnType,
+                                            astContext().FloatTy) &&
+        astContext().hasSameUnqualifiedType(paramType, astContext().FloatTy);
+    if (isDouble || isFloat)
+      if (std::optional<llvm::StringRef> rustCallee =
+              hostedMathCallee(callee->getName(), isFloat))
+        return emitHostedMathCall(call, *rustCallee, isFloat);
   }
 
   // W2.2: the only `CXXMethodDecl` an ordinary (non-member) `CallExpr` ever

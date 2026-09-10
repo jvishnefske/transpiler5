@@ -173,7 +173,19 @@ byte-diff as proof of soundness for these classes:
   report one `cmake configure failed` instead of their real blocker,
   destroying the census while leaving PASS unchanged.
 - `scripts/tractor-census.py` gives per-case FULL blocker sets and set-cover.
-  Use it to rank work; use `tractor-eval.py` to score it.
+  Use it to rank work; use `tractor-eval.py` to score it. Its depth is a
+  LOWER BOUND and its sole-blocker table is split CONFIRMED / PARTIAL — rank
+  only on CONFIRMED.
+- **A corpus-runner early exit silently degrades PASS while leaving EMIT
+  intact.** One run reported `NOT_DISCOVERED 47 / PASS 6` under machine
+  contention while its `emitted 57/252` line was correct. Before trusting any
+  PASS number, check the `corpus runner exited` line and confirm
+  `discovered_by_corpus_runner` matches the emitted count.
+- **A refusal's wording is part of the ranking instrument.** The census keys
+  on the diagnostic, so giving a rejection bespoke prose moves it out of its
+  `libc:<name>`-style tag and into the `other` junk bucket, where a future
+  reader ranking work will not see it. A new refusal class needs a
+  `RejectionLedger` needle in the same commit.
 
 ## Repo-specific rules
 

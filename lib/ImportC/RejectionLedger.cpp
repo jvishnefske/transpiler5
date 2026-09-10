@@ -175,6 +175,22 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
      llvm::StringLiteral("struct-shape-conflict")},
     {llvm::StringLiteral("was rejected, so a type naming it"),
      llvm::StringLiteral("rejected-type-cascade")},
+    // FR-224: the curated <math.h> POLICY rejections (pow/exp/log and
+    // their `f` forms). They previously tabulated [other] behind the
+    // generic bucket, and FR-224 made that worse rather than better: it
+    // moved `expf` OUT of the `libc:expf` tag the generic system-header
+    // wording gave it and into [other], so the census lost the one tag
+    // that told a reader "this is refused on purpose, do not rank it as
+    // missing work". A tag of its own restores that, for the f64 forms
+    // too.
+    {llvm::StringLiteral("has no bit-exact Rust mapping"),
+     llvm::StringLiteral("libm-not-bit-exact")},
+    // FR-224: `abort`, for the same reason and with the same history --
+    // it was `libc:abort` until this wave gave it a wording that says
+    // WHY. The tag records that the blocker is the emitted crate's
+    // stdout buffering model, not the abort call.
+    {llvm::StringLiteral("terminates without flushing"),
+     llvm::StringLiteral("abort-stdout-flush")},
 };
 
 /// The C++-input table (`_CXX_BLOCKER_SUBSTRINGS`), consulted after the table

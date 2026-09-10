@@ -13714,10 +13714,85 @@ piece and becomes FR-45.
   `failed to parse one or more C inputs` **which does not say WHICH input**,
   itself a diagnostic gap worth fixing before anyone measures that cohort.
 
-- [ ] FR-224 (opened 2026-09-09 from an owner question -- "methods of making
-  safer bindings for binary library dependencies with header"): **THE CORPUS
-  SAYS THIS IS TWO DIFFERENT PROBLEMS, AND ONLY ONE OF THEM IS A BINDING
-  PROBLEM.**
+- [x] FR-224 (opened and the shim half LANDED 2026-09-09 from an owner
+  question -- "methods of making safer bindings for binary library
+  dependencies with header"): **THE CORPUS SAYS THIS IS TWO DIFFERENT
+  PROBLEMS, AND ONLY ONE OF THEM IS A BINDING PROBLEM.**
+  **LANDED, MEASURED: PASS 41 -> 45 (+4), EMIT-cleared 50 -> 57 (+7).** The
+  +4 are `002_stdin_echo`, `016_divide_by_zero_float`, `022_stdlib_div` (all
+  exec, needing no export) and `022_stdlib_div_lib` (**lib, CLASS 0**, the one
+  lib case that exports). The +3 emit-only are `tfm_lib`, `hsv_to_rgb_lib` and
+  `029_strcspn_lib`, all now SYMBOL_MISSING. **The +4-to-+6 projection was
+  right at its LOWER bound**, and the reasons the optimistic end did not
+  arrive are the valuable part.
+  **THREE OF MY OWN LEADS WERE REFUTED BY MEASUREMENT, which was the wanted
+  outcome:**
+   1. **`abort` is a NO-GO with a measured byte-diff, and the defect is not
+      `abort`.** `std::process::abort()` matches on signal, on destructors and
+      on exit status (134 both sides) -- and `printf("before abort\n");
+      abort();` still diverges, because the emitted crate's stdout is
+      line-buffered where C's is fully buffered off a terminal. **Filed as
+      FR-228**, a crate-wide output-model defect that `abort` merely makes
+      observable. `abort` now refuses, located, naming the real cause. Cost:
+      `bin2hex_lib` returns to EMIT_FAIL, so EMIT is +7 rather than +8; PASS
+      is unaffected, that case being a multi-pointer export NO-GO either way.
+   2. **My UB warning about `016_divide_by_zero_float` was WRONG.** I said its
+      `(int)(100.0/0.0)` was undefined and told the agent to check
+      well-definedness before treating the case as winnable. It did, and the
+      corpus had already handled it: `test04.json` carries
+      `"has_ub": "Divides by zero: floating point"` with no expected stdout
+      and the harness SKIPS it; vectors 01-03 all take the divisor-nonzero
+      path and are fully defined. The case is winnable and now passes.
+      **Checking well-definedness first was still the right instruction -- the
+      answer was just already written down**, in `Public-Tests-UB.md`.
+   3. **`div` needed NO system-header TYPE admission.** I scoped `div_t` as
+      the hard one of the exec four. There is no system-header type rejection
+      in the importer at all: hand-probed, `static div_t mydiv(int, int)`
+      renders `struct DivT { quot: i32, rem: i32 }` with both member reads,
+      UNPATCHED. Only the CALL was refused. An ordinary shim, not its own FR.
+  **`expf` STAYED REJECTED, as led** -- and `logf`/`powf` joined it, so the
+  f32 forms now match the f64 policy exactly rather than being an accidental
+  gap next to a deliberate one. `sqrtf`/`fabsf`/`floorf` (plus `ceilf`/`sinf`
+  free, no corpus demand) are byte-identical to clang+glibc over 28 values
+  including the sign of zero.
+  **THE CENSUS'S BLOCKER SETS WERE LOWER BOUNDS AGAIN, and it bit 3 of the 13
+  "sole-blocker" cases** -- exactly the property FR-223 now documents:
+  `027_ctype_ascii` (and its `_lib` twin) has TWO further blockers behind
+  `setlocale`, `__ctype_b_loc` in VALUE position (FR-129 admits the ctype
+  classifiers in boolean context only, and this program prints glibc's `_IS*`
+  mask) and then the FR-129 locale fence itself, which fires on the mere
+  presence of a `setlocale` call regardless of argument;
+  `hsl_to_rgb_lib` needs `fmodf`; `normalize_lib` needs at least two more.
+  So `setlocale` landed as a working shim worth **+0 EMIT and +0 PASS**, which
+  is recorded as such rather than counted.
+  **THE LIB HALF OF THIS ENTRY IS EXHAUSTED: EXACTLY 1 OF THE 9 LIB CASES
+  EXPORTS, and it is the one already counted.** Measured signature by
+  signature. The decisive one is `gaussian_kernel(float *out, int size,
+  float sigma)`: it has a **DECLARED `(pointer, size)` pair**, which is
+  FR-202's must-access shape, and `classifyCAbiSignature` refuses it anyway --
+  so even admitting `expf` would yield nothing, and **FR-227's proposed CLASS
+  2b (the parameter-bounded slice) is confirmed missing by an independent
+  case**. Further work on the lib half returns zero.
+  **A DIAGNOSTIC-VOCABULARY FEEDBACK LOOP WORTH KNOWING ABOUT.** Giving
+  `expf` and `abort` wording that says WHY moved them out of the census's
+  `libc:<name>` tag and into `other`, its junk bucket -- so a future reader
+  ranking work would have seen nothing where two deliberate, measured
+  refusals live. Two ledger needles (`libm-not-bit-exact`, `abort-stdout-
+  flush`) were added to keep them visible, and the first also rescues the
+  pre-existing f64 `pow`/`exp`/`log`, which had been sitting in `other` since
+  C99-48. **A refusal's wording is part of the ranking instrument.**
+  Gate 1044/1044 (1040 + 4 new tests), clippy 57 (+0) at the epoch-7 pin with
+  the population hash unchanged and the epoch NOT closed, both corpus ratchets
+  unmoved, and golden movement measured over 1095 paired `--emit=rust` files:
+  **MOVED 0, newly-rejected 0, newly-accepted 2** (the two new EndToEnd files
+  themselves). Nothing re-blessed; the full lit suite was run too, per the
+  split-file blindness rule.
+  **HARNESS HAZARD, recorded because it produced a wrong number once:** a
+  corpus-runner early exit (2.7s, under machine contention) reported
+  `NOT_DISCOVERED 47 / PASS 6` while the `emitted 57/252` line stayed correct.
+  **An early exit silently degrades PASS while leaving EMIT intact.** Check
+  the `corpus runner exited` line and the NOT_DISCOVERED bucket before
+  trusting any PASS number.
   `call to 'X' declared in a system header; not part of the supported C
   subset` is the **#1 single-fix lever in the census**, and it touches **15
   cases, 13 of which need NOTHING ELSE**. The complete list, measured from
@@ -13994,6 +14069,54 @@ piece and becomes FR-45.
   exists; (3) TRACTOR measured 41 -> 53 with the 12 blake cases newly PASS and
   NO case lost; (4) the 8 sha2 cases still refuse, LOCATED, and are recorded
   as such rather than silently emitting a wrong export.
+
+- [ ] FR-228 (opened 2026-09-09, found by the FR-224 implementation's own
+  byte-diff oracle while trying to admit `abort`): **EVERY EMITTED CRATE HAS
+  THE WRONG STDOUT BUFFERING MODEL, AND EXACTLY ONE CONSTRUCT MAKES IT
+  OBSERVABLE.**
+  C's `stdout` is **FULLY buffered** when it is not a terminal -- a pipe or a
+  file -- and is flushed at `exit` or when the buffer fills. Rust's `Stdout`
+  is a **`LineWriter`** and flushes on every newline. For every NORMAL
+  termination the two agree, and that was measured, not assumed: `return` and
+  `exit` flush on both sides and produce byte-identical output, including for
+  a trailing partial line with no newline (`printf("partial-no-newline");
+  exit(3);` is byte-identical).
+  They diverge for any termination that does NOT flush. Measured:
+      printf("before abort\n");
+      abort();
+  clang+glibc with stdout redirected to a file writes **NOTHING** -- C11
+  7.22.4.1p2 leaves the flush implementation-defined and glibc declines. The
+  emitted crate writes `before abort`, because the LineWriter already flushed
+  on the newline. Diff: `0a1 > before abort`.
+  **THE DIVERGENCE IS THE SILENTLY-WRONG DIRECTION** -- the emitted program
+  prints bytes the reference build does not print -- so `abort` now REFUSES,
+  located, with wording that names the real cause rather than the call:
+  "'abort' terminates without flushing C's fully buffered stdout, but the
+  emitted crate's line-buffered stdout has already written every completed
+  line". **Nothing local to the call can fix it**: flushing at the call site
+  writes MORE than glibc, not less.
+  **WHY 1044 GREEN TESTS NEVER SAW THIS.** It is not a blind spot of the
+  byte-diff oracle -- the oracle caught it the moment a test had the shape.
+  It is a **GAP IN THE CORPUS**: no EndToEnd test terminates without flushing,
+  so the entire suite exercises only the case where the two models agree. The
+  lesson generalises past this entry -- an oracle only refutes the shapes
+  somebody wrote down, and a green suite is evidence about its own population.
+  THE FIX, scoped and NOT costed: give the emitted crate a fully-buffered
+  `BufWriter<Stdout>` flushed at normal exit only. That is a **crate-wide
+  output-model change that shifts every emitted byte of every crate that
+  prints**, so it needs the full byte-diff wave and a golden re-bless of a
+  large fraction of the suite. It would admit `abort`; whether anything else
+  observes the difference today is UNMEASURED, and so is the golden churn.
+  Candidates to check first, since they share the non-flushing shape: `_Exit`,
+  `quick_exit`, and a fatal signal raised by `raise`.
+  ACCEPTANCE: (1) a fully-buffered stdout writer flushed at normal exit only;
+  (2) `printf` then `abort` byte-identical to the clang native with stdout
+  redirected to a FILE, and still byte-identical to a terminal run; (3) the
+  partial-line-then-`exit` shape stays byte-identical, i.e. the fix does not
+  trade one divergence for another; (4) `abort`'s located refusal is replaced
+  by a working lowering and `bin2hex_lib` clears EMIT; (5) the golden churn is
+  reported as a COUNT, and every moved golden re-verified by its own oracle
+  rather than re-blessed.
 
 - [ ] FR-227 (opened 2026-09-09, measuring the export boundary rather than the
   importer): **THE EXPORT GATE, NOT THE IMPORTER, IS WHERE THIS CORPUS'S
