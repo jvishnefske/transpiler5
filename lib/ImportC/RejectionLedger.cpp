@@ -113,6 +113,23 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
     // test/RealWorld/run_realworld.py at the same position.
     {llvm::StringLiteral("negative element index through a slice parameter"),
      llvm::StringLiteral("slice-param-negative-index")},
+    // FR-229: the object-representation BYTE VIEW family. The three
+    // wordings below are the boundary of the admitted view, and each is a
+    // distinct piece of work rather than one bucket: a padded aggregate
+    // has no determinate byte image at all (C leaves the holes
+    // indeterminate, measured), a global's image would have to be built
+    // from a staged copy, and a mutable view reaching a call path with no
+    // post-call flush would silently lose the callee's writes. They sit
+    // ABOVE the generic wordings so first-match-wins routes them, and none
+    // of the three overlaps the older CTS-BR `byte view of an aggregate
+    // with non-byte members`, which keeps its historical `other` bucket.
+    // Mirrors test/RealWorld/run_realworld.py's classify_blocker.
+    {llvm::StringLiteral("byte view of an aggregate with interior padding"),
+     llvm::StringLiteral("byte-view-padding")},
+    {llvm::StringLiteral("byte view of the global object"),
+     llvm::StringLiteral("byte-view-global")},
+    {llvm::StringLiteral("byte view with no write-back point"),
+     llvm::StringLiteral("byte-view-writeback")},
     {llvm::StringLiteral("returned pointer value"),
      llvm::StringLiteral("returned-pointer")},
     {llvm::StringLiteral("pointer return type"),

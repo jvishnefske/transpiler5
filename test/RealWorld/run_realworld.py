@@ -323,6 +323,17 @@ _BLOCKER_SUBSTRINGS = [
         "negative element index through a slice parameter",
         "slice-param-negative-index",
     ),
+    # FR-229: the object-representation BYTE VIEW family -- a padded
+    # aggregate (no determinate image), a global base (its image would come
+    # from a staged copy), and a mutable view with no post-call write-back
+    # point (the callee's writes would be silently lost). Kept as three
+    # tags because they are three separate pieces of work, and placed above
+    # the generic wordings so first-match-wins routes them. None overlaps
+    # the older CTS-BR "byte view of an aggregate with non-byte members".
+    # Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("byte view of an aggregate with interior padding", "byte-view-padding"),
+    ("byte view of the global object", "byte-view-global"),
+    ("byte view with no write-back point", "byte-view-writeback"),
     ("returned pointer value", "returned-pointer"),
     ("pointer return type", "returned-pointer"),
     ("return sites disagree", "returned-pointer"),

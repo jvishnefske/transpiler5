@@ -2,8 +2,22 @@
 // to aggregates whose scalar leaves are ALL unsigned char: (1) a byte
 // view `(u8 *)&x` of an aggregate with non-u8 leaves is a located
 // rejection with its own wording (authored here, binding) — int-leaf
-// structs stay on the typed path and never expose their object
-// representation; (2) a RUNTIME read of a flexible-array-member tail is
+// structs stay on the typed path. FR-229 SPLIT THAT FIRST PIN IN TWO
+// WITHOUT LOOSENING EITHER HALF. A LOCAL padding-free int-leaf object IS
+// now viewable at a byte-slice argument — not by exposing the typed
+// object's storage, but by materializing a synthetic `[u8; N]` image with
+// `to_ne_bytes` per field at the field's C offset (see byte-view.c), so
+// the claim "never exposes its object representation" was replaced by the
+// stronger one that Rust's own layout is irrelevant to what the view
+// prints. The TWO shapes that made the original pin's example
+// unrepresentable are unchanged and are pinned SEPARATELY below:
+// `int-leaf-view.c` keeps the GLOBAL base (whose image would have to come
+// from a staged copy, so a callee that also touched the global would see
+// or lose the wrong values) and now names the global; `int-leaf-array.c`
+// keeps the original wording for a member that is not a scalar at all.
+// Padded aggregates — the shape with no determinate image in the first
+// place — are pinned in byte-view-invalid.c; (2) a RUNTIME read of a
+// flexible-array-member tail is
 // a located rejection (the FAM declaration and its folded static
 // initializer are legal, see byte-region-aggregates.c); (3) an unnamed
 // union arm with non-u8 leaves whose size differs from the union's is
@@ -20,13 +34,16 @@
 //
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/int-leaf-view.c 2>&1 | FileCheck %s --check-prefix=INTLEAF
+// RUN: not emitrust-import-c %t/int-leaf-array.c 2>&1 | FileCheck %s --check-prefix=INTARRAY
 // RUN: not emitrust-import-c %t/fam-tail-read.c 2>&1 | FileCheck %s --check-prefix=FAMREAD
 // RUN: not emitrust-import-c %t/mixed-size-arm.c 2>&1 | FileCheck %s --check-prefix=MIXED
 
 //--- int-leaf-view.c
-// struct P has int leaves (with padding-free layout, even): its object
-// representation is still not observable — the byte view rejects at the
-// cast.
+// struct P has int leaves and a padding-free layout, so its byte image is
+// determinate — but `gp` is a GLOBAL. Building the image would mean
+// building it from a STAGED COPY of the global, and a callee that also
+// reached the global directly would then see (or lose) the wrong values.
+// One located rejection, at the argument, naming the global.
 typedef unsigned char u8;
 struct P { int x; int y; };
 struct P gp = {1, 2};
@@ -42,7 +59,33 @@ int main(void) {
   print_((u8 *)&gp, sizeof gp);
   return 0;
 }
-// INTLEAF: int-leaf-view.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: byte view of an aggregate with non-byte members
+// INTLEAF: int-leaf-view.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: byte view of the global object 'gp'
+
+//--- int-leaf-array.c
+// The other half of the original pin, kept verbatim at its own site: a
+// member that is not a SCALAR at all. FR-229's scatter is per scalar
+// field, so there is no offset map to read for `int q[2]` and the
+// standing non-byte-members wording still authors the refusal — for a
+// LOCAL object, which is exactly the axis the global pin above does not
+// cover. Without this sub-unit the original wording would have no test.
+typedef unsigned char u8;
+struct A { int q[2]; };
+int printf(const char *, ...);
+
+void take_(const u8 *p, int n) {
+  int i;
+  for (i = 0; i < n; i++)
+    printf(" %x", p[i]);
+}
+
+int main(void) {
+  struct A a;
+  a.q[0] = 1;
+  a.q[1] = 2;
+  take_((const u8 *)&a, sizeof a);
+  return 0;
+}
+// INTARRAY: int-leaf-array.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: byte view of an aggregate with non-byte members
 
 //--- fam-tail-read.c
 // The FAM tail of a u8-only region struct is initializable (extended

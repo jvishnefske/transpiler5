@@ -5952,6 +5952,83 @@ private:
                      const clang::VarDecl *ownerBase, Location loc,
                      const clang::VarDecl **outFirstPointerArgBase = nullptr);
 
+  //===--------------------------------------------------------------------===//
+  // FR-229: the materialized OBJECT-REPRESENTATION byte view.
+  //===--------------------------------------------------------------------===//
+
+  /// One scalar component of a materialized byte view: the field it is
+  /// read from (null when the viewed object is itself a scalar), its byte
+  /// offset inside the view, its width in bytes, and the mapped emitrust
+  /// type whose `to_ne_bytes`/`from_ne_bytes` moves it.
+  struct ByteViewComponent {
+    const clang::FieldDecl *field;
+    unsigned offset;
+    unsigned width;
+    Type valueType;
+  };
+
+  /// The complete byte image of an object: `size` bytes covered EXACTLY by
+  /// `components`, contiguous and in C DECLARATION order with no padding
+  /// hole, so every byte of the view has a determinate value. C leaves
+  /// padding indeterminate -- one clang -O0 binary prints
+  /// `0100000007000000` for a `{char; int;}` on a clean stack and
+  /// `01dddddd07000000` after the frame is dirtied -- and the byte-diff
+  /// oracle cannot see the difference because every harness initializes
+  /// every field (FR-212). A padded aggregate is therefore a located
+  /// rejection, never a guess.
+  ///
+  /// Scattering per field at the FIELD's C offset is also what makes this
+  /// sound where a `transmute` is not: nothing in the emitted crate
+  /// depends on rustc having laid the struct out the way clang did.
+  struct ByteViewPlan {
+    unsigned size = 0;
+    SmallVector<ByteViewComponent, 4> components;
+  };
+
+  /// A byte view passed to a MUTABLE byte-slice parameter: the image and
+  /// the object it must be reconstituted into after the call op.
+  struct ByteViewWriteback {
+    Value bytesPlace;
+    Value objectPlace;
+    ByteViewPlan plan;
+  };
+
+  /// FR-229: plans the byte image of an object of type `objectType`.
+  /// Returns true with `plan` filled when the type HAS a determinate byte
+  /// image this wave can build (an integer or f32/f64 scalar, or a record
+  /// whose fields are all such scalars and whose clang layout is
+  /// padding-free); `failure()` when the shape is a LOCATED rejection
+  /// (interior padding); and false when it is simply not a byte-view
+  /// shape, which leaves every pre-existing refusal for that expression
+  /// verbatim.
+  ///
+  /// The no-padding proof is READ off `emitrust.abi_layout` -- clang's own
+  /// ASTRecordLayout numbers, parked on the struct_def by
+  /// `annotateAbiFaithfulness` -- and never re-derived here, so a second
+  /// layout model cannot disagree with the one the emitted const-assertions
+  /// check against.
+  FailureOr<bool> planByteView(clang::QualType objectType, Location loc,
+                               ByteViewPlan &plan);
+
+  /// FR-229: matches `(unsigned char *)&obj` in a byte-slice ARGUMENT
+  /// position and, when it plans, materializes the object representation
+  /// into a fresh `[u8; N]` local (per-component `to_ne_bytes` scattered
+  /// at the C byte offsets) and returns a `slice_of` over it in `result`.
+  /// Returns false when the argument is not that shape, leaving the
+  /// caller's existing paths (and their rejections) untouched.
+  FailureOr<bool> tryEmitByteViewArgument(
+      Location loc, const clang::Expr *argument, Type paramType,
+      bool isMutParam, const clang::VarDecl *&root,
+      SmallVectorImpl<ByteViewWriteback> *byteViewWritebacks, Value &result);
+
+  /// FR-229: reconstitutes each viewed object from its (possibly mutated)
+  /// byte image, `from_ne_bytes` per component at its own offset. Emitted
+  /// immediately after the call op; dead-store elimination removes it
+  /// again when the object is never read afterwards, so a read-only byte
+  /// view costs nothing.
+  LogicalResult flushByteViewWritebacks(Location loc,
+                                        ArrayRef<ByteViewWriteback> writebacks);
+
   /// Lowers one borrow-producing call argument against the reference-typed
   /// target parameter `paramType`. A slice parameter receives an
   /// `emitrust.slice_of` of the argument's region base at the argument's
@@ -5985,11 +6062,27 @@ private:
   /// `passing a pointer into a heap allocation as a slice argument`
   /// rejection verbatim — refusing is safe, emitting an unkeyed
   /// aliasing pair is not.
+  ///
+  /// FR-229: `byteViewWritebacks` is the byte-view family's equivalent
+  /// opt-in. A `(unsigned char *)&obj` argument materializes a SYNTHETIC
+  /// `[u8; sizeof obj]` image of the object, so a callee that writes
+  /// through a MUTABLE byte-slice parameter mutates the image and not the
+  /// object; the write is recovered only by reconstituting the object from
+  /// the image right after the call. That reconstitution is the caller's
+  /// job (the argument path returns a Value, the call op is built above
+  /// it), so a caller that can flush passes the sink and a caller that
+  /// cannot keeps a LOCATED rejection. Omitting it is a MEASURED
+  /// miscompile, not a theoretical one: `zap((unsigned char *)&x, 4);
+  /// printf("%d", x)` prints the native -1431655766 against a naive Rust
+  /// 1, from a crate that builds clean. A SHARED (`const unsigned char *`)
+  /// byte view needs no sink -- C forbids writing through it, so no valid
+  /// program can observe a lost write.
   FailureOr<Value> emitBorrowArgument(
       Location loc, const clang::Expr *argument, Type paramType,
       const clang::VarDecl *&root,
       SmallVectorImpl<const clang::FieldDecl *> *rootPath = nullptr,
-      Value *allocBacking = nullptr);
+      Value *allocBacking = nullptr,
+      SmallVectorImpl<ByteViewWriteback> *byteViewWritebacks = nullptr);
 
   /// FR-74: matches a member-array slice ARGUMENT — a dot/arrow
   /// projection chain ending at a fixed-extent array-typed field —
@@ -6395,8 +6488,12 @@ private:
     Value basePlace;
     /// The i64 cursor of the access's first byte.
     Value cursor;
-    /// The mapped integer type of the viewed access (e.g. ui32).
-    IntegerType valueType;
+    /// The mapped type of the viewed access (e.g. ui32). FR-229 widened
+    /// this from IntegerType to Type so the byte view can move f32/f64
+    /// components through the same `to_ne_bytes`/`from_ne_bytes` pair; the
+    /// wide-byte DEREF path that owned it first still only ever stores an
+    /// integer here.
+    Type valueType;
     /// sizeof(T) of the viewed type, in bytes.
     unsigned byteWidth;
     /// The byte-run's element type. Null keeps the historical CTS-P11

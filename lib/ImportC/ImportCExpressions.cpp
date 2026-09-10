@@ -3161,6 +3161,12 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   };
   SmallVector<HeldBorrow, 4> borrowRoots;
   SmallVector<std::pair<Value, bool>, 4> borrowBackings;
+  // FR-229: byte views materialized for THIS call site, reconstituted into
+  // their objects right after the call op. This path owns a flush point,
+  // so it opts in; the multi-base dispatch arm below deliberately does NOT
+  // (a byte view there keeps the located refusal rather than acquiring an
+  // untested second flush site).
+  SmallVector<ByteViewWriteback, 2> byteViewWritebacks;
   for (const PendingBorrow &borrow : borrows) {
     const clang::VarDecl *root = nullptr;
     Value allocBacking;
@@ -3184,7 +3190,7 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     bool borrowIsMut = llvm::isa<emitrust::MutRefType>(borrowType);
     FailureOr<Value> reference =
         emitBorrowArgument(loc, borrow.expr, borrowType, root, &rootPath,
-                           &allocBacking);
+                           &allocBacking, &byteViewWritebacks);
     if (failed(reference))
       return failure();
     // FR-104: an armed parameter-cursor-return capture records the rooted
@@ -3295,6 +3301,13 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   // always self-consistent with whatever the Rust emitter later prints for
   // that same function inside its `impl` block.
   if (staticMethod) {
+    // FR-229: this arm returns before the call tail's write-back flush, so
+    // a byte view that reached it would silently lose the callee's writes.
+    // Defensive only, but the failure direction has to be a located
+    // refusal, never a dropped store.
+    if (!byteViewWritebacks.empty())
+      return emitError(loc) << "unsupported: byte view with no write-back "
+                               "point for the callee's writes";
     // By-value lookup: a StringRef binding would dangle (see
     // cxxMethodMangledName).
     std::string structName =
@@ -3313,6 +3326,12 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   }
 
   auto callOp = builder.create<func::CallOp>(loc, target, arguments);
+  // FR-229: reconstitute every viewed object from its (possibly mutated)
+  // byte image. This sits BEFORE the throws-carrier early return below on
+  // purpose: an early return past it would be the silent-lost-write
+  // miscompile the write-back exists to prevent.
+  if (failed(flushByteViewWritebacks(loc, byteViewWritebacks)))
+    return failure();
   // W2.24: a call to a can-throw-closure member returns the synthesized
   // carrier; unwrap it here (two RESULT-mode matches + the early-return
   // cf pattern — see unwrapThrowsResult). The planner's closure gates
@@ -6391,11 +6410,148 @@ peelVoidMediatedArgumentCast(clang::ASTContext &context,
   return cast->getSubExpr();
 }
 
+//===----------------------------------------------------------------------===//
+// FR-229: the materialized OBJECT-REPRESENTATION byte view.
+//===----------------------------------------------------------------------===//
+
+FailureOr<bool> CImporter::tryEmitByteViewArgument(
+    Location loc, const clang::Expr *argument, Type paramType,
+    bool isMutParam, const clang::VarDecl *&root,
+    SmallVectorImpl<ByteViewWriteback> *byteViewWritebacks, Value &result) {
+  auto u8Type = IntegerType::get(builder.getContext(), 8,
+                                 IntegerType::Unsigned);
+  // The destination has to be a byte slice: `&[u8]` or `&mut [u8]`.
+  Type pointee = borrowPointee(paramType);
+  auto sliceType = llvm::dyn_cast_or_null<emitrust::SliceType>(pointee);
+  if (!sliceType || sliceType.getElementType() != u8Type)
+    return false;
+
+  // ... and the argument the exact non-escaping spelling `(unsigned char
+  // *)&obj`. Matching the ARGUMENT syntactically (rather than teaching
+  // `emitPointerRValue` to return a byte-view pointer) is deliberate: a
+  // byte view is a materialized COPY, so a `PtrExprValue` carrying one
+  // would be a miscompile the moment any other consumer treated it as the
+  // address of the object. `unsigned char *p = (unsigned char *)&x;` --
+  // the escaping form -- keeps its standing `pointer assigned a
+  // non-address value` refusal, and THAT guard is what makes the
+  // non-escape premise hold for free.
+  // A `(unsigned char *)` cast feeding a `const unsigned char *`
+  // parameter arrives wrapped in clang's implicit qualification
+  // adjustment (`ImplicitCastExpr <NoOp>`), which `stripTrivia`
+  // deliberately does not touch. Peeling it is narrow -- BOTH sides must
+  // already be byte pointers, so nothing but a const/volatile adjustment
+  // can be discarded here.
+  const clang::Expr *peeled = stripTrivia(argument);
+  while (const auto *implicit =
+             llvm::dyn_cast<clang::ImplicitCastExpr>(peeled)) {
+    if (implicit->getCastKind() != clang::CK_NoOp)
+      break;
+    clang::QualType inner =
+        implicit->getSubExpr()->getType().getCanonicalType();
+    if (!inner->isPointerType() || !isU8ScalarType(inner->getPointeeType()))
+      break;
+    peeled = stripTrivia(implicit->getSubExpr());
+  }
+  const auto *cstyle = llvm::dyn_cast<clang::CStyleCastExpr>(peeled);
+  if (!cstyle)
+    return false;
+  clang::QualType destType = cstyle->getType().getCanonicalType();
+  if (!destType->isPointerType() ||
+      !isU8ScalarType(destType->getPointeeType()))
+    return false;
+  const auto *addrOf =
+      llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(cstyle->getSubExpr()));
+  if (!addrOf || addrOf->getOpcode() != clang::UO_AddrOf)
+    return false;
+  const auto *ref =
+      llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(addrOf->getSubExpr()));
+  if (!ref)
+    return false;
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var)
+    return false;
+
+  ByteViewPlan plan;
+  FailureOr<bool> planned = planByteView(var->getType(), loc, plan);
+  if (failed(planned))
+    return failure();
+  if (!*planned)
+    return false;
+
+  // A GLOBAL object's byte image would be built from a STAGED COPY, so a
+  // callee that also touches the global directly would see -- or lose --
+  // the wrong values. This is the pin `byte-region-aggregates-invalid.c`
+  // has carried since CTS-BR, MOVED FORWARD rather than loosened: still
+  // one located rejection, now naming the global instead of blaming the
+  // struct's members.
+  if (!var->hasLocalStorage())
+    return emitError(loc) << "unsupported: byte view of the global object '"
+                          << canonicalStreamName(var->getName()) << "'";
+  // A mutable byte-slice parameter means the callee may WRITE through the
+  // view; without a post-call reconstitution point the write is silently
+  // lost (a measured miscompile -- see the sink's documentation).
+  if (isMutParam && !byteViewWritebacks)
+    return emitError(loc) << "unsupported: byte view with no write-back "
+                             "point for the callee's writes";
+  auto it = symbols.find(var);
+  if (it == symbols.end())
+    return emitError(loc) << "unsupported: byte view of '" << var->getName()
+                          << "', which is not an importable place";
+  Value objectPlace = it->second;
+  auto lvalueType =
+      llvm::dyn_cast<emitrust::LValueType>(objectPlace.getType());
+  if (!lvalueType)
+    return emitError(loc) << "unsupported: byte view of '" << var->getName()
+                          << "', which is not an importable place";
+
+  // Materialize the object representation: one `to_ne_bytes` per scalar
+  // component, scattered at the component's C byte offset in C
+  // declaration order. Rust's own layout of the struct never enters into
+  // it, which is exactly why this is sound where a `transmute` is not.
+  IntegerType cursorType = builder.getIntegerType(64);
+  auto bytesType =
+      emitrust::ArrayType::get(builder.getContext(), plan.size, u8Type);
+  Value bytesPlace = createVariablePlace(loc, bytesType);
+  for (const ByteViewComponent &component : plan.components) {
+    Value valuePlace = objectPlace;
+    if (component.field) {
+      FailureOr<Value> member =
+          projectMemberPlace(loc, objectPlace, component.field);
+      if (failed(member))
+        return failure();
+      valuePlace = *member;
+    }
+    Value value = loadPlace(loc, valuePlace);
+    WideByteAccess access{bytesPlace,
+                          createIntConstant(loc, cursorType, component.offset),
+                          component.valueType, component.width, u8Type};
+    if (failed(emitWideByteStore(access, value, loc)))
+      return failure();
+  }
+  if (isMutParam)
+    byteViewWritebacks->push_back(
+        ByteViewWriteback{bytesPlace, objectPlace, plan});
+
+  // `root` names the VIEWED object, not the image: the write-back stores
+  // the image over the object, so a second argument that also borrows the
+  // object (`f((unsigned char *)&x, &x)`) would have its writes stomped by
+  // a reconstitution from a stale image. Keying the borrow here routes
+  // that pair into `emitCall`'s existing same-base rejection instead.
+  root = var;
+  result = builder
+               .create<emitrust::SliceOfOp>(
+                   loc, paramType, bytesPlace,
+                   createIntConstant(loc, cursorType, 0), isMutParam)
+               .getResult();
+  return true;
+}
+
 FailureOr<Value> CImporter::emitBorrowArgument(
     Location loc, const clang::Expr *argument, Type paramType,
     const clang::VarDecl *&root,
     SmallVectorImpl<const clang::FieldDecl *> *rootPath,
-    Value *allocBacking) {
+    Value *allocBacking,
+    SmallVectorImpl<ByteViewWriteback> *byteViewWritebacks) {
   root = nullptr;
   if (allocBacking)
     *allocBacking = Value();
@@ -6406,6 +6562,23 @@ FailureOr<Value> CImporter::emitBorrowArgument(
   bool isMutParam = llvm::isa<emitrust::MutRefType>(paramType);
   if (!pointee)
     return emitError(loc) << "unsupported reference parameter type";
+
+  // FR-229: `(unsigned char *)&obj` at a byte-slice parameter is the
+  // object REPRESENTATION of a local scalar or padding-free aggregate,
+  // which the typed model never materializes. It is matched first because
+  // it is a syntactic shape over an argument the pointer decomposition
+  // below has no representation for at all; every other spelling falls
+  // straight through with its existing rejection intact.
+  {
+    Value byteView;
+    FailureOr<bool> handled = tryEmitByteViewArgument(
+        loc, argument, paramType, isMutParam, root, byteViewWritebacks,
+        byteView);
+    if (failed(handled))
+      return failure();
+    if (*handled)
+      return byteView;
+  }
 
   // FR-48: the argument bound to a C++ reference parameter. C spells this
   // borrow explicitly (`f(&x)`) and C++ does not (`f(x)`) — the argument
