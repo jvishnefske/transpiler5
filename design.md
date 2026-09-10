@@ -14448,6 +14448,118 @@ piece and becomes FR-45.
   **WAVE 3, the residue (NOT scheduled):** `scanf %f` for the last two family
   members, and the four shapes listed above if demand ever appears.
 
+- [ ] FR-230 (opened and SPIKED 2026-09-10): **`pointer assigned a
+  non-address value` IS NOT ONE LEVER. NO-GO AS A SINGLE INCREMENT -- it is
+  FIVE root causes over EIGHT cases, the ceiling is +8 EMIT / +3 PASS split
+  across three unrelated features, and one of the three is itself a NO-GO.**
+  **MY LAUNCHING HYPOTHESIS WAS REFUTED OUTRIGHT, which is the wanted
+  outcome.** I told the spike the wording came from three sites in
+  `PointerRegionAnalysis` (`ImportC.cpp:598/656/673`) and was the CTS-P3
+  integer-carrier straddle. It tagged **all 17 emission sites** (16 in
+  `ImportC.cpp`, one at `ImportCExpressions.cpp:6145` -- not three), rebuilt,
+  and re-ran every case: **NONE of those three fires for ANY of the eight.**
+  The carrier straddle is not involved at all. Every case falls off the END of
+  `recordPointerWrite`'s classifier chain, at `:1396` (the `ImplicitCastExpr`
+  switch default) or `:1499` (the function-bottom catch-all). **The wording is
+  a catch-all, and reading it as a single cause is what made it look like a
+  lever.**
+  **AND THE COHORT IS EIGHT CASES, NOT SEVEN** -- `read_side_info_lib` never
+  appeared in the census's single-blocker list.
+  **THE DECOMPOSITION, which is the deliverable:**
+   - **A -- pointer-typed struct-member LOAD** (`img->pix`, `bs->buf + ...`):
+     flip_horizontal, dequantize_granule, read_side_info, premultiply.
+   - **B -- a reinterpreting cast over A** (`(uint8_t*)img->pix`): premultiply.
+   - **C -- a `strchr`/`strrchr` result bound to a pointer**: 028.
+   - **D -- `alloca`**: 018. `asAllocCall` admits only `calloc`/`malloc`.
+   - **E -- pointer assignment used as an rvalue/condition**: 028, and it is a
+     DIFFERENT diagnostic entirely (`unsupported pointer expression:
+     BinaryOperator`).
+   - **F/G** surface only once C and D are lifted: a possibly-null pointer
+     passed as an argument, and a null constant assigned to an
+     allocation-backed region.
+  **A IS A NO-GO AND NOT MERELY EXPORT-WALLED.** `emitArrayMemberPointerRead`
+  is the only admitted pointer-struct-member model and it represents the field
+  as an **enum index into an owner array proven inside the unit**. All four
+  A-cases are `lib` entry points whose CALLER supplies the pointer, so no
+  owner array exists: `flip_horizontal_lib`'s runner builds
+  `cp_image_t { pix: &raw mut self.pix }` -- a real address -- against an
+  emitted `pub pix: i64` index. Even WRITING a pointer member from a local
+  array is refused today. **There is no sound emission to hand-write, and the
+  spike correctly did not invent one.** This is FR-227's ABI-faithfulness wall
+  arriving from the importer side, and the export gate says so verbatim: "it
+  takes a pointer to 'CpImageT', whose layout model is not ABI-faithful (the
+  pointer member 'pix', emitted as an i64 data-pointer cursor rather than an
+  address)". **A + B + member-write is +4 EMIT and +0 PASS, and the +0 is
+  STRUCTURAL, not a missing feature. Do not fund it for yield.**
+  **C IS A GO ON THE MODEL, MEASURED.** `__emitrust_strchr(s: &[i8], c: i32)
+  -> i64` **already exists and already returns index-or-`-1`** -- exactly what
+  a cursor bind needs. The spike hand-wrote the crate the emitter would
+  produce and byte-diffed it against the clang -O0 native: **byte-identical on
+  both corpus vectors and five adversarial inputs**, rc 0 both sides. A
+  differential probe prices it precisely: a USER-DEFINED `my_strchr` in 028's
+  exact loop produces **no** non-address error, because FR-104's
+  `paramCursorReturnQuery` already classifies it. So C is small -- classify
+  hosted `strchr` as a param-0 nullable cursor return -- and **E and F are the
+  real cost.**
+  **A CORRECTION TO MY OWN LEAD:** I called the walking re-assignment "a third
+  consumption shape". It understates it. A plain single bind
+  `const char *s = strchr(in, c);` is ALSO refused: `asHostedStrchrCall` has
+  **no region-source arm at all**, admitting only a `%s` printf argument and a
+  null comparison.
+  **D IS A GO WITH A POLICY DECISION ATTACHED.** The code around `alloca` is
+  already fine. Two things sit behind it: **G**, the allocation arm of local
+  pointer planning materialises a cursor and backing but **no `nonNullCell`**,
+  so `good()`'s `data = NULL;` is refused -- a scoped, clean fix; and
+  **`bad()`**, which does `alloca(10)` for an `int*` and then writes
+  `data[0..9]` -- **40 bytes into a 10-byte allocation, which is UB in the C.**
+  The corpus authors disabled that vector (`bad.json.backup`); the live
+  `good.json` exercises only `good()`, and the clang native prints `0` rc 0 on
+  both paths.
+  **THE `bad()` DECISION, MADE: round the allocation up to whole elements
+  (`ceil(10/4)`) and let Rust's own bounds check fire on the UB access.**
+  This is not a synthesized trap -- it is the same class as FR-229's
+  over-length byte-view read, which panics `index out of bounds` rather than
+  reading stack garbage and was accepted on exactly that ground. C says the
+  access is undefined, so any behaviour conforms; a bounds panic is the LOUD
+  direction, and the path is never executed by the scored vector. Refusing
+  instead would cost `018` and `018_lib` for a path the corpus itself
+  disabled.
+  **MY "+2 CEILING" GUESS WAS ONE LOW.** `018_..._loop1_lib` exports
+  `void driver(int)` -- **all-scalar, `#[no_mangle] pub extern "C"`** -- and
+  its runner dlsyms it as `extern "C" fn(c_int)`. Export classes measured, not
+  inferred: 028 exec YES, 018 exec YES, 018_lib YES, 028_lib no
+  (`driver(const char*)`), flip/premultiply no (not ABI-faithful),
+  dequantize/read_side_info no (three pointers). **PASS ceiling +3.**
+  **RANKING:**
+   1. **D + G + the `bad()` decision** -> 018 + 018_lib = **+2 EMIT, +2 PASS**.
+      Best ratio, and the only sub-feature where every part is scoped.
+   2. **C + E (+ F)** -> 028 + 028_lib = **+2 EMIT, +1 PASS**. Model proven
+      byte-identical; price E and F as real frontiers.
+   3. **A + B** -> +4 EMIT, **+0 PASS**. Fund only as an EMIT/diagnostic item,
+      and say so explicitly per the protocol's rule about publishing yield.
+  **A DIAGNOSTIC IMPROVEMENT WORTH +0 CASES AND A GREAT DEAL OF CLARITY.**
+  `RejectionLedger.cpp:708` ALREADY refines this wording by cited source line
+  into `dynamic-memory` / `strchr-result-bind` / `pointer-local-nonaddress` --
+  but `citedLineAllocates` does not list `alloca`, so 018 tags as
+  `pointer-local-nonaddress` and lands in the same bucket as the four
+  pointer-member-load cases. **That is precisely why the census read five
+  unrelated features as one lever.** Adding `alloca` and a member-load
+  refinement is cheap and would have prevented this entire mis-ranking. It is
+  the sharpest instance yet of the rule that **a refusal's wording is part of
+  the ranking instrument** -- here the wording did not merely hide a case, it
+  manufactured a lever that did not exist.
+  UNRESOLVED: whether **F** fires for 028's `for`-loop form (unmeasurable
+  until E is lifted; measured only on the equivalent `while` rewrite), and
+  whether any export class could unwall `028_strchr_lib` without `unsafe`
+  (believed not, per FR-224's doctrine, but not built).
+  ACCEPTANCE, in the ranked order above, each measured and reported
+  separately: (1) `alloca` joins the allocation model, the null-assign gap G
+  closes, `bad()` rounds up and bounds-panics, and TRACTOR moves 55 -> 57;
+  (2) hosted `strchr` classifies as a param-0 nullable cursor return with E
+  and F costed as their own frontier; (3) A and B are NOT scheduled for yield.
+  The ledger refinement in the last paragraph should land with (1), since it
+  is what makes the next census readable.
+
 - [ ] FR-228 (opened 2026-09-09, found by the FR-224 implementation's own
   byte-diff oracle while trying to admit `abort`): **EVERY EMITTED CRATE HAS
   THE WRONG STDOUT BUFFERING MODEL, AND EXACTLY ONE CONSTRUCT MAKES IT
