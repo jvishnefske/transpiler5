@@ -13801,8 +13801,15 @@ piece and becomes FR-45.
   **BUT THE REACHABLE SPHINCS+ PRIZE IS 20, NOT 128, AND THE TAXONOMY SAYS SO
   WITHOUT ANY NEW WORK.** The 80 lib cases are only **FOUR distinct exported
   symbols**, 20 configurations each:
-   - `initialize_hash_function(spx_ctx *ctx)` -- ONE struct pointer,
-     **IMPORT/EXPORT CLASS 1, exportable**. 20 cases.
+   - `initialize_hash_function(spx_ctx *ctx)` -- ONE struct pointer.
+     **CORRECTED BY FR-226, WHICH SPIKED THIS THE SAME HOUR: it is NOT CLASS 1
+     today.** A C `T *` parameter imports as `&mut [T]`, a SLICE, never
+     `&mut T`, so the CLASS 1 branch cannot fire for it; and its body is
+     `{ (void)ctx; }`, so CLASS 2's must-access bound has zero accesses to
+     prove anything from. FR-226 measures the real shape of the lever: ONE
+     emit blocker (not five) across all 20, and **12 cases, not 20** -- the 20
+     split blake 12 (no-op body) / sha2 8 (`seed_state(ctx)`, which accesses
+     the pointer).
    - `prf_addr(unsigned char *out, const spx_ctx *ctx, const uint32_t addr[8])`
    - `gen_message_random(R, sk_prf, optrand, m, mlen, ctx)`
    - `hash_message(digest, tree, leaf_idx, R, pk, m, mlen, ctx)`
@@ -13812,9 +13819,11 @@ piece and becomes FR-45.
      cases, unreachable without overturning a recorded NO-GO. `m`/`mlen` is a
      declared pair (CLASS 2) but the other buffers are not, and one
      undeclarable length is enough to refuse the whole signature.
-  So the corpus's largest lever is `initialize_hash_function` at **20 cases**,
-  and it is gated behind the 5-fix import package the census measured for
-  every SPHINCS+ lib case:
+  So the corpus's largest lever is `initialize_hash_function`, **measured by
+  FR-226 at 12 cases behind TWO fixes** -- not 20 behind five. The five-fix
+  package below is what the census reported over a 28-file source set; the
+  harness's actual TARGET CLOSURE for these cases is 5 sources, in which
+  exactly one of the five appears:
       aliasing mutable pointer arguments      non-constant array size
       string function argument must designate a char array
       the address of a scalar object cannot be passed as a slice parameter
@@ -13828,10 +13837,10 @@ piece and becomes FR-45.
   face the 5-fix package over a 28-file whole-program closure PLUS a working
   `main`. **FR-223 ranked that item (1); on this evidence it is LAST.**
   RANKED PATH FORWARD, REPLACING FR-223's:
-   1. **`initialize_hash_function`, 20 cases** -- the 5-fix package, then a
-      CLASS 1 export. Costed as a package; no member of it is worth anything
-      alone, which is exactly what FR-221 measured when it deleted one member
-      and got +0.
+   1. **`initialize_hash_function`, 12 cases** (FR-226) -- ONE aliasing fix at
+      `utils.c:79` plus an unaccessed-pointer export class. Costed as a
+      package; neither member is worth anything alone, which is exactly what
+      FR-221 measured when it fixed one and got +0.
    2. **FR-224's shim table, +4 to +6** -- small, independent, in flight.
    3. **argv, up to +5** but NOT one fix (see FR-223's correction).
    4. **The other three SPHINCS+ symbols, 60 cases** -- blocked on FR-181's
@@ -13841,6 +13850,83 @@ piece and becomes FR-45.
   ACCEPTANCE: none of the above is implemented by this entry. It is a
   measurement, and its claim is that the ranking above is the one the corpus
   supports.
+
+- [ ] FR-226 (opened 2026-09-09, spiked the same hour from FR-225's ranked
+  item 1): **THE 20-CASE LEVER IS TWO FIXES, NOT FIVE, AND ONE OF THEM IS A
+  FUNCTION THAT DOES NOTHING.** Measured, not extrapolated.
+  **THE CENSUS'S 5-BLOCKER SET FOR THESE CASES WAS OVER THE WRONG SOURCES.**
+  Run through the harness's own `cmake_configure` -> `target_closure` ->
+  `filtered_compdb` path, `053_blake_128f_s_initialize_hash_function_lib` has
+  a closure of **5 sources, not 28**, and strict emit reports **exactly ONE
+  error**:
+      utils.c:79:13: unsupported: aliasing mutable pointer arguments
+                     (two arguments borrow object 'buffer')
+  which is `thash(buffer + SPX_N, buffer, 2, ctx, addr)` -- two overlapping
+  reslices of ONE buffer, i.e. **the FR-221 archetype and the textbook
+  `split_at_mut` shape**. Measured over **all 20** cases carrying this symbol
+  (12 blake at 5 sources, 8 sha2 at 4): every one is `rc=1` with exactly one
+  error, and all 20 report the SAME one. Extrapolating from a single config
+  is how this ledger has gone wrong before, so it was not done.
+  **WHY IT STILL WOULD NOT EXPORT, AND THE IRONY IS THE POINT.** With
+  `--recover` the crate emits clean (rc 0, 200KB `lib.rs`) as
+  `pub fn spx_initialize_hash_function(_ctx: &mut [u8]) {}` -- a FAITHFUL
+  translation, because the C really is `void initialize_hash_function(spx_ctx
+  *ctx) { (void)ctx; }`. But `--c-abi-exports` emits NOTHING for it, with the
+  FR-139 sentence "its signature is not all-scalar". The reason is not the
+  wording's: `classifyCAbiSignature` DOES implement CLASS 1 (a struct
+  reference) and CLASS 2 (a single slice with a proven must-access bound), but
+  a C `T *` PARAMETER IS IMPORTED AS `&mut [T]`, A SLICE, NEVER `&mut T`.
+  Verified by differential probe across every spelling that could plausibly
+  matter -- named `struct`, anonymous `typedef struct`, tagged
+  `typedef struct S` -- and across member shapes: `{int x; int y;}` becomes
+  `&mut [IntsCtx]`, `{uint8_t a[16]; int n;}` becomes `&mut [MixedCtx]`,
+  `{uint8_t a[16];}` becomes `&mut [u8]`. **CLASS 1 therefore essentially
+  cannot fire for a C struct pointer today**, which corrects FR-225's claim
+  that this symbol is "CLASS 1, exportable" -- it would be, if the parameter
+  were modelled as a struct reference; it is not.
+  That leaves CLASS 2, which requires a PROVEN MUST-ACCESS BOUND -- and the
+  body is `{ (void)ctx; }`, so there are **ZERO accesses and nothing to prove
+  a bound from**. The function that is trivially safest to export is exactly
+  the one the bound analysis has no material to work with.
+  **THE PROPOSED FIX -- A NEW EXPORT CLASS: THE UNACCESSED POINTER.** If a
+  pointer parameter is never accessed in the body, no bound is NEEDED: a
+  `pub extern "C" fn f(_p: *mut u8) {}` that never dereferences `_p` is sound
+  for ANY pointer value including null, is ordinary safe Rust with **no
+  `unsafe` block anywhere**, and satisfies the rubric's zero-`unsafe`
+  requirement outright. The wrapper calls the emitted inner function with an
+  empty slice, which is sound precisely because the inner never reads it.
+  **CONFIRMED AGAINST THE HARNESS RATHER THAN ASSUMED:** the runner dlsyms
+  `SPX_initialize_hash_function`, calls it as
+  `unsafe extern "C" fn(*mut Ctx)` with `&raw mut self.spx_ctx`, and its
+  vectors have `lib_state_in == lib_state_out` -- it expects NOTHING to
+  change, because the C changes nothing. The `unsafe` is the harness's own,
+  outside the emitted crate.
+  **YIELD: 12 CASES, NOT 20, AND THE DIFFERENCE IS THE USUAL TRAP.** The 20
+  split **blake 12 / sha2 8**, and only blake's body is a no-op. sha2's is
+  `{ seed_state(ctx); }`, which reads `ctx->pub_seed` and writes
+  `ctx->state_seeded`: the pointer IS accessed, the unaccessed class does not
+  apply, and its vectors expect state to change. Writing "20" here would have
+  been the tenth instance.
+  **THIS VINDICATES THE SET-COVER PRINCIPLE ON THE EXACT CASE THAT MOTIVATED
+  IT, AND FR-221's NO-GO STANDS UNAMENDED.** FR-221 measured the aliasing fix
+  ALONE at **+0** and was RIGHT: alone it clears emit and the case still dies
+  at `dlsym`. Paired with the unaccessed-pointer export it is worth **12**.
+  Neither fix is worth anything without the other, which is precisely what
+  "marginal yield is a property of the SET" asserts.
+  **THE OTHER THREE SYMBOLS' BLOCKERS, read off their recovery stubs** (the
+  FR-52 marker contract naming them in the emitted `unimplemented!`):
+  `prf_addr` -- "string function argument must designate a char array";
+  `gen_message_random` and `hash_message` -- "the address of a scalar object
+  cannot be passed as a slice parameter". Those 60 cases need those fixes
+  **plus** the multi-reference export NO-GO overturned, so FR-225's ranking of
+  them last is unchanged.
+  ACCEPTANCE: (1) `utils.c:79`'s two-reslice shape imports, by the FR-201
+  granularity route or `split_at_mut`, with a runtime byte-diff pin; (2) a
+  pointer parameter with no accesses in the body exports with the C ABI and a
+  bare symbol, refusing located when any access exists; (3) TRACTOR measured
+  41 -> 53 with the 12 blake cases newly PASS and NO case lost; (4) the 8 sha2
+  cases still refuse, LOCATED, and are recorded as such rather than silently
+  emitting a wrong export.
 
 - [x] FR-220 (opened and LANDED 2026-09-09 from an owner question -- "is there
   a way to not emit dead code and remove the override"): **THE ANSWER WAS NOT
