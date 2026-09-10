@@ -7751,6 +7751,11 @@ LogicalResult CImporter::finalizeProject() {
              << "unsupported: function '" << func.getSymName()
              << "' is referenced but not defined in any translation unit";
     }
+  // FR-228: last, once every translation unit is in the module -- the stdout
+  // runtime's two decisions (which print macros are used, and whether the
+  // program has a `c_main` to flush from) are whole-program facts that a
+  // per-TU emission would answer from a shard.
+  emitStdoutRuntime();
   return success();
 }
 

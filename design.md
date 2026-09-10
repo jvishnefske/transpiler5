@@ -14798,7 +14798,7 @@ piece and becomes FR-45.
   (`conditional operator on a non-scalar operand`), a pre-existing gap the
   EndToEnd test had to work around with an `if`.
 
-- [ ] FR-228 (opened 2026-09-09, found by the FR-224 implementation's own
+- [x] FR-228 (opened 2026-09-09 and LANDED 2026-09-10, found by the FR-224 implementation's own
   byte-diff oracle while trying to admit `abort`): **EVERY EMITTED CRATE HAS
   THE WRONG STDOUT BUFFERING MODEL, AND EXACTLY ONE CONSTRUCT MAKES IT
   OBSERVABLE.**
@@ -14837,14 +14837,106 @@ piece and becomes FR-45.
   observes the difference today is UNMEASURED, and so is the golden churn.
   Candidates to check first, since they share the non-flushing shape: `_Exit`,
   `quick_exit`, and a fatal signal raised by `raise`.
-  ACCEPTANCE: (1) a fully-buffered stdout writer flushed at normal exit only;
-  (2) `printf` then `abort` byte-identical to the clang native with stdout
-  redirected to a FILE, and still byte-identical to a terminal run; (3) the
-  partial-line-then-`exit` shape stays byte-identical, i.e. the fix does not
-  trade one divergence for another; (4) `abort`'s located refusal is replaced
-  by a working lowering and `bin2hex_lib` clears EMIT; (5) the golden churn is
-  reported as a COUNT, and every moved golden re-verified by its own oracle
-  rather than re-blessed.
+  **LANDED 2026-09-10. ALL FIVE ACCEPTANCE CLAUSES MET. TRACTOR EMIT 69 -> 70,
+  PASS 57 -> 57 (+0)** -- `bin2hex_lib` clears EMIT and lands in
+  SYMBOL_MISSING exactly as projected, being a two-pointer export case. The
+  +1 is an EMIT number and is reported as one.
+  **THE OBVIOUS IMPLEMENTATION WAS WRONG, AND THE MEASUREMENT SAYS SO.** A
+  `BufWriter` does NOT reproduce C. glibc's `_IO_new_file_xsputn` fills the
+  buffer, flushes only when a write no longer FITS, then passes whole
+  4096-blocks straight through; a `BufWriter` flushes what it HOLDS instead of
+  filling. Measured against the clang native at six boundaries -- 7 bytes ->
+  0 on disk at abort, 6000 -> 4096, one 4096 -> 4096, two 4096 -> 4096,
+  8192 -> 8192, 4097 -> 4096 -- **the runtime reproduces all six and a
+  `BufWriter` matches only the first.**
+  **THREE MORE PLACES THE OBVIOUS ANSWER WAS WRONG:**
+   1. **Macro shadowing must be TEXTUAL.** `use crate::__emitrust_print as
+      print;` at the crate root compiles and silently leaves a nested `mod`'s
+      `println!` bound to the std prelude. Only `macro_rules!` at the top of
+      the file covers nested modules, so the placement is load-bearing.
+   2. **Block-begin insertion is not enough.** A `--link` merge re-seats the
+      runtime behind earlier shards' items, breaking the joint-vs-link byte
+      diff. The items are marked and HOISTED AT RENDER TIME instead.
+   3. **A per-shard runtime SHAPE is a hard error.** Emitting a pass-through
+      writer for a module without `c_main` and a buffered one for a module
+      with it gives rustc **E0428** when `--link` merges shards that split
+      that way. The runtime text is now IDENTICAL in every module and only a
+      runtime `AtomicBool` varies -- which also makes the failure direction
+      safe, since `--crate-type=lib` on a main-bearing TU degrades to
+      unbuffered writes rather than filling a buffer nobody flushes.
+  **EVERY EXIT PATH ENUMERATED AND PINNED**, because a missed flush is silent
+  truncation and would have been worse than the bug: `return` from main (the
+  entry wrapper), C `exit(status)` (the flush is spliced ahead of EVERY
+  `std::process::exit` **unconditionally** -- a shard cannot know whether it
+  will be linked into a bin, and guessing wrong truncates silently), a Rust
+  panic (hook chained in the init, which is what keeps the bounds-panic and
+  actor-panic tests showing their stdout), and `abort`, which flushes nothing
+  by design. No `unsafe`. No `#[allow]` needed: rustc's `dead_code` lint skips
+  identifiers beginning with `_`, so the `__emitrust_` namespace is already
+  exempt.
+  **GOLDEN CHURN, COUNTED AND RE-VERIFIED, NOT RE-BLESSED: 1342 files swept,
+  MOVED 485**, of which 3 are the new tests, so **482 pre-existing files
+  moved**; 480 byte-identical, 376 rejected by both, **0 newly rejected**, 1
+  newly accepted (the flipped pin). **All 485 were checked to carry the
+  runtime -- none moved for any other reason.** Re-verification was by each
+  file's own oracle: the 298 EndToEnd by byte-diff, the 68 c-testsuite and 35
+  Cpp17Suite by execution and output diff in their ratchets, the FileCheck
+  goldens by the full lit run -- which the split-file blindness rule required,
+  since the hash sweep alone would have missed the `libc-shim-invalid.c`
+  sub-units.
+  The FR-224 abort pin was **moved forward, not deleted**: `abort-stmt` is
+  gone because the refusal is gone, `abort-value` stays with its wording
+  unchanged, the `abort-stdout-flush` ledger tag is deleted in the same change
+  as its rejection, and a `NOTSTUBBED` scan now asserts the function is no
+  longer stubbed. The comment KEEPS FR-224's history and explains that the
+  refusal was RIGHT and its cause lay elsewhere.
+  **TWO MEASUREMENT-LAYER DEFECTS SURFACED AND FIXED IN THE SAME COMMIT:**
+   - `binding_eval.py`'s `DEFAULT_BASELINE` still named the CLOSED
+     `binding-baseline-epoch6.json`, so a bare invocation exited 2 with
+     "refusing to measure" and every caller passed `--baseline` by hand.
+     **That is CLAUDE.md's "three consumers name the baseline document" drift,
+     one consumer short**, and it predates this work. Re-pinned to epoch-7.
+   - **FR-228 INFLATED THE BINDING METRIC'S DENOMINATOR**: its runtime is ~44
+     counted statements in EVERY crate, so `statements` jumped 19695 ->
+     32481 and `free/100 stmts` FELL 11.71 -> 7.10 **with no emitter change
+     behind it**. Both ratchet axes are ABSOLUTE and were unaffected, so
+     nothing fired and nothing was re-pinned. CLAUDE.md warns a
+     per-100-statements ratio is gameable by REMOVING good statements; this is
+     the mirror image, gameable by ADDING neutral ones. The report now says so
+     inline. Excluding runtime items needs a change to the syn-based probe and
+     is NOT done.
+  **`_Exit` / `quick_exit` / `raise`: NOT implemented, refusals pinned
+  verbatim.** `_Exit` is *almost* free -- with C's model in place,
+  `std::process::exit(n)` WITHOUT the flush splice reproduces C exactly when
+  stdout is a file (measured: 0 bytes). **It fails on a TTY**, where glibc
+  line-buffers and C writes the complete line while dropping the partial one
+  (measured through a pty), whereas the crate hands writes straight to std's
+  `Stdout` on a terminal and Rust's `process::exit` flushes it. Admitting
+  `_Exit` requires the writer to own the terminal case too. `raise` is further
+  off: Rust std has no `raise`, and `raise(SIGABRT)` is only abort-equivalent
+  while no handler is installed, which is a whole-program question about
+  `signal`.
+  The 4096 buffer size is `st_blksize`-dependent. It is right on every
+  filesystem here and the six boundaries reproduce exactly, but **no lit test
+  prints past 4096 and then aborts** -- that would assert a property of the
+  checkout's filesystem rather than of the emitter.
+  Byte-diff run with stdout redirected to a FILE in every RUN line, not a tty:
+  abort 0 vs 0 bytes rc 134 both; exit 10612 vs 10612 rc 3 both; return 3771
+  vs 3771 rc 5 both. The terminal half was verified separately through a pty.
+  **I re-verified the two load-bearing cases myself in the main tree**:
+  `printf("before abort\n"); abort();` gives rc 134 and **0 bytes on both
+  sides** (it wrote 12 bytes before this change), and 900 lines plus a partial
+  line then `exit(3)` gives **8008 bytes byte-identical** across the 4096
+  boundary.
+  Gate 1074/1074, clippy 57 (+0) at epoch-7 with the population hash
+  unchanged, binding both axes flat, CTestSuite 220/220, Cpp17Suite 35/35.
+  ACCEPTANCE, all met: (1) a fully-buffered stdout writer flushed at normal
+  exit only; (2) `printf` then `abort` byte-identical to the clang native with
+  stdout redirected to a FILE, and still byte-identical to a terminal run;
+  (3) the partial-line-then-`exit` shape stays byte-identical; (4) `abort`'s
+  located refusal replaced by a working lowering, `bin2hex_lib` clearing EMIT;
+  (5) the golden churn reported as a COUNT with every moved golden re-verified
+  by its own oracle rather than re-blessed.
 
 - [ ] FR-227 (opened 2026-09-09, measuring the export boundary rather than the
   importer): **THE EXPORT GATE, NOT THE IMPORTER, IS WHERE THIS CORPUS'S

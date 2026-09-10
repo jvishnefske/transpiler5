@@ -56,4 +56,7 @@ int main(void) {
 // helper is an `unused` deny in the emitted crate, which the RUN line's
 // whole-output --implicit-check-not enforces.
 // CHECK: emitrust.verbatim "fn __emitrust_byte_out(b: i8) {
-// CHECK-SAME: write_all(&[b as u8])
+// FR-228 routed the raw byte through the crate-wide stdout writer:
+// sharing `print!`'s LOCK was never enough once the two had to share
+// its BUFFERING MODEL as well.
+// CHECK-SAME: __emitrust_out_write(&[b as u8])

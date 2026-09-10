@@ -23,7 +23,8 @@
 //     caller expects), which is why this FR qualifies the emitter's uses
 //     instead of renaming the user's type;
 //   * `Vec` stays bare in `&[Vec<i8>]`, in the verbatim `__emitrust_cstr_out`
-//     helper, and in the emitrust-cc DRIVER's `fn main()` wrapper.
+//     helper, in FR-228's crate-wide stdout runtime (`buf: Vec<u8>`), and in
+//     the emitrust-cc DRIVER's `fn main()` wrapper.
 //
 // RUN: emitrust-cc --emit=rust %s -o - \
 // RUN:   | FileCheck %s --strict-whitespace --match-full-lines
@@ -119,24 +120,33 @@ int main(int argc, char **argv) {
 // CHECK-NEXT:    }
 // CHECK-NEXT:    0i32
 // CHECK-NEXT:}
+// FR-228 moved the raw `%s` writer off `std::io::stdout()` and onto the
+// crate-wide buffered writer; `Vec<u8>` is still bare here, which is the
+// point of the line.
 // CHECK-NEXT:fn __emitrust_cstr_out(s: &[i8]) {
-// CHECK-NEXT:    use std::io::Write;
 // CHECK-NEXT:    let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
 // CHECK-NEXT:    let bytes: Vec<u8> = s[..end].iter().map(|&b| b as u8).collect();
-// CHECK-NEXT:    std::io::stdout().write_all(&bytes).expect("stdout write failed");
+// CHECK-NEXT:    __emitrust_out_write(&bytes);
 // CHECK-NEXT:}
 // CHECK-EMPTY:
+// FR-228: the argv wrapper additionally installs and flushes the buffered
+// stdout writer. `Vec<Vec<i8>>` is unqualified in both flavours.
 // CHECK-NEXT:fn main() {
+// CHECK-NEXT:    __emitrust_stdout_init();
 // CHECK-NEXT:    use std::os::unix::ffi::OsStrExt;
 // CHECK-NEXT:    let __emitrust_argv: Vec<Vec<i8>> = std::env::args_os()
 // CHECK-NEXT:        .map(|a| {
 // CHECK-NEXT:            a.as_bytes().iter().map(|&b| b as i8).chain(std::iter::once(0i8)).collect()
 // CHECK-NEXT:        })
 // CHECK-NEXT:        .collect();
-// CHECK-NEXT:    std::process::exit(c_main(__emitrust_argv.len() as i32, &__emitrust_argv));
+// CHECK-NEXT:    let __emitrust_status = c_main(__emitrust_argv.len() as i32, &__emitrust_argv);
+// CHECK-NEXT:    __emitrust_out_flush();
+// CHECK-NEXT:    std::process::exit(__emitrust_status);
 // CHECK-NEXT:}
 
 // `Vec` is shadowed by nothing in this crate, so it is never qualified --
-// each prelude name is decided independently.
+// each prelude name is decided independently. FR-228 makes the `Box::new`
+// in the stdout runtime's panic hook a second, independent witness for
+// `Box`: it is bare because nothing here shadows `Box` either.
 // NOVEC-NOT: ::std::vec::
 // NOVEC-NOT: ::std::boxed::

@@ -3243,22 +3243,22 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
     // raw bytes up to (not including) the first NUL go straight to
     // stdout via `write_all`, BYPASSING the `__emitrust_cstr` Display
     // funnel whose Latin-1 byte-to-char widening would double-encode any
-    // non-ASCII argument byte (the spike's matrix column C). The write
-    // goes through the same globally buffered stdout handle `print!`
-    // locks, so segment ordering holds even on block-buffered pipes.
+    // non-ASCII argument byte (the spike's matrix column C). FR-228: the
+    // write goes through `__emitrust_out_write`, the SAME crate-wide
+    // stdout writer `print!` is shadowed onto -- sharing the LOCK was
+    // never enough, because the two would then have different BUFFERING
+    // MODELS and a non-flushing termination would reorder them.
     // Emitted once per module, after all imported items.
     OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
     moduleBuilder.create<emitrust::VerbatimOp>(
         UnknownLoc::get(builder.getContext()),
         moduleBuilder.getStringAttr(
             "fn __emitrust_cstr_out(s: &[i8]) {\n"
-            "    use std::io::Write;\n"
             "    let end = s.iter().position(|&b| b == 0)"
             ".unwrap_or(s.len());\n"
             "    let bytes: Vec<u8> = s[..end].iter().map(|&b| b as u8)"
             ".collect();\n"
-            "    std::io::stdout().write_all(&bytes)"
-            ".expect(\"stdout write failed\");\n"
+            "    __emitrust_out_write(&bytes);\n"
             "}"));
   }
   if (needsCStrNOutHelper && !cStrNOutHelperEmitted) {
@@ -3273,14 +3273,12 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
         UnknownLoc::get(builder.getContext()),
         moduleBuilder.getStringAttr(
             "fn __emitrust_cstr_n_out(s: &[i8], n: i64) {\n"
-            "    use std::io::Write;\n"
             "    let end = s.iter().take(n as usize)"
             ".position(|&b| b == 0)"
             ".unwrap_or(s.len().min(n as usize));\n"
             "    let bytes: Vec<u8> = s[..end].iter().map(|&b| b as u8)"
             ".collect();\n"
-            "    std::io::stdout().write_all(&bytes)"
-            ".expect(\"stdout write failed\");\n"
+            "    __emitrust_out_write(&bytes);\n"
             "}"));
   }
   if (needsCStrPadOutHelper && !cStrPadOutHelperEmitted) {
@@ -3304,7 +3302,6 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
         moduleBuilder.getStringAttr(
             "fn __emitrust_cstr_pad_out(s: &[i8], prec: i32, width: i32,\n"
             "                           flags: i32) {\n"
-            "    use std::io::Write;\n"
             "    let limit = if prec < 0 { s.len() } "
             "else { (prec as usize).min(s.len()) };\n"
             "    let end = s[..limit].iter().position(|&b| b == 0)"
@@ -3322,8 +3319,7 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             "    if flags & 1 != 0 {\n"
             "        bytes.resize(bytes.len() + pad, b' ');\n"
             "    }\n"
-            "    std::io::stdout().write_all(&bytes)"
-            ".expect(\"stdout write failed\");\n"
+            "    __emitrust_out_write(&bytes);\n"
             "}"));
   }
   if (needsByteOutHelper && !byteOutHelperEmitted) {
@@ -3332,16 +3328,15 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
     // converts to unsigned char and writes that ONE byte; `write_all` of
     // the raw byte matches it for every value 0..=255, where the
     // `__emitrust_fmt_c` char widening would emit two-byte UTF-8 for
-    // 128..=255. Shares the buffered stdout handle with `print!`.
+    // 128..=255. FR-228: shares the crate-wide stdout WRITER with
+    // `print!`, not merely its lock.
     // Emitted once per module, after all imported items.
     OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
     moduleBuilder.create<emitrust::VerbatimOp>(
         UnknownLoc::get(builder.getContext()),
         moduleBuilder.getStringAttr(
             "fn __emitrust_byte_out(b: i8) {\n"
-            "    use std::io::Write;\n"
-            "    std::io::stdout().write_all(&[b as u8])"
-            ".expect(\"stdout write failed\");\n"
+            "    __emitrust_out_write(&[b as u8]);\n"
             "}"));
   }
   if (needsByteErrHelper && !byteErrHelperEmitted) {
@@ -4658,7 +4653,221 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             "    match o { Some(x) => (true, x as i64), None => (false, 0) }\n"
             "}"));
   }
+  // FR-228: the crate-wide stdout runtime is a WHOLE-PROGRAM decision (see
+  // `emitStdoutRuntime`), so the single-file, non-defer import -- the one
+  // path that never runs `finalizeProject` -- emits it here, once the TU is
+  // complete. Every other path emits it from `finalizeProject` instead.
+  if (!deferExternGlobals)
+    emitStdoutRuntime();
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// FR-228: C's stdout buffering model
+//===----------------------------------------------------------------------===//
+
+void CImporter::emitStdoutRuntime() {
+  if (stdoutRuntimeEmitted)
+    return;
+  // Which macros the crate actually uses is read off the IR rather than
+  // tracked at the emission sites: `emitrust.call_opaque "print!"` /
+  // `"println!"` is what the Rust emitter renders, so the walk is exact by
+  // construction and cannot miss a print path somebody adds later. It also
+  // means an unused `macro_rules!` (rustc's `unused_macros`) is impossible.
+  bool usesPrint = false;
+  bool usesPrintln = false;
+  llvm::SmallVector<emitrust::CallOpaqueOp> exits;
+  module.walk([&](emitrust::CallOpaqueOp call) {
+    llvm::StringRef callee = call.getCallee();
+    if (callee == "print!")
+      usesPrint = true;
+    else if (callee == "println!")
+      usesPrintln = true;
+    else if (callee == "std::process::exit")
+      exits.push_back(call);
+  });
+  // The raw-byte writers (`%s`/`%c` straight from argv, and the width- and
+  // precision-bounded forms) write stdout without going through a macro, so
+  // they demand the runtime on their own.
+  bool usesRawOut = needsCStrOutHelper || needsCStrNOutHelper ||
+                    needsCStrPadOutHelper || needsByteOutHelper;
+  if (!usesPrint && !usesPrintln && !usesRawOut)
+    return;
+  // The runtime's TEXT is the same in every module, deliberately. A
+  // `--link` merge dedups header verbatims by exact printed text, so two
+  // shards that disagreed about the shape -- one with a `c_main` and one
+  // without -- produced TWO `fn __emitrust_out_write` definitions and rustc
+  // E0428 (measured: test/EndToEnd/link-slice-model-e2e.c, whose three
+  // shards split exactly that way). What varies instead is whether
+  // buffering is ever TURNED ON, and that is a runtime flag only the entry
+  // wrapper sets: a library, which lives inside a process whose exit it does
+  // not own and has nowhere to flush from, simply never calls
+  // `__emitrust_stdout_init` and keeps today's unbuffered writes.
+  stdoutRuntimeEmitted = true;
+
+  // The runtime is the module's FIRST item: `macro_rules!` scoping is
+  // TEXTUAL, so a `print!` shadow only covers uses that come after it --
+  // including the uses inside FR-159's per-TU `mod` blocks, which a
+  // `use`-alias at the crate root would silently NOT cover (measured: the
+  // alias form left `mod tu1`'s `println!` bound to the std prelude).
+  // Sequential creation from one begin-of-block builder keeps the items in
+  // this order.
+  OpBuilder moduleBuilder = OpBuilder::atBlockBegin(module.getBody());
+  Location loc = UnknownLoc::get(builder.getContext());
+  auto item = [&](llvm::StringRef text) {
+    auto verbatim = moduleBuilder.create<emitrust::VerbatimOp>(
+        loc, moduleBuilder.getStringAttr(text));
+    // Block-begin insertion is not enough on its own: a `--link` merge
+    // concatenates shards, so the runtime lands wherever the printing shard
+    // sits on the link line. The mark is what lets the Rust emitter hoist it
+    // to the top of the crate root in EVERY path.
+    verbatim->setAttr(emitrust::kStdoutRuntimeAttrName,
+                      moduleBuilder.getUnitAttr());
+  };
+  if (usesPrint)
+    item("macro_rules! print {\n"
+         "    ($($arg:tt)*) => "
+         "{ crate::__emitrust_out_fmt(format_args!($($arg)*)) };\n"
+         "}");
+  if (usesPrintln)
+    // A bare `println!()` -- FR-131's fold of a lone-newline format -- has
+    // no format string, and `format_args!()` demands one, so it takes an arm
+    // of its own. It still routes through `__emitrust_out_line` (rather than
+    // writing b"\n" directly) so that a crate whose ONLY println is the bare
+    // form does not leave that function dead.
+    item("macro_rules! println {\n"
+         "    () => { crate::__emitrust_out_line(format_args!(\"\")) };\n"
+         "    ($($arg:tt)*) => "
+         "{ crate::__emitrust_out_line(format_args!($($arg)*)) };\n"
+         "}");
+  {
+    // BUFSIZ is glibc's block size for the stream, which is the destination
+    // file's `st_blksize` -- 4096 on every filesystem this project is built
+    // and tested on. The fill/flush rule below reproduces glibc's
+    // `_IO_new_file_xsputn` exactly, and was validated against the clang
+    // native at five boundaries (7 bytes -> 0 on disk at abort, 6000 -> 4096,
+    // 4096 -> 4096, 4096 twice -> 4096, 8192 -> 8192, 4097 -> 4096); a plain
+    // `BufWriter` matches NONE of them past the first, because it flushes the
+    // buffer it already holds rather than filling it.
+    item("struct __EmitrustStdout {\n"
+         "    buf: Vec<u8>,\n"
+         "    started: bool,\n"
+         "}");
+    item("static __EMITRUST_STDOUT: std::sync::Mutex<__EmitrustStdout> =\n"
+         "    std::sync::Mutex::new(__EmitrustStdout "
+         "{ buf: Vec::new(), started: false });");
+    item("static __EMITRUST_STDOUT_FULL: std::sync::atomic::AtomicBool =\n"
+         "    std::sync::atomic::AtomicBool::new(false);");
+    item("const __EMITRUST_STDOUT_BUFSIZ: usize = 4096;");
+    // Buffering is opt-in and installed by the entry wrapper alone, so a
+    // module that never reaches one -- a library crate, or a
+    // `--crate-type=lib` build of a main-bearing translation unit -- keeps
+    // the unbuffered writes it has today instead of losing its output.
+    //
+    // In a library crate this function therefore has NO caller at all (its
+    // only one is the `fn main` wrapper, which the DRIVER renders and which
+    // is not part of the module), and it needs no `#[allow(dead_code)]` for
+    // that: rustc's dead-code lint skips every item whose name begins with
+    // an underscore, which is what has always exempted the `__emitrust_`
+    // helper namespace. Probed, not assumed. Emitting it only for a module
+    // that has a `c_main` was the alternative, and that is exactly what
+    // produced two disagreeing runtimes in a `--link` merge.
+    item("fn __emitrust_stdout_init() {\n"
+         "    use std::io::IsTerminal;\n"
+         "    if std::io::stdout().is_terminal() {\n"
+         "        return;\n"
+         "    }\n"
+         "    __EMITRUST_STDOUT_FULL"
+         ".store(true, std::sync::atomic::Ordering::Relaxed);\n"
+         "    let inner = std::panic::take_hook();\n"
+         "    std::panic::set_hook(Box::new(move |info| {\n"
+         "        __emitrust_out_flush();\n"
+         "        inner(info);\n"
+         "    }));\n"
+         "}");
+    item("fn __emitrust_out_write(bytes: &[u8]) {\n"
+         "    use std::io::Write;\n"
+         "    if !__EMITRUST_STDOUT_FULL"
+         ".load(std::sync::atomic::Ordering::Relaxed) {\n"
+         "        std::io::stdout().write_all(bytes)"
+         ".expect(\"stdout write failed\");\n"
+         "        return;\n"
+         "    }\n"
+         "    let mut state = "
+         "__EMITRUST_STDOUT.lock().unwrap_or_else(|e| e.into_inner());\n"
+         "    let mut rest = bytes;\n"
+         "    if state.started {\n"
+         "        let room = __EMITRUST_STDOUT_BUFSIZ - state.buf.len();\n"
+         "        let take = room.min(rest.len());\n"
+         "        state.buf.extend_from_slice(&rest[..take]);\n"
+         "        rest = &rest[take..];\n"
+         "        if rest.is_empty() {\n"
+         "            return;\n"
+         "        }\n"
+         "    } else {\n"
+         "        state.started = true;\n"
+         "        state.buf.reserve(__EMITRUST_STDOUT_BUFSIZ);\n"
+         "    }\n"
+         "    let out = std::io::stdout();\n"
+         "    let mut sink = out.lock();\n"
+         "    sink.write_all(&state.buf).expect(\"stdout write failed\");\n"
+         "    state.buf.clear();\n"
+         "    let direct = rest.len() - rest.len() % __EMITRUST_STDOUT_BUFSIZ;\n"
+         "    sink.write_all(&rest[..direct])"
+         ".expect(\"stdout write failed\");\n"
+         "    sink.flush().expect(\"stdout flush failed\");\n"
+         "    state.buf.extend_from_slice(&rest[direct..]);\n"
+         "}");
+    item("fn __emitrust_out_flush() {\n"
+         "    use std::io::Write;\n"
+         "    if !__EMITRUST_STDOUT_FULL"
+         ".load(std::sync::atomic::Ordering::Relaxed) {\n"
+         "        std::io::stdout().flush()"
+         ".expect(\"stdout flush failed\");\n"
+         "        return;\n"
+         "    }\n"
+         "    let mut state = "
+         "__EMITRUST_STDOUT.lock().unwrap_or_else(|e| e.into_inner());\n"
+         "    if state.buf.is_empty() {\n"
+         "        return;\n"
+         "    }\n"
+         "    let out = std::io::stdout();\n"
+         "    let mut sink = out.lock();\n"
+         "    sink.write_all(&state.buf).expect(\"stdout write failed\");\n"
+         "    sink.flush().expect(\"stdout flush failed\");\n"
+         "    state.buf.clear();\n"
+         "}");
+  }
+  if (usesPrint)
+    item("fn __emitrust_out_fmt(args: std::fmt::Arguments) {\n"
+         "    __emitrust_out_write(args.to_string().as_bytes());\n"
+         "}");
+  if (usesPrintln)
+    item("fn __emitrust_out_line(args: std::fmt::Arguments) {\n"
+         "    let mut text = args.to_string();\n"
+         "    text.push('\\n');\n"
+         "    __emitrust_out_write(text.as_bytes());\n"
+         "}");
+  // `std::process::exit` does NOT run destructors, so a buffer dropped by it
+  // is never written: every one of C's `exit(status)` calls needs the flush
+  // spliced in ahead of it. The entry wrapper covers the OTHER normal exit
+  // (a `return` from `main`); a Rust panic is covered by the hook
+  // `__emitrust_stdout_init` installs, and `abort` -- which is the whole
+  // point of the change -- deliberately flushes NOTHING.
+  //
+  // Spliced UNCONDITIONALLY, not only for a module that has a `c_main`. A
+  // `--link` shard does not know whether the program it will be merged into
+  // has one, and the failure direction of guessing wrong is an `exit` that
+  // never flushes -- silent truncation. In a module that really is a
+  // library the flush is a no-op: buffering is off unless the entry wrapper
+  // turned it on, and the call then just flushes std's own handle.
+  for (emitrust::CallOpaqueOp exitCall : exits) {
+    OpBuilder exitBuilder(exitCall);
+    exitBuilder.create<emitrust::CallOpaqueOp>(
+        exitCall.getLoc(), TypeRange(),
+        exitBuilder.getStringAttr("crate::__emitrust_out_flush"),
+        /*args=*/ArrayAttr(), ValueRange{});
+  }
 }
 
 //===----------------------------------------------------------------------===//

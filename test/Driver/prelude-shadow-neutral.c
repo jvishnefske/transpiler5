@@ -23,6 +23,9 @@
 //   * the FR-64 `String` binding,
 //   * the C99-43 C3 argv table `&[Vec<i8>]`,
 //   * the emitter's verbatim `__emitrust_cstr_out` helper (`Vec<u8>`),
+//   * FR-228's crate-wide stdout runtime, which opens the file: its buffer is
+//     a bare `Vec<u8>` and its panic hook a bare `Box::new`, so it is a
+//     second independent witness for both names,
 //   * and the emitrust-cc DRIVER's own `fn main()` wrapper
 //     (`let __emitrust_argv: Vec<Vec<i8>> = ..`), which is a SEPARATE
 //     rendering site outside the emitter and needs its own neutrality.
@@ -78,7 +81,88 @@ int main(int argc, char **argv) {
 // every function body, every prelude spelling and the BARE sweep below are
 // untouched, and because the whole root is pinned full-width under
 // --strict-whitespace the unbroken CHECK-NEXT chain is the proof.
-// CHECK:#[allow(dead_code)]
+// CHECK:macro_rules! print {
+// CHECK-NEXT:    ($($arg:tt)*) => { crate::__emitrust_out_fmt(format_args!($($arg)*)) };
+// CHECK-NEXT:}
+// CHECK-NEXT:macro_rules! println {
+// CHECK-NEXT:    () => { crate::__emitrust_out_line(format_args!("")) };
+// CHECK-NEXT:    ($($arg:tt)*) => { crate::__emitrust_out_line(format_args!($($arg)*)) };
+// CHECK-NEXT:}
+// CHECK-NEXT:struct __EmitrustStdout {
+// CHECK-NEXT:    buf: Vec<u8>,
+// CHECK-NEXT:    started: bool,
+// CHECK-NEXT:}
+// CHECK-NEXT:static __EMITRUST_STDOUT: std::sync::Mutex<__EmitrustStdout> =
+// CHECK-NEXT:    std::sync::Mutex::new(__EmitrustStdout { buf: Vec::new(), started: false });
+// CHECK-NEXT:static __EMITRUST_STDOUT_FULL: std::sync::atomic::AtomicBool =
+// CHECK-NEXT:    std::sync::atomic::AtomicBool::new(false);
+// CHECK-NEXT:const __EMITRUST_STDOUT_BUFSIZ: usize = 4096;
+// CHECK-NEXT:fn __emitrust_stdout_init() {
+// CHECK-NEXT:    use std::io::IsTerminal;
+// CHECK-NEXT:    if std::io::stdout().is_terminal() {
+// CHECK-NEXT:        return;
+// CHECK-NEXT:    }
+// CHECK-NEXT:    __EMITRUST_STDOUT_FULL.store(true, std::sync::atomic::Ordering::Relaxed);
+// CHECK-NEXT:    let inner = std::panic::take_hook();
+// CHECK-NEXT:    std::panic::set_hook(Box::new(move |info| {
+// CHECK-NEXT:        __emitrust_out_flush();
+// CHECK-NEXT:        inner(info);
+// CHECK-NEXT:    }));
+// CHECK-NEXT:}
+// CHECK-NEXT:fn __emitrust_out_write(bytes: &[u8]) {
+// CHECK-NEXT:    use std::io::Write;
+// CHECK-NEXT:    if !__EMITRUST_STDOUT_FULL.load(std::sync::atomic::Ordering::Relaxed) {
+// CHECK-NEXT:        std::io::stdout().write_all(bytes).expect("stdout write failed");
+// CHECK-NEXT:        return;
+// CHECK-NEXT:    }
+// CHECK-NEXT:    let mut state = __EMITRUST_STDOUT.lock().unwrap_or_else(|e| e.into_inner());
+// CHECK-NEXT:    let mut rest = bytes;
+// CHECK-NEXT:    if state.started {
+// CHECK-NEXT:        let room = __EMITRUST_STDOUT_BUFSIZ - state.buf.len();
+// CHECK-NEXT:        let take = room.min(rest.len());
+// CHECK-NEXT:        state.buf.extend_from_slice(&rest[..take]);
+// CHECK-NEXT:        rest = &rest[take..];
+// CHECK-NEXT:        if rest.is_empty() {
+// CHECK-NEXT:            return;
+// CHECK-NEXT:        }
+// CHECK-NEXT:    } else {
+// CHECK-NEXT:        state.started = true;
+// CHECK-NEXT:        state.buf.reserve(__EMITRUST_STDOUT_BUFSIZ);
+// CHECK-NEXT:    }
+// CHECK-NEXT:    let out = std::io::stdout();
+// CHECK-NEXT:    let mut sink = out.lock();
+// CHECK-NEXT:    sink.write_all(&state.buf).expect("stdout write failed");
+// CHECK-NEXT:    state.buf.clear();
+// CHECK-NEXT:    let direct = rest.len() - rest.len() % __EMITRUST_STDOUT_BUFSIZ;
+// CHECK-NEXT:    sink.write_all(&rest[..direct]).expect("stdout write failed");
+// CHECK-NEXT:    sink.flush().expect("stdout flush failed");
+// CHECK-NEXT:    state.buf.extend_from_slice(&rest[direct..]);
+// CHECK-NEXT:}
+// CHECK-NEXT:fn __emitrust_out_flush() {
+// CHECK-NEXT:    use std::io::Write;
+// CHECK-NEXT:    if !__EMITRUST_STDOUT_FULL.load(std::sync::atomic::Ordering::Relaxed) {
+// CHECK-NEXT:        std::io::stdout().flush().expect("stdout flush failed");
+// CHECK-NEXT:        return;
+// CHECK-NEXT:    }
+// CHECK-NEXT:    let mut state = __EMITRUST_STDOUT.lock().unwrap_or_else(|e| e.into_inner());
+// CHECK-NEXT:    if state.buf.is_empty() {
+// CHECK-NEXT:        return;
+// CHECK-NEXT:    }
+// CHECK-NEXT:    let out = std::io::stdout();
+// CHECK-NEXT:    let mut sink = out.lock();
+// CHECK-NEXT:    sink.write_all(&state.buf).expect("stdout write failed");
+// CHECK-NEXT:    sink.flush().expect("stdout flush failed");
+// CHECK-NEXT:    state.buf.clear();
+// CHECK-NEXT:}
+// CHECK-NEXT:fn __emitrust_out_fmt(args: std::fmt::Arguments) {
+// CHECK-NEXT:    __emitrust_out_write(args.to_string().as_bytes());
+// CHECK-NEXT:}
+// CHECK-NEXT:fn __emitrust_out_line(args: std::fmt::Arguments) {
+// CHECK-NEXT:    let mut text = args.to_string();
+// CHECK-NEXT:    text.push('\n');
+// CHECK-NEXT:    __emitrust_out_write(text.as_bytes());
+// CHECK-NEXT:}
+// CHECK-NEXT:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct MyOption {
 // CHECK-NEXT:    id: i32,
@@ -127,20 +211,22 @@ int main(int argc, char **argv) {
 // CHECK-NEXT:    0i32
 // CHECK-NEXT:}
 // CHECK-NEXT:fn __emitrust_cstr_out(s: &[i8]) {
-// CHECK-NEXT:    use std::io::Write;
 // CHECK-NEXT:    let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
 // CHECK-NEXT:    let bytes: Vec<u8> = s[..end].iter().map(|&b| b as u8).collect();
-// CHECK-NEXT:    std::io::stdout().write_all(&bytes).expect("stdout write failed");
+// CHECK-NEXT:    __emitrust_out_write(&bytes);
 // CHECK-NEXT:}
 // CHECK-EMPTY:
 // CHECK-NEXT:fn main() {
+// CHECK-NEXT:    __emitrust_stdout_init();
 // CHECK-NEXT:    use std::os::unix::ffi::OsStrExt;
 // CHECK-NEXT:    let __emitrust_argv: Vec<Vec<i8>> = std::env::args_os()
 // CHECK-NEXT:        .map(|a| {
 // CHECK-NEXT:            a.as_bytes().iter().map(|&b| b as i8).chain(std::iter::once(0i8)).collect()
 // CHECK-NEXT:        })
 // CHECK-NEXT:        .collect();
-// CHECK-NEXT:    std::process::exit(c_main(__emitrust_argv.len() as i32, &__emitrust_argv));
+// CHECK-NEXT:    let __emitrust_status = c_main(__emitrust_argv.len() as i32, &__emitrust_argv);
+// CHECK-NEXT:    __emitrust_out_flush();
+// CHECK-NEXT:    std::process::exit(__emitrust_status);
 // CHECK-NEXT:}
 
 // Not one qualified prelude path anywhere in the crate root.

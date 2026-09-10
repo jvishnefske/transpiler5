@@ -7,10 +7,10 @@
 // RUN: not emitrust-import-c %t/locale-native.c 2>&1 | FileCheck %s --check-prefix=NATIVE
 // RUN: not emitrust-import-c %t/locale-value.c 2>&1 | FileCheck %s --check-prefix=LOCALEVALUE
 // RUN: not emitrust-import-c %t/abort-value.c 2>&1 | FileCheck %s --check-prefix=ABORTVALUE
-// RUN: not emitrust-import-c %t/abort-stmt.c 2>&1 | FileCheck %s --check-prefix=ABORTSTMT
 // RUN: not emitrust-import-c %t/strcspn-scalar.c 2>&1 | FileCheck %s --check-prefix=CSPNSCALAR
 // RUN: not emitrust-import-c %t/sqrtl.c 2>&1 | FileCheck %s --check-prefix=SQRTL
 // RUN: emitrust-cc --emit=import --recover %t/ledger.c -o - 2>&1 | FileCheck %s --check-prefix=LEDGER
+// RUN: emitrust-cc --emit=import --recover %t/ledger.c -o /dev/null 2>&1 | FileCheck %s --check-prefix=NOTSTUBBED
 
 // FR-224 BOUNDARIES of the shim table. Every shape below is a LOCATED
 // rejection on purpose, and the reason differs per shape -- which is why
@@ -98,40 +98,30 @@ int main(void) {
 }
 // LOCALEVALUE: locale-value.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported
 
-// FR-224's MEASURED NO-GO, and the most useful thing this spike found.
-// `std::process::abort()` looked exact -- same SIGABRT, same absence of
-// destructors and of a flush, and the exit status DOES agree (134 both
-// sides). The byte-diff oracle refuted it anyway:
+// FR-228 FLIPPED FR-224's abort NO-GO, and the history is worth keeping
+// because the refusal was RIGHT and its cause was somewhere else.
+// `std::process::abort()` always matched C's abort exactly -- same
+// SIGABRT, same absence of destructors and of a flush, same 134 exit
+// status -- and the byte-diff oracle refuted it anyway on
 //
 //     printf("before abort\n"); abort();
 //
-// clang+glibc with stdout redirected to a file writes NOTHING, because
-// C's stdout is FULLY buffered off a terminal and abort does not flush
-// it (C11 7.22.4.1p2, implementation-defined, glibc declines). The
-// emitted crate writes `before abort`, because Rust's Stdout is a
-// LineWriter that flushed on the newline. Measured diff: `0a1 > before
-// abort`.
+// because clang+glibc with stdout redirected to a FILE writes NOTHING
+// (C's stdout is FULLY buffered off a terminal and abort does not flush
+// it; C11 7.22.4.1p2, implementation-defined, glibc declines) while the
+// emitted crate wrote `before abort` from a `LineWriter` that had
+// already flushed on the newline. The defect was the emitted crate's
+// BUFFERING MODEL, not abort, and nothing local to the call could repair
+// it -- flushing at the call site writes MORE than glibc, not less.
+// FR-228 gave the crate C's model, so `abort` is now a plain lowering
+// and its statement form has moved OUT of this file: the positive pin is
+// test/Import/C/stdout-buffering.c and the differential one
+// test/EndToEnd/stdout-buffering-abort.c, which diffs against the clang
+// native with stdout redirected to a file.
 //
-// The defect is therefore the emitted crate's BUFFERING MODEL, not
-// abort: a normal return/exit flushes on both sides and agrees byte for
-// byte even for a partial line (measured separately). abort is just the
-// only admitted construct that can observe the difference, and nothing
-// local to the call repairs it -- flushing here writes MORE than glibc,
-// not less. So it refuses, and the wording says why, so that whoever
-// picks up the fully-buffered-stdout FR finds this note.
-//--- abort-stmt.c
-#include <stdio.h>
-#include <stdlib.h>
-int main(void) {
-  printf("before abort\n");
-  abort();
-  return 0;
-}
-// ABORTSTMT: abort-stmt.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: 'abort' terminates without flushing C's fully buffered stdout, but the emitted crate's line-buffered stdout has already written every completed line
-
 // abort returns void in every conforming declaration, so a value use can
 // only come from a redeclaration; it rejects rather than silently
-// dropping a call that terminates the process.
+// dropping a call that terminates the process. That half did NOT move.
 //--- abort-value.c
 int abort(void);
 int main(void) {
@@ -164,15 +154,23 @@ int main(void) {
 }
 // SQRTL: sqrtl.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported
 
-// FR-224 COUNTING HYGIENE. Both of this wave's NO-GO wordings previously
+// FR-224 COUNTING HYGIENE. This wave's NO-GO wordings previously
 // tabulated as `libc:expf` / `libc:abort`, because they went through the
 // generic system-header rejection; giving them a wording that says WHY
 // would otherwise have dropped them into `other`, the census's largest
 // junk bucket, and a reader ranking work by that census would then have
-// seen nothing at all where two DELIBERATE refusals live. Each gets its
-// own ledger tag so "refused on purpose" never reads as "missing work".
-// The `libm-not-bit-exact` tag also picks up the pre-existing f64
+// seen nothing at all where a DELIBERATE refusal lives. The tag is what
+// keeps "refused on purpose" from reading as "missing work". The
+// `libm-not-bit-exact` tag also picks up the pre-existing f64
 // pow/exp/log, which had been in `other` since C99-48.
+//
+// FR-228 removed the OTHER tag this section used to carry.
+// `abort-stdout-flush` keyed on the abort refusal's wording, and there is
+// no such refusal any more -- so `uses_abort` is no longer stubbed at all,
+// and the `NOTSTUBBED` scan below says so directly rather than leaving its
+// absence to be inferred from an unstubbed list. A tag that can never fire
+// is worse than no tag: it tells a census reader the frontier is still
+// there.
 //--- ledger.c
 #include <math.h>
 #include <stdio.h>
@@ -181,9 +179,9 @@ void uses_abort(int n) { if (n < 0) abort(); printf("%d\n", n); }
 float uses_expf(float x) { return expf(x); }
 double uses_pow(double x) { return pow(x, 2.0); }
 int fine(int a) { return a * 2; }
-// LEDGER: stubbed 'uses_abort' [abort-stdout-flush]
 // LEDGER: stubbed 'uses_expf' [libm-not-bit-exact]
 // LEDGER: stubbed 'uses_pow' [libm-not-bit-exact]
 // LEDGER: blocker tabulation
-// LEDGER-DAG: abort-stdout-flush 1
 // LEDGER-DAG: libm-not-bit-exact 2
+// NOTSTUBBED-NOT: uses_abort
+// NOTSTUBBED-NOT: abort-stdout-flush

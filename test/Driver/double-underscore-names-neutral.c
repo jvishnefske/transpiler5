@@ -76,5 +76,12 @@ int main(void) {
 // CHECK-NEXT:    0i32
 // CHECK-NEXT:}
 // CHECK-EMPTY:
-// CHECK-NEXT:fn main() { std::process::exit(c_main()); }
+// FR-228: the buffered stdout writer's install/flush pair. The double
+// underscores this file is about are untouched by it.
+// CHECK-NEXT:fn main() {
+// CHECK-NEXT:    __emitrust_stdout_init();
+// CHECK-NEXT:    let __emitrust_status = c_main();
+// CHECK-NEXT:    __emitrust_out_flush();
+// CHECK-NEXT:    std::process::exit(__emitrust_status);
+// CHECK-NEXT:}
 // NOATTR-NOT: allow(non_snake_case)

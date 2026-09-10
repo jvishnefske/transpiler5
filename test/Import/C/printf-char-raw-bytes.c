@@ -110,7 +110,10 @@ void stdout_bytes(int x) {
 // without the surrounding quotes the pattern requires).
 // OUT: emitrust.verbatim "fn __emitrust_fmt_c(x: i32) -> char
 // OUT: emitrust.verbatim "fn __emitrust_byte_out(b: i8) {
-// OUT-SAME: write_all(&[b as u8])
+// FR-228 routed the raw byte through the crate-wide stdout writer:
+// sharing `print!`'s LOCK was never enough once the two had to share
+// its BUFFERING MODEL as well.
+// OUT-SAME: __emitrust_out_write(&[b as u8])
 
 //--- buffer.c
 int sprintf(char *dst, const char *fmt, ...);

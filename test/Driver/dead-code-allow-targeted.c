@@ -127,6 +127,12 @@ int main(void) {
 // emitter's, not the header's -- and the C spellings are untouched.
 // CNAMES:      #![allow(non_snake_case, non_upper_case_globals, non_camel_case_types)]
 // CNAMES-EMPTY:
-// CNAMES-NEXT: #[allow(dead_code)]
+// FR-228: the crate-wide stdout runtime is the first EMITTED item -- it has
+// to be, because `macro_rules!` scoping is TEXTUAL and the `println!` shadow
+// only covers uses that follow it. Only the `println!` half appears: this
+// crate never calls `print!`, and emitting a macro nothing uses would put
+// `unused_macros` on the crate.
+// CNAMES-NEXT: macro_rules! println {
+// CNAMES:      #[allow(dead_code)]
 // CNAMES-NEXT: #[derive(Clone, Copy, Default)]
 // CNAMES-NEXT: struct never_built {

@@ -5186,6 +5186,40 @@ private:
   /// definition for why nothing local to the call can repair it.
   LogicalResult emitAbortCall(const clang::CallExpr *call);
 
+  /// FR-228: gives the emitted crate C's STDOUT BUFFERING MODEL.
+  ///
+  /// C's `stdout` is FULLY buffered when it is not an interactive device and
+  /// is flushed at `exit` or when the buffer fills; Rust's `Stdout` is a
+  /// `LineWriter` and flushes on every completed line. The two agree for
+  /// every NORMAL termination and diverge for every termination that does
+  /// not flush -- `printf("x\n"); abort();` writes NOTHING through glibc
+  /// with stdout redirected to a file (C11 7.22.4.1p2 leaves the flush
+  /// implementation-defined and glibc declines) and `x` through the emitted
+  /// crate. That is the silently-wrong direction, which is why `abort` used
+  /// to refuse.
+  ///
+  /// This runs ONCE per module, after every translation unit has been
+  /// imported (the single-file path calls it at the end of
+  /// `importTranslationUnit`, the defer/project path from `finalizeProject`),
+  /// because both of its decisions are WHOLE-PROGRAM: which macros are
+  /// actually used, and whether the module has a `c_main` at all. It
+  ///   * emits the runtime as the module's FIRST items -- `macro_rules!`
+  ///     scoping is TEXTUAL, so the `print!`/`println!` shadows must precede
+  ///     every use, including uses inside the per-TU `mod` blocks;
+  ///   * selects the FULLY BUFFERED runtime for a module that has a `c_main`
+  ///     (a whole program, where an entry wrapper can flush at normal exit)
+  ///     and a pass-through runtime otherwise (a library lives inside a
+  ///     foreign process whose exit this crate does not own; buffering there
+  ///     would be silent truncation, which is strictly worse than the
+  ///     divergence being fixed);
+  ///   * inserts an explicit `crate::__emitrust_out_flush()` before every
+  ///     `std::process::exit`, which does NOT run destructors and would
+  ///     otherwise drop the buffer on the floor.
+  /// Buffering is additionally OPT-IN AT RUNTIME (`__emitrust_stdout_init`,
+  /// called only by the entry wrapper), so a main-bearing module forced to a
+  /// library crate degrades to today's behavior instead of losing output.
+  void emitStdoutRuntime();
+
   /// Lowers a value-position call to a definition-less `abs` (i32) or
   /// `labs` (i64, `isLong`) to `iN::wrapping_abs`. C leaves
   /// abs(INT_MIN)/labs(LONG_MIN) undefined (7.20.6.1p2); wrapping_abs
@@ -8022,6 +8056,10 @@ private:
   /// True once the `__emitrust_byte_out` helper has been emitted, so a
   /// multi-TU import never emits it twice.
   bool byteOutHelperEmitted = false;
+  /// FR-228: true once the crate-wide stdout runtime has been emitted, so
+  /// neither a multi-TU import nor the single-file/project finalization
+  /// pair can emit it twice.
+  bool stdoutRuntimeEmitted = false;
   /// True once a `char`/`signed char`/`unsigned char` operand of a
   /// `std::cerr <<` chain has been imported (W2.22); triggers emission of
   /// `__emitrust_byte_err`, the stderr twin of `__emitrust_byte_out`.

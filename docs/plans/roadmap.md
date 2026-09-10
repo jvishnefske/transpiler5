@@ -74,13 +74,16 @@ Five importer fixes plus the (already landed) unaccessed-pointer export class.
 fourteen stubbed functions, so "+12" is a loose upper bound. Fix **one** class,
 re-measure the stub count, and re-cost — the histogram makes that cheap now.
 
-### 4. FR-228 — the stdout buffering model · +1 PASS, wide blast radius
+### 4. ~~FR-228 — the stdout buffering model~~ · **DONE, EMIT +1 / PASS +0**
 
-C's stdout is fully buffered off a terminal; Rust's is a `LineWriter`. They
-agree on every normal termination and diverge on any that does not flush,
-which is why `abort` is currently refused. The fix is a crate-wide
-`BufWriter<Stdout>` flushed at normal exit only — **it shifts every emitted
-byte of every crate that prints.** Fund it for correctness, not for the case.
+Landed 2026-09-10. Two things worth carrying forward. **A `BufWriter` does not
+reproduce C** — glibc fills its buffer and flushes only when a write no longer
+*fits*, then passes whole blocks through; measured at six boundaries, a
+`BufWriter` matches one of them. And **`std::process::exit` runs no
+destructors**, so every exit path needed an explicit flush spliced in
+*unconditionally* — a shard cannot know whether it will be linked into a bin,
+and guessing wrong truncates silently. 482 pre-existing goldens moved, all
+verified to carry the runtime and re-checked by their own oracles.
 
 ### Not to be funded for yield
 
@@ -111,6 +114,14 @@ byte of every crate that prints.** Fund it for correctness, not for the case.
   C-declared byte extent.
 - **FR-162** — licensing. LICENSE is AGPL-3.0; 54 files carry Apache-2.0 WITH
   LLVM-exception. **Owner decision.**
+- **The binding metric's denominator is inflated** — FR-228's runtime is ~44
+  counted statements in every crate, so `statements` went 19695 → 32481 and
+  `free/100 stmts` *fell* 11.71 → 7.10 with no emitter change. Both ratchet
+  axes are absolute and unaffected; the report now says so inline. Excluding
+  runtime items needs a change to the syn-based probe.
+- **`_Exit` is almost free** — `process::exit` without the flush splice
+  reproduces C exactly when stdout is a file, and fails only on a tty, where
+  glibc line-buffers. Admitting it means the writer owning the terminal case.
 
 ## Rules this roadmap is built on
 
