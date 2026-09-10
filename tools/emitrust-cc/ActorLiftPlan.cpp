@@ -84,6 +84,33 @@ bool allUsesInside(mlir::emitrust::GlobalOp global, mlir::ModuleOp module,
   });
 }
 
+/// FR-231: `crate::geo::counter` -> `geo_counter`; any other symbol
+/// unchanged.
+///
+/// Under `--namespace-modules` an item symbol is an absolute Rust PATH, but
+/// every name this file MANUFACTURES is an identifier -- a driver-local `let`
+/// binding, an actor struct's type name, its variable name, its field names.
+/// A path reaching any of those is not a diagnosable condition downstream: it
+/// is an op-verifier abort ("variable name must be a non-empty Rust
+/// identifier") on a legal C++ input, or a struct named
+/// `Crate::ns::tu0SeedActor` that no Rust parser accepts. Flattened once here,
+/// at the single point where a symbol becomes an identifier. The `crate::`
+/// head carries no information (every path has it) and is dropped. Inert for
+/// every flagless compile -- no symbol contains `::` there.
+std::string flattenItemPath(llvm::StringRef symbol) {
+  if (!symbol.consume_front("crate::"))
+    return symbol.str();
+  std::string flattened;
+  while (!symbol.empty()) {
+    auto [segment, tail] = symbol.split("::");
+    if (!flattened.empty())
+      flattened += "_";
+    flattened += segment.str();
+    symbol = tail;
+  }
+  return flattened;
+}
+
 /// Drops the owning function's static-local mangle prefix from a cell
 /// symbol: `ACCUMULATE_TOTAL` owned by `accumulate` -> `TOTAL` (idiomatic
 /// rename), `accumulate_total` -> `total` (verbatim names). Falls back to
@@ -124,8 +151,14 @@ ActorLiftAttachment emitrustcc::attachActorLiftAttributes(
   // `let mut pub: i32 = 5;` and the lifted field `struct PubActor { pub:
   // i32 }`), the silently-unbuildable outcome the repo forbids.
   auto derivedName = [preserveCNames](llvm::StringRef symbol) {
+    // FR-231: this derives a BINDING name -- a driver-local `let`, or an
+    // actor struct's field -- and neither has a module to live in, so a
+    // `--namespace-modules` path is flattened first. The `takenLocalNames`
+    // guard below keeps two globals that flatten onto ONE binding from
+    // merging.
+    std::string flat = flattenItemPath(symbol);
     std::string name =
-        preserveCNames ? symbol.str() : mlir::emitrust::toSnakeCase(symbol);
+        preserveCNames ? flat : mlir::emitrust::toSnakeCase(flat);
     if (mlir::emitrust::isRustKeyword(name))
       name += "_";
     return name;
@@ -177,7 +210,7 @@ ActorLiftAttachment emitrustcc::attachActorLiftAttributes(
     llvm::StringRef base = namingBase(actor);
     if (!base.empty())
       typeNameOfActor[i] =
-          mlir::emitrust::toUpperCamelCase(base) + "Actor";
+          mlir::emitrust::toUpperCamelCase(flattenItemPath(base)) + "Actor";
   }
 
   // -- The demotion table. First matching rule per actor wins.
@@ -340,7 +373,8 @@ ActorLiftAttachment emitrustcc::attachActorLiftAttributes(
     entry.planActor = (int)actorIndex;
     entry.typeName = typeNameOfActor[actorIndex];
     entry.varName =
-        mlir::emitrust::toSnakeCase(namingBase(actor)) + "_actor";
+        mlir::emitrust::toSnakeCase(flattenItemPath(namingBase(actor))) +
+        "_actor";
     llvm::StringSet<> fieldNames;
     bool fieldCollision = false;
     for (const std::string &global : actor.globals) {
@@ -429,8 +463,10 @@ ActorLiftAttachment emitrustcc::attachActorLiftAttributes(
   for (auto &[ownerSymbol, cells] : freeFnCells) {
     LiftEntry entry;
     entry.typeName =
-        mlir::emitrust::toUpperCamelCase(ownerSymbol) + "Actor";
-    entry.varName = mlir::emitrust::toSnakeCase(ownerSymbol) + "_actor";
+        mlir::emitrust::toUpperCamelCase(flattenItemPath(ownerSymbol)) +
+        "Actor";
+    entry.varName =
+        mlir::emitrust::toSnakeCase(flattenItemPath(ownerSymbol)) + "_actor";
     llvm::sort(cells,
                [](mlir::emitrust::GlobalOp a, mlir::emitrust::GlobalOp b) {
                  return a.getSymName() < b.getSymName();
@@ -510,9 +546,21 @@ ActorLiftAttachment emitrustcc::attachActorLiftAttributes(
   {
     llvm::StringSet<> takenLocalNames;
     llvm::SmallVector<std::pair<std::string, std::string>> guardedLocals;
-    for (auto &local : localGlobals)
+    for (auto &local : localGlobals) {
+      // FR-231: flattening a namespace path can land the binding on a name
+      // the crate ROOT already defines (`namespace geo { int counter; }`
+      // beside a root `geo_counter`), and a `let` of that name inside c_main
+      // would SHADOW the root static for every bare-name reference in the
+      // same body -- a silently wrong read, which is the one outcome this
+      // project does not accept. Keeping the module-level form is the
+      // existing "collision: keep today's shape" fallback. Gated on the
+      // symbol being a path so no flagless compile can reach it.
+      if (llvm::StringRef(local.first).contains("::") &&
+          mlir::SymbolTable::lookupSymbolIn(module, local.second))
+        continue;
       if (takenLocalNames.insert(local.second).second)
         guardedLocals.push_back(std::move(local));
+    }
     localGlobals = std::move(guardedLocals);
   }
 

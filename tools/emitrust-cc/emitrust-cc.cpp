@@ -561,6 +561,22 @@ static llvm::cl::opt<bool> preserveCNamesFlag(
         "it."),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> namespaceModulesFlag(
+    "namespace-modules",
+    llvm::cl::desc(
+        "Emit each C++ namespace as a Rust `mod` instead of flattening it "
+        "into a name prefix (FR-231). By default `namespace geo { namespace "
+        "inner { int twice(int); } }` emits the single item "
+        "`ns_geo_ns_inner_twice`, a spelling that degrades with nesting "
+        "depth; under this flag the same input emits `mod geo { mod inner { "
+        "fn twice(..) } }` and every use site spells `crate::geo::inner::"
+        "twice`. Namespace REOPENING composes for free -- blocks are bucketed "
+        "by path, so a namespace split across a header and an implementation "
+        "file lands in ONE `mod`. An anonymous namespace becomes `mod anon`. "
+        "Off by default, in which case the compile is byte-identical to one "
+        "built without this flag"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> deferExternalsFlag(
     "defer-externals",
     llvm::cl::desc(
@@ -2639,6 +2655,9 @@ int main(int argc, char **argv) {
   // and item graph) before any symbol is named. Set once here so the two paths
   // cannot disagree.
   mlir::emitrust::idiomaticRenameEnabled() = !preserveCNamesFlag;
+  // FR-231: same posture, same reason -- the importer, the FR-40 item graph
+  // and the clang-free emitter all name symbols and must agree on the shape.
+  mlir::emitrust::namespaceModulesEnabled() = namespaceModulesFlag;
 
   if (inputFilenames.empty() && compilationDatabasePath.empty()) {
     llvm::errs() << "error: at least one input file is required, or "
@@ -2677,6 +2696,27 @@ int main(int argc, char **argv) {
     llvm::errs() << "error: --c-abi-exports does not apply under --partition: "
                     "a workspace member is a path dependency of its siblings, "
                     "which a cdylib cannot be\n";
+    return 1;
+  }
+  // FR-231: a C-ABI export and a namespace module are mutually exclusive by
+  // CONSTRUCTION, not by policy. The emitter's export loop skips every item
+  // carrying a module path, because FR-159 minted those paths for per-TU
+  // modules whose contents are translation-unit-local and have no C symbol to
+  // give. Under --namespace-modules a module path no longer implies TU-local,
+  // so that skip would silently DROP the export of a namespaced `extern "C"`
+  // function -- a missing symbol discovered at link time, with no diagnostic,
+  // which is exactly the class of change this project refuses to make
+  // quietly. Refused here rather than reinterpreted: teaching the export loop
+  // to distinguish the two kinds of module path is a real feature with its own
+  // wrapper-placement question (a `#[no_mangle]` item inside a `mod` is
+  // exported, but its C name would then be minted by a flag the C caller never
+  // saw), and shipping it as a side effect of a naming flag is how a wrong
+  // number gets built later.
+  if (cAbiExportsFlag && namespaceModulesFlag) {
+    llvm::errs() << "error: --c-abi-exports does not apply under "
+                    "--namespace-modules: an item inside a Rust module is not "
+                    "exported, so a namespaced function would silently lose "
+                    "its C symbol\n";
     return 1;
   }
   // FR-59: partitioning is a link-time, crate-emitting operation only —

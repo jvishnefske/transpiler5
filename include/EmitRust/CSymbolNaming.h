@@ -171,6 +171,8 @@ static inline std::string templateArgSuffix(const clang::RecordDecl *record);
 static inline std::string joinSymbolPrefix(llvm::StringRef prefix,
                                            llvm::StringRef base);
 static inline std::string namespacePrefix(const clang::DeclContext *context);
+static inline std::string
+namespaceModulePath(const clang::DeclContext *context);
 
 static inline std::string recordRustName(const clang::RecordDecl *record) {
   llvm::StringRef name = record->getName();
@@ -207,6 +209,18 @@ static inline std::string recordRustName(const clang::RecordDecl *record) {
   // (`ItemGraphBuilder::recordSymbolFor`, FR-41's coloring probe, FR-42's
   // recovery owner symbol). `std::` records never reach here — their
   // names are pre-seeded — so `std::pair<int, int>` stays `PairI32I32`.
+  //
+  // FR-231: under `--namespace-modules` the flattening prefix is replaced by
+  // the ABSOLUTE module path (`crate::geo::inner::`) and the camel fold moves
+  // to the LEAF alone -- `toUpperCamelCase("crate::geo::Point")` would spell
+  // `Crate::geo::Point` and, worse, fold the path separators of a nested
+  // chain into the type name. The path is a Rust PATH, not part of the
+  // identifier, so it must never see a casing pass.
+  if (namespaceModulesEnabled()) {
+    std::string leaf = name.str() + templateArgSuffix(record);
+    return namespaceModulePath(record->getDeclContext()) +
+           (idiomaticRenameEnabled() ? toUpperCamelCase(leaf) : leaf);
+  }
   std::string spelled =
       joinSymbolPrefix(namespacePrefix(record->getDeclContext()),
                        name.str() + templateArgSuffix(record));
@@ -279,6 +293,60 @@ static inline std::string namespacePrefix(const clang::DeclContext *context) {
     prefix += "_";
   }
   return prefix;
+}
+
+/// FR-231: the ABSOLUTE Rust module path `crate::a::b::` reflecting
+/// `context`'s enclosing namespace chain, or the empty string when there is
+/// no chain (every plain-C input, and every C++ declaration at global scope).
+///
+/// This is `namespacePrefix`'s alternative, selected process-wide by
+/// `namespaceModulesEnabled()`. The two differ only in SHAPE: one flattens
+/// `a::b::f` into the identifier `ns_a_ns_b_f`, the other spells the path
+/// `crate::a::b::f` -- which is exactly the symbol shape FR-159's `emitModule`
+/// already buckets into `mod` blocks. Being absolute is a requirement and not
+/// a style choice, for FR-159's own reason: a path written INSIDE a `mod` is
+/// module-relative, so a relative `geo::f` is rustc E0433 in an fn-ptr table
+/// payload rendered inside the module.
+///
+/// The trailing `::` is part of the return value so a caller composes with
+/// plain concatenation and an empty path degenerates to the historical bare
+/// leaf, byte for byte.
+///
+/// Segment casing MIRRORS `namespacePrefix` exactly (FR-125's per-segment
+/// `toSnakeCase` under the idiomatic rename, verbatim under
+/// `--preserve-c-names`), so the two spellings stay in step and a
+/// `--preserve-c-names` module keeps the C++ namespace's own capitalization;
+/// the emitter writes an `#[allow(non_snake_case)]` cover on a `mod` whose
+/// name would trip the lint (which the idiomatic rename does NOT prevent -- a
+/// DOUBLED underscore survives `toSnakeCase` untouched). An ANONYMOUS namespace contributes the fixed
+/// segment `anon` -- deliberately NOT a nameless construct: Rust has no
+/// anonymous module, one `mod anon` per TU matches the one synthesized
+/// internal-linkage entity C++ gives however many `namespace { }` blocks
+/// reopen it, and it keeps the per-TU `tu<N>_` leaf tag (which is what
+/// actually distinguishes two TUs' anonymous namespaces) doing that job
+/// alone.
+///
+/// `extern "C" { ... }` is a `LinkageSpecDecl`, not a `NamespaceDecl`, so it
+/// is transparent here exactly as it is in `namespacePrefix`.
+static inline std::string
+namespaceModulePath(const clang::DeclContext *context) {
+  llvm::SmallVector<const clang::NamespaceDecl *, 4> chain;
+  for (; context && !context->isTranslationUnit();
+       context = context->getParent())
+    if (const auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(context))
+      chain.push_back(ns);
+  if (chain.empty())
+    return std::string();
+  std::string path = "crate::";
+  for (const clang::NamespaceDecl *ns : llvm::reverse(chain)) {
+    if (ns->isAnonymousNamespace())
+      path += "anon";
+    else
+      path += idiomaticRenameEnabled() ? toSnakeCase(ns->getName())
+                                       : ns->getName().str();
+    path += "::";
+  }
+  return path;
 }
 
 /// W2.15 template-argument TYPE CODE: the deterministic spelling one
@@ -722,8 +790,24 @@ static inline std::string cFunctionSymbolName(const clang::FunctionDecl *func,
     if (mangledBase.empty())
       return std::string();
   }
-  std::string base = joinSymbolPrefix(namespacePrefix(func->getDeclContext()),
-                                      mangledBase);
+  // FR-231: under `--namespace-modules` the namespace contributes a PATH
+  // rather than a flattening prefix, and the path must end up OUTSIDE
+  // everything else the symbol composes -- most sharply the per-TU tag, which
+  // this function has always joined on the OUTSIDE (`tu0_` + base). Applied
+  // unchanged to a path that would spell `tu0_crate::geo::f`, which is not a
+  // Rust path at all; the tag belongs on the LEAF (`crate::geo::tu0_f`), where
+  // it still distinguishes two TUs' file-statics. The overload and template
+  // suffixes were already leaf-local (they append to `base`), so they need no
+  // move.
+  std::string modulePath;
+  std::string base;
+  if (namespaceModulesEnabled()) {
+    modulePath = namespaceModulePath(func->getDeclContext());
+    base = mangledBase;
+  } else {
+    base = joinSymbolPrefix(namespacePrefix(func->getDeclContext()),
+                            mangledBase);
+  }
   //  - FR-114: a member of a free-function OVERLOAD SET appends one type
   //    code per parameter (`overloadParamSuffix`, empty for every sole
   //    owner of a name), so `g(int)`/`g(double)` emit `g_i32`/`g_d`
@@ -738,8 +822,8 @@ static inline std::string cFunctionSymbolName(const clang::FunctionDecl *func,
   //    template in a namespace composes all three.
   base += templateArgSuffix(func);
   if (func->getStorageClass() == clang::SC_Static)
-    return joinSymbolPrefix(tuTag, base);
-  return base;
+    base = joinSymbolPrefix(tuTag, base);
+  return modulePath + base;
 }
 
 /// The emitted module symbol of the file-scope variable `var` in a
@@ -763,15 +847,25 @@ static inline std::string cFunctionSymbolName(const clang::FunctionDecl *func,
 static inline std::string cGlobalSymbolName(const clang::VarDecl *var,
                                             llvm::StringRef tuTag) {
   bool internal = !var->isExternallyVisible();
-  std::string full =
-      joinSymbolPrefix((internal ? tuTag.str() : std::string()) +
-                           namespacePrefix(var->getDeclContext()),
-                       var->getName());
+  // FR-231: the same leaf-vs-path split `cFunctionSymbolName` makes, and for
+  // the same two reasons. The per-TU tag stays on the leaf
+  // (`crate::geo::TU0_X`, never `TU0_crate::geo::X`), and the
+  // SCREAMING_SNAKE_CASE fold applies to the leaf ALONE -- run over the whole
+  // string it would spell `CRATE::GEO::X`, a path to a module the crate does
+  // not have.
+  std::string modulePath;
+  std::string prefix = internal ? tuTag.str() : std::string();
+  if (namespaceModulesEnabled())
+    modulePath = namespaceModulePath(var->getDeclContext());
+  else
+    prefix += namespacePrefix(var->getDeclContext());
+  std::string full = joinSymbolPrefix(prefix, var->getName());
   // A global becomes SCREAMING_SNAKE_CASE as a whole, so its per-TU tag and
   // namespace prefix are uppercased too (`tu0_calls` -> `TU0_CALLS`,
   // `ns_shapes_base` -> `NS_SHAPES_BASE`); the linkage predicate in
   // CSymbolLinkage.h recognizes the uppercased tags.
-  return idiomaticRenameEnabled() ? toScreamingSnakeCase(full) : full;
+  return modulePath +
+         (idiomaticRenameEnabled() ? toScreamingSnakeCase(full) : full);
 }
 
 /// FR-123: the friend functions DEFINED INLINE in the class definition

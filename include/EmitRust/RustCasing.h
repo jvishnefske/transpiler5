@@ -52,6 +52,27 @@ inline bool &idiomaticRenameEnabled() {
   return enabled;
 }
 
+/// FR-231 namespace modules. Process-wide for exactly the reason its FR-53
+/// sibling above is: the SAME naming primitives feed the importer, the FR-40
+/// item graph (its own clang parse, no importer in scope) and the clang-free
+/// Rust emitter, and a symbol spelled `crate::geo::twice` by one of them and
+/// `ns_geo_twice` by another would be a silent cross-path collision, not a
+/// diagnosable one.
+///
+/// When set, `namespacePrefix`'s FLATTENING (`ns_geo_ns_inner_twice`) is
+/// replaced at the three symbol-naming sites by the ABSOLUTE Rust path
+/// `crate::geo::inner::twice`, which is precisely the shape FR-159's
+/// `emitModule` already buckets into `mod` blocks -- use sites spell the whole
+/// path either way, so the emitter needed only a nested-tree renderer.
+///
+/// Set once, at startup, by the driver (`emitrust-cc`, `--namespace-modules`);
+/// DEFAULT OFF, so every pre-existing golden is byte-identical, and tools that
+/// never set it (`emitrust-import-c`) keep the flattened spelling.
+inline bool &namespaceModulesEnabled() {
+  static bool enabled = false;
+  return enabled;
+}
+
 /// Would rustc's `non_snake_case` lint fire on an item named `name`?
 ///
 /// Mirrors rustc's own `is_snake_case`: leading and trailing underscores are
