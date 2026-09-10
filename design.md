@@ -13655,11 +13655,31 @@ piece and becomes FR-45.
   SAYS THIS IS TWO DIFFERENT PROBLEMS, AND ONLY ONE OF THEM IS A BINDING
   PROBLEM.**
   `call to 'X' declared in a system header; not part of the supported C
-  subset` is the **#1 single-fix lever in the census (+14 cases as a SOLE
-  blocker)**, and **every one of the 15 affected cases needs exactly ONE
-  function**. The complete list, measured:
-      sqrtf 2   setlocale 2   div 2   atof 2   strcspn 2   fputs 1
-      fabsf 1   srand 1       floorf 1  expf 1  abort 1
+  subset` is the **#1 single-fix lever in the census**, and it touches **15
+  cases, 13 of which need NOTHING ELSE**. The complete list, measured from
+  `census.json` at HEAD (any-member count, then the sole-blocker subset):
+      sqrtf 2/2   setlocale 2/2   div 2/2   strcspn 2/1   fputs 1/1
+      fabsf 1/1   floorf 1/1   expf 1/1   abort 1/1   atof 1/1   srand 1/0
+  Ten distinct functions. The two cases that are NOT sole-blocker are
+  `029_strcspn` (strcspn + one other) and `008_long_run_lib` (srand +
+  `unreached-by-import`), so `srand` -- the hardest of the ten, since it must
+  reproduce glibc's exact sequence to byte-diff -- is never on the critical
+  path for a single case.
+  **CORRECTED 2026-09-09, SAME DAY, BY THE CENSUS THIS ENTRY CITES.** The
+  first draft of this paragraph said "+14 cases as a SOLE blocker", "every one
+  of the 15 affected cases needs exactly ONE function", and -- worst -- "all
+  15 are exec, so they need no export". All three were wrong, and the third is
+  **the first-failure trap for the NINTH time, committed inside the entry that
+  was written to describe it.** The measured split is:
+      SOLE-BLOCKER CASES: 13  =  4 exec  +  9 lib
+  and the nine `lib` cases do not clear the export boundary for free.
+  `bin2hex(hex, hex_maxlen, bin, bin_len)` and `normalize(dest, src, size)`
+  are TWO-POINTER exports, i.e. exactly **FR-181's HARD NO-GO cohort**;
+  `022_stdlib_div_lib` (`x`, `y` scalars) is CLASS 0 and should export.
+  **THE HONEST PROJECTION IS THEREFORE +4 TO +6 PASS, NOT +14** -- the four
+  exec cases, which need no export and only have to build and run, plus
+  whichever lib cases classify CLASS 0. It is still the largest measured
+  single-fix lever on the board, but it must be filed at its real size.
   **ELEVEN OF THE THIRTEEN NEED NO BINDING AT ALL.** `sqrtf`/`fabsf`/
   `floorf`/`expf` are `f32::sqrt`/`abs`/`floor`/`exp`; `div` is `(a/b, a%b)`;
   `abort` is `std::process::abort()`; `strcspn` is a byte scan; `atof` is a

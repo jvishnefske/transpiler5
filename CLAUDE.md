@@ -51,11 +51,14 @@ habit in the protocol — it is what caught every error listed in §3.
 ## 3. COUNTING RULES — every one of these has cost a wrong decision
 
 **Count PROGRAMS, not EVENTS, not SITES.** A first-failure histogram has
-produced a wrong yield **seven** times (FR-61f ×2, FR-165, FR-138, FR-177,
-FR-178, FR-221). The last was an entry that cited the previous six and then
-ranked "83 of 202 EMIT_FAIL cases, 33% of the corpus" — which was 83 *events*
-over **three source programs and four sites**, 80 of them one file built 128
-ways. Deleting the whole check was then measured at **+0**.
+produced a wrong yield **nine** times (FR-61f ×2, FR-165, FR-138, FR-177,
+FR-178, FR-221, FR-223, FR-224). FR-221 cited the previous six and then ranked
+"83 of 202 EMIT_FAIL cases, 33% of the corpus" — which was 83 *events* over
+**three source programs and four sites**, 80 of them one file built 128 ways;
+deleting the whole check measured **+0**. **FR-224 then committed the trap
+inside the entry written to describe it**, projecting +14 from a blocker count
+without checking `kind` — 9 of the 13 were `lib` and needed exports, so the
+honest figure was +4 to +6. Assume you are about to do this too.
 
 **Marginal yield is a property of the SET.** A blocker in 83 cases is worth
 zero if all 83 also need four other fixes. Use the census's set-cover, not
