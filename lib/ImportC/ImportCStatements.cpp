@@ -3604,6 +3604,26 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
       PointerLocalInfo info;
       info.cursorCell = cursorCell;
       info.backing = backing;
+      // FR-230 (G): an allocation-backed region that ALSO receives a null
+      // constant (`int *data; data = NULL; data = alloca(n);`) needs the
+      // CTS-P8 Option-of-cursor discriminant like any other nullable
+      // region. Without the flag cell the null assignment hit
+      // `storePointerAssign`'s "null pointer constant assigned to this
+      // pointer" refusal, whose comment claims the analysis "marks every
+      // null-receiving local region nullable, so this rejection covers
+      // only non-region pointers" -- true of every region arm EXCEPT this
+      // one, which materialized a cursor and a backing and no flag. The
+      // flag starts FALSE unless the DECLARATION ITSELF is the allocation
+      // binding (`int *p = malloc(4); ...; p = NULL;`), which takes the
+      // store-0-and-stop path below and would otherwise leave a genuinely
+      // non-null pointer reading as null at a later `if (p)`. Every other
+      // binding path stores the flag for itself.
+      Value nonNullCell;
+      bool boundAtDecl = var->getInit() && asAllocCall(var->getInit());
+      if (region->nullable) {
+        nonNullCell = createEntryAlloca(loc, builder.getI1Type());
+        info.nonNullCell = nonNullCell;
+      }
       pointerLocals[var] = info;
       // The fresh backing is already zeroed, so the declaration binding
       // only initializes the cursor to 0; a later `p = malloc(...)`
@@ -3611,6 +3631,9 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
       builder.create<memref::StoreOp>(
           loc, createIntConstant(loc, builder.getIntegerType(64), 0),
           cursorCell);
+      if (nonNullCell)
+        builder.create<memref::StoreOp>(
+            loc, createBoolConstant(loc, boundAtDecl), nonNullCell);
       // FR-147 (defect found while admitting allocation-backed slice
       // ARGUMENTS): a SECOND pointer united into this allocation region
       // (`char *q = p + 3;`, `const char *z = walk(p);`) declares here
@@ -4029,6 +4052,12 @@ LogicalResult CImporter::storePointerAssign(Location loc,
     builder.create<memref::StoreOp>(
         loc, createIntConstant(loc, builder.getIntegerType(64), 0),
         info.cursorCell);
+    // FR-230 (G): an allocation is an ADDRESS binding, so it selects the
+    // Some side of a nullable allocation-backed region's discriminant --
+    // the mirror of the `p = NULL` arm a few lines up.
+    if (info.nonNullCell)
+      builder.create<memref::StoreOp>(loc, createBoolConstant(loc, true),
+                                      info.nonNullCell);
     return success();
   }
   // FR-93: a member-array decay source (`p = s->arr;`, `Iv = ctx->Iv;`)

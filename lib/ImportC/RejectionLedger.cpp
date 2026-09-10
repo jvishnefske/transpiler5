@@ -65,9 +65,17 @@ bool isDynamicMemoryName(llvm::StringRef name) {
 /// disambiguate the shared pointer wordings below (`_ALLOC_KEYWORDS`).
 /// `free` is absent on purpose: a `free(p)` line never produces one of those
 /// wordings, and the substring would match `free_list` and friends.
+///
+/// FR-230: `alloca` is here because its absence MIS-RANKED the census. A
+/// stack allocation raised the same shared "non-address value" wording and,
+/// unrefined, landed in `pointer-local-nonaddress` next to four unrelated
+/// pointer-member loads -- five different features read as one lever. A
+/// refusal's wording is part of the ranking instrument. The substring also
+/// covers `__builtin_alloca`, the spelling `<alloca.h>`'s macro expands to.
 bool citedLineAllocates(llvm::StringRef line) {
   return line.contains("malloc") || line.contains("calloc") ||
-         line.contains("realloc") || line.contains("aligned_alloc");
+         line.contains("realloc") || line.contains("aligned_alloc") ||
+         line.contains("alloca");
 }
 
 /// The ordered substring table (`_BLOCKER_SUBSTRINGS`). First match wins, so

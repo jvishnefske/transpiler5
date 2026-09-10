@@ -14552,9 +14552,81 @@ piece and becomes FR-45.
   until E is lifted; measured only on the equivalent `while` rewrite), and
   whether any export class could unwall `028_strchr_lib` without `unsafe`
   (believed not, per FR-224's doctrine, but not built).
+  **ITEM (1) LANDED 2026-09-10: TRACTOR 55 -> 57, +2 PROGRAMS AT PASS**
+  (`018_stack_buffer_overflow_loop1` and its `_lib` twin), EMIT 67 -> 69, zero
+  regressions, gate 1061/1061.
+  **MY ANCHOR WAS INCOMPLETE IN A WAY THAT WOULD HAVE PRODUCED A NO-OP.**
+  `<alloca.h>` defines `alloca` as a function-like MACRO for
+  `__builtin_alloca`, so the corpus call's `DirectCallee` is
+  `__builtin_alloca` -- matching only `"alloca"` at the gate I named would
+  have left `018` refused exactly as before. Both spellings are now matched
+  and both are pinned, the literal one needing `--extra-arg=-isystem` because
+  declared in the main file it dies earlier on `unsupported: pointer return
+  type`. This is a FIFTH anchor defect from me in one session and a subtler
+  class than the others: the line was right and the MATCHING CONDITION was
+  incomplete.
+  **A MISCOMPILE THE NAIVE NULL-FLAG FIX WOULD HAVE INTRODUCED, caught by the
+  implementer.** Materialising the flag and defaulting it to `false` is wrong
+  for `int *p = malloc(4); ...; p = NULL;` -- the DECLARATION is the binding
+  and takes the store-0-and-stop path, so the flag would stay false while `p`
+  genuinely holds an allocation, and a later `if (p)` would read null. Seeded
+  from `var->getInit() && asAllocCall(var->getInit())` instead. **`cargo
+  build` cannot see this class**; it is a wrong-answer bug and exactly why the
+  byte-diff oracle is the authority.
+  A second consequence not in the spec: a nullable allocation-backed region
+  now inherits the shared CTS-P8 deref guard, so each deref emits an
+  `assert!(flag)`. It folds away before Rust is emitted in the corpus case and
+  costs nothing there; pinned positively and negatively.
+  **THE ROUNDING IS UNIFORM ACROSS `malloc`/`calloc`/`alloca`, AND THAT IS A
+  DELIBERATE DEVIATION FROM A LITERAL READING OF MY SPEC, REPORTED NOT
+  HIDDEN.** It cannot move an already-admitted lowering, because `ceil ==
+  exact` whenever the size divides evenly -- pinned both ways in
+  `alloc-size-round-up.c` (`malloc(16)/int -> [4 x i32]` exact against
+  `malloc(10)/int -> [3 x i32]` rounded). It DOES widen admission for
+  previously-REJECTED `malloc` shapes. An allocator-specific rule would have
+  been arbitrary: the C is UB in both cases and the panic is the loud
+  direction in both.
+  **BUT THE WIDENING HAS A CONSEQUENCE WORTH STATING PLAINLY, AND IT IS NOT
+  UNIFORMLY LOUD.** `int *p = malloc(10)` now backs `[i32; 3]` = 12 bytes,
+  which is LARGER than the C object. Writing `p[2]` is UB in C (bytes 8-11 of
+  a 10-byte allocation) and now **succeeds silently in Rust** rather than
+  trapping. For `018`'s shape the rounding IS loud -- `alloca(10)` for `int*`
+  written through `p[0..9]` panics at index 3 -- but the general case can
+  round INTO the silent direction. No defined program changes behaviour, so
+  this is not a miscompile; it does mean the emitted crate can mask a heap
+  overflow the C had. **THE TIGHTENING, if it is ever wanted: keep the rounded
+  backing (a Rust array must be whole elements) but bounds-check against the
+  C-DECLARED BYTE EXTENT, so `p[2]` on a 10-byte allocation traps too.** Not
+  done, not costed, and recorded here so the looseness is a known choice
+  rather than a discovery.
+  **THE LEDGER HEURISTIC CAN BE SPOOFED BY AN IDENTIFIER**, found the hard
+  way: a probe function named `uses_aligned_alloca` tagged `dynamic-memory` on
+  BOTH binaries, because `citedLineAllocates` keys on the whole SOURCE LINE
+  and the substring matched inside the function name. Renamed to
+  `stack_block`. **Anyone extending that table should know it matches
+  identifiers, not just calls.** The before/after is measured on identical
+  input: unpatched `[pointer-local-nonaddress]`, patched `[dynamic-memory]`.
+  The Python mirror was verified by CALLING `classify_blocker`, not by eye,
+  with negative controls confirming `strchr-result-bind` and the plain pointer
+  tag are unmoved.
+  **THE OPTIONAL MEMBER-LOAD REFINEMENT WAS DECLINED, correctly.** Those cases
+  reach the same ambiguous wording, so the only ledger-level lever is another
+  cited-line substring, and the only discriminator is `->`/`.` -- which would
+  sweep in unrelated lines and reclassify existing entries. Doing it properly
+  needs a bespoke diagnostic at the member-load site, with its own golden
+  churn. Left alone rather than done badly.
+  Golden movement: paired sweep over 926 inputs, **3 hashes changed, all 3 the
+  new test files** moving REJECTED -> emitting; **zero movement in the 923
+  pre-existing files**. Two of the new files are `split-file` sources and are
+  REJECTED on both sides, counted as rejected-by-both rather than moved -- and
+  since a hash sweep is blind to split-file sub-units, the full lit suite was
+  run at the final tree state as well. Clippy 57 (+0), binding both axes flat,
+  CTestSuite 220/220 and Cpp17Suite 35/35 with manifests untouched (no
+  unrecorded new PASS, which fails the ratchet just as a regression does).
+  All re-verified independently in the main tree.
   ACCEPTANCE, in the ranked order above, each measured and reported
-  separately: (1) `alloca` joins the allocation model, the null-assign gap G
-  closes, `bad()` rounds up and bounds-panics, and TRACTOR moves 55 -> 57;
+  separately: (1) DONE -- `alloca` joined the allocation model, the null-assign
+  gap G closed, `bad()` rounds up and bounds-panics, TRACTOR 55 -> 57;
   (2) hosted `strchr` classifies as a param-0 nullable cursor return with E
   and F costed as their own frontier; (3) A and B are NOT scheduled for yield.
   The ledger refinement in the last paragraph should land with (1), since it
