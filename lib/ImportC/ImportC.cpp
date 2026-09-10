@@ -4610,6 +4610,32 @@ CImporter::flushByteViewWritebacks(Location loc,
                                  IntegerType::Unsigned);
   IntegerType cursorType = builder.getIntegerType(64);
   for (const ByteViewWriteback &writeback : writebacks) {
+    // FR-229 Wave 2 (capability D): a BYTE ARRAY crossed out of the i8
+    // domain comes back as ONE whole-array domain cast, not a per-
+    // component `from_ne_bytes`. Rust's `as` between i8 and u8 is
+    // bit-preserving in both directions, so the round trip is the
+    // identity on every byte the callee did not touch — which is the
+    // property a partial write through the view depends on.
+    if (writeback.domainElement) {
+      auto bytesType = emitrust::ArrayType::get(builder.getContext(),
+                                                writeback.domainCount, u8Type);
+      auto objectType = emitrust::ArrayType::get(
+          builder.getContext(), writeback.domainCount, writeback.domainElement);
+      requestStringHelper("__emitrust_bytes_as_i8");
+      Value restored =
+          builder
+              .create<emitrust::CallOpaqueOp>(
+                  loc, TypeRange{objectType},
+                  builder.getStringAttr("__emitrust_bytes_as_i8"),
+                  /*args=*/ArrayAttr(),
+                  ValueRange{builder
+                                 .create<emitrust::LoadOp>(
+                                     loc, bytesType, writeback.bytesPlace)
+                                 .getResult()})
+              .getResult(0);
+      builder.create<emitrust::AssignOp>(loc, writeback.objectPlace, restored);
+      continue;
+    }
     for (const ByteViewComponent &component : writeback.plan.components) {
       WideByteAccess access{writeback.bytesPlace,
                             createIntConstant(loc, cursorType,
@@ -4630,6 +4656,152 @@ CImporter::flushByteViewWritebacks(Location loc,
     }
   }
   return success();
+}
+
+FailureOr<bool> CImporter::tryEmitObjectRepresentationMemcpy(
+    const clang::CallExpr *call, llvm::StringRef name,
+    const CharRegionArg &dst, Location loc) {
+  clang::ASTContext &context = astContext();
+  // memcpy's `const void *` parameter wraps the argument in an implicit
+  // pointer bitcast (and a const-qualification no-op), exactly as
+  // `emitCharRegionArg` peels for the region channel.
+  const clang::Expr *source = stripTrivia(call->getArg(1));
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(source)) {
+    if ((cast->getCastKind() != clang::CK_BitCast &&
+         cast->getCastKind() != clang::CK_NoOp) ||
+        !isPointerType(cast->getType()))
+      break;
+    source = stripTrivia(cast->getSubExpr());
+  }
+  const auto *addrOf = llvm::dyn_cast<clang::UnaryOperator>(source);
+  if (!addrOf || addrOf->getOpcode() != clang::UO_AddrOf)
+    return false;
+  const auto *ref =
+      llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(addrOf->getSubExpr()));
+  if (!ref)
+    return false;
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var)
+    return false;
+
+  ByteViewPlan plan;
+  FailureOr<bool> planned = planByteView(var->getType(), loc, plan);
+  if (failed(planned))
+    return failure();
+  if (!*planned)
+    return false;
+
+  // Only the WHOLE object image is admitted. A partial copy would need a
+  // per-byte window into a scattered image and has no test behind it, so
+  // it DECLINES rather than guessing: the caller's source resolution then
+  // raises its own located rejection, unchanged.
+  std::optional<llvm::APSInt> constCount =
+      call->getArg(2)->getIntegerConstantExpr(context);
+  if (!constCount || constCount->isNegative() ||
+      constCount->getExtValue() != static_cast<int64_t>(plan.size))
+    return false;
+
+  // A GLOBAL source's image would be built from a STAGED COPY (Wave 1's
+  // finding for the scalar view, unchanged here).
+  if (!var->hasLocalStorage())
+    return emitError(loc) << "unsupported: byte view of the global object '"
+                          << canonicalStreamName(var->getName()) << "'";
+  auto sourceIt = symbols.find(var);
+  if (sourceIt == symbols.end())
+    return false;
+  Value objectPlace = sourceIt->second;
+  if (!llvm::isa<emitrust::LValueType>(objectPlace.getType()))
+    return false;
+
+  // Resolve the DESTINATION as a place plus a byte cursor. Only a plain
+  // named byte array (top-level or a member array) is addressed here;
+  // every other region shape — a literal backing, a heap backing, an
+  // unwrapped nullable slice, a multi-base cursor — declines and keeps
+  // the caller's existing rejection.
+  Value basePlace;
+  Value cursor;
+  const clang::VarDecl *dstRoot = nullptr;
+  if (dst.isMember()) {
+    basePlace = dst.memberPlace;
+    cursor = dst.memberCursor;
+    dstRoot = dst.memberRoot;
+  } else {
+    const PtrExprValue &pointer = dst.pointer;
+    if (pointer.literalBacking || pointer.backing || pointer.slicePlace ||
+        pointer.member || pointer.baseIndex || pointer.nonNull ||
+        !pointer.multiBases.empty() || !pointer.base || !pointer.cursor)
+      return false;
+    auto dstIt = symbols.find(pointer.base);
+    if (dstIt == symbols.end())
+      return false;
+    basePlace = dstIt->second;
+    cursor = pointer.cursor;
+    dstRoot = pointer.base;
+  }
+  // Source and destination naming ONE object: the scatter reads each
+  // component of the object while writing bytes over it, so an overlap
+  // would make the result depend on the emission order. C's memcpy is
+  // undefined on overlap anyway; rejecting is the loud direction.
+  if (dstRoot && dstRoot == var)
+    return emitError(loc) << "unsupported: " << name
+                          << " source and destination point into the same "
+                             "object '"
+                          << var->getName() << "'";
+  auto lvalueType = llvm::dyn_cast<emitrust::LValueType>(basePlace.getType());
+  auto destArray = lvalueType ? llvm::dyn_cast<emitrust::ArrayType>(
+                                    lvalueType.getValueType())
+                              : emitrust::ArrayType();
+  if (!destArray)
+    return false;
+  auto destElement = llvm::dyn_cast<IntegerType>(destArray.getElementType());
+  if (!destElement || destElement.getWidth() != 8)
+    return false;
+  // A constant cursor whose image runs off the end of the destination is
+  // rejected HERE. Left alone it would emit constant out-of-range array
+  // indices, which rustc rejects outright (`unconditional_panic`) — the
+  // silently-unbuildable class, worse than a located refusal. A runtime
+  // cursor keeps the emitted slice bounds check, whose panic refines
+  // the C program's undefined out-of-bounds write.
+  if (std::optional<int64_t> offset = staticCursorValue(cursor)) {
+    if (*offset < 0 || static_cast<uint64_t>(*offset) + plan.size >
+                           destArray.getSize())
+      return emitError(loc)
+             << "unsupported: " << plan.size << "-byte access at offset "
+             << *offset << " runs past the end of '"
+             << (dstRoot ? dstRoot->getName() : llvm::StringRef("<region>"))
+             << "' (" << destArray.getSize() << " bytes)";
+  }
+
+  // Scatter the object representation straight into the destination: one
+  // `T::to_ne_bytes` per scalar component, written at the component's C
+  // byte offset past the destination cursor, in C declaration order. No
+  // intermediate image is materialized and nothing here depends on
+  // rustc's layout of the source struct.
+  IntegerType cursorType = builder.getIntegerType(64);
+  for (const ByteViewComponent &component : plan.components) {
+    Value valuePlace = objectPlace;
+    if (component.field) {
+      FailureOr<Value> member =
+          projectMemberPlace(loc, objectPlace, component.field);
+      if (failed(member))
+        return failure();
+      valuePlace = *member;
+    }
+    Value value = loadPlace(loc, valuePlace);
+    Value componentCursor =
+        component.offset == 0
+            ? cursor
+            : builder
+                  .create<arith::AddIOp>(
+                      loc, cursor,
+                      createIntConstant(loc, cursorType, component.offset))
+                  .getResult();
+    WideByteAccess access{basePlace, componentCursor, component.valueType,
+                          component.width, destElement};
+    if (failed(emitWideByteStore(access, value, loc)))
+      return failure();
+  }
+  return true;
 }
 
 //===----------------------------------------------------------------------===//

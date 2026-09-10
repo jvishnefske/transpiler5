@@ -5991,6 +5991,16 @@ private:
     Value bytesPlace;
     Value objectPlace;
     ByteViewPlan plan;
+    /// FR-229 Wave 2 (capability D): non-null when the viewed object is a
+    /// BYTE ARRAY crossed from the i8 storage domain into u8 rather than a
+    /// scalar/aggregate whose representation was scattered per component.
+    /// The copy-out is then ONE whole-array domain cast back to this
+    /// element type, not a per-component `from_ne_bytes`, and `plan` is
+    /// empty. Rust's `as` between i8 and u8 is bit-preserving in both
+    /// directions, so the round trip is the identity on the bytes.
+    Type domainElement;
+    /// The array's element count, meaningful only with `domainElement`.
+    unsigned domainCount = 0;
   };
 
   /// FR-229: plans the byte image of an object of type `objectType`.
@@ -6021,6 +6031,26 @@ private:
       bool isMutParam, const clang::VarDecl *&root,
       SmallVectorImpl<ByteViewWriteback> *byteViewWritebacks, Value &result);
 
+  /// FR-229 Wave 2 (capabilities D and E): the cast operand of a byte-slice
+  /// argument named a whole BYTE ARRAY, either as `&arr` (capability E,
+  /// which the importer had no lowering for at all) or as the decayed
+  /// `arr` (capability D, claimed ONLY when the i8/u8 storage domain has
+  /// to cross -- a ui8 array's decay already lowers correctly and must
+  /// keep its golden byte for byte).
+  ///
+  /// A ui8 array's view IS the region, so it becomes an ordinary
+  /// `slice_of` with no copy and no write-back obligation. An i8 array
+  /// cannot be resliced as `[u8]` at all -- `emitrust.slice_of`'s verifier
+  /// refuses it -- so it is bridged by a materialized `[u8; N]` copy with
+  /// a per-byte `as u8`, which is bit-preserving, and being a COPY it
+  /// inherits Wave 1's write-back obligation exactly: a mutable parameter
+  /// with no post-call flush point takes a LOCATED refusal rather than
+  /// dropping the callee's stores.
+  FailureOr<bool> tryEmitByteArrayViewArgument(
+      Location loc, const clang::VarDecl *var, bool viaAddrOf, Type paramType,
+      bool isMutParam, const clang::VarDecl *&root,
+      SmallVectorImpl<ByteViewWriteback> *byteViewWritebacks, Value &result);
+
   /// FR-229: reconstitutes each viewed object from its (possibly mutated)
   /// byte image, `from_ne_bytes` per component at its own offset. Emitted
   /// immediately after the call op; dead-store elimination removes it
@@ -6028,6 +6058,21 @@ private:
   /// view costs nothing.
   LogicalResult flushByteViewWritebacks(Location loc,
                                         ArrayRef<ByteViewWriteback> writebacks);
+
+  /// FR-229 Wave 2 (capability C): matches `memcpy(dst, &obj, sizeof obj)`
+  /// — a memcpy whose SOURCE is the object representation of a local
+  /// scalar or padding-free aggregate. The typed model has no bytes to
+  /// copy from there, so nothing is resolved as a source region at all:
+  /// each planned component is split with `T::to_ne_bytes` and scattered
+  /// straight into `dst`'s byte array at the component's C offset past
+  /// the destination cursor. Returns false when the call is not that
+  /// shape (a non-constant count, a count that is not the whole object,
+  /// a destination this path cannot address), which leaves the caller's
+  /// existing source resolution — and its located rejection — untouched.
+  FailureOr<bool> tryEmitObjectRepresentationMemcpy(const clang::CallExpr *call,
+                                                    llvm::StringRef name,
+                                                    const CharRegionArg &dst,
+                                                    Location loc);
 
   /// Lowers one borrow-producing call argument against the reference-typed
   /// target parameter `paramType`. A slice parameter receives an

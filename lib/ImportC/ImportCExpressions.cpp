@@ -6414,6 +6414,129 @@ peelVoidMediatedArgumentCast(clang::ASTContext &context,
 // FR-229: the materialized OBJECT-REPRESENTATION byte view.
 //===----------------------------------------------------------------------===//
 
+FailureOr<bool> CImporter::tryEmitByteArrayViewArgument(
+    Location loc, const clang::VarDecl *var, bool viaAddrOf, Type paramType,
+    bool isMutParam, const clang::VarDecl *&root,
+    SmallVectorImpl<ByteViewWriteback> *byteViewWritebacks, Value &result) {
+  clang::ASTContext &context = astContext();
+  const auto *arrayType =
+      context.getAsConstantArrayType(var->getType().getCanonicalType());
+  // A VLA or an incomplete array has no static image to view.
+  if (!arrayType)
+    return false;
+  clang::QualType element = arrayType->getElementType().getCanonicalType();
+  const auto *builtin =
+      llvm::dyn_cast<clang::BuiltinType>(element.getTypePtr());
+  if (!builtin)
+    return false;
+  // THE CHAR FAMILY ONLY (`int8_t`/`uint8_t` canonicalize into it). A
+  // wider element makes this the object representation of an ARRAY, which
+  // is a different piece of work and keeps its existing rejection — that
+  // is the rejecting side of the symmetry pin, and it is why widening an
+  // admitted `char[]` to `short[]` must stop qualifying.
+  switch (builtin->getKind()) {
+  case clang::BuiltinType::Char_S:
+  case clang::BuiltinType::Char_U:
+  case clang::BuiltinType::SChar:
+  case clang::BuiltinType::UChar:
+    break;
+  default:
+    return false;
+  }
+  uint64_t count = arrayType->getSize().getZExtValue();
+  if (count == 0 || count > 0xFFFFFFFFull)
+    return false;
+  // The decay spelling over an array whose C element is already unsigned
+  // needs no crossing: it is the region base itself and lowers correctly
+  // through the pointer decomposition (including the located
+  // `passing a pointer into a global variable` refusal for a global).
+  // Claiming it here would move a working golden for nothing.
+  if (!viaAddrOf && element->isUnsignedIntegerType())
+    return false;
+  // A GLOBAL's image would be built from a STAGED COPY, exactly as Wave 1
+  // records for the scalar view: a callee that also touched the global
+  // would see — or lose — the wrong bytes. Every spelling that reaches
+  // here is a hard rejection today, so naming the global is strictly a
+  // better needle than the mechanism wording it had.
+  if (!var->hasLocalStorage())
+    return emitError(loc) << "unsupported: byte view of the global object '"
+                          << canonicalStreamName(var->getName()) << "'";
+  auto it = symbols.find(var);
+  if (it == symbols.end())
+    return emitError(loc) << "unsupported: byte view of '" << var->getName()
+                          << "', which is not an importable place";
+  Value arrayPlace = it->second;
+  auto lvalueType = llvm::dyn_cast<emitrust::LValueType>(arrayPlace.getType());
+  auto placeArray = lvalueType ? llvm::dyn_cast<emitrust::ArrayType>(
+                                     lvalueType.getValueType())
+                               : emitrust::ArrayType();
+  // The planner may have relocated the array (an owner region, a promoted
+  // member place). Whatever place it landed on still has to BE an array
+  // of the C extent, or the view would be of something else entirely.
+  if (!placeArray || placeArray.getSize() != count)
+    return emitError(loc) << "unsupported: byte view of '" << var->getName()
+                          << "', which is not an importable place";
+  auto elementType = llvm::dyn_cast<IntegerType>(placeArray.getElementType());
+  if (!elementType || elementType.getWidth() != 8)
+    return false;
+  auto u8Type =
+      IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  // Defensive: the C-type test above already declined this pair, and the
+  // place is the ground truth for what the emitted array really is.
+  if (!viaAddrOf && elementType == u8Type)
+    return false;
+  IntegerType cursorType = builder.getIntegerType(64);
+  // Already in the u8 domain: the view IS the region, so the `&arr`
+  // spelling simply joins the decay spelling's lowering. No copy is made,
+  // so there is no write-back obligation to discharge.
+  if (elementType == u8Type) {
+    root = var;
+    result = builder
+                 .create<emitrust::SliceOfOp>(
+                     loc, paramType, arrayPlace,
+                     createIntConstant(loc, cursorType, 0), isMutParam)
+                 .getResult();
+    return true;
+  }
+  // The i8 -> u8 crossing. `emitrust.slice_of` refuses it at the verifier
+  // ("result slice element type 'ui8' does not match the base element
+  // type 'i8'") and that refusal is correct: they are two Rust types over
+  // one C storage domain. The bridge is a materialized `[u8; N]` copy
+  // with a per-byte `as u8`, which is bit-preserving in Rust — and being
+  // a COPY it inherits Wave 1's write-back obligation unchanged.
+  if (isMutParam && !byteViewWritebacks)
+    return emitError(loc) << "unsupported: byte view with no write-back "
+                             "point for the callee's writes";
+  auto bytesType = emitrust::ArrayType::get(
+      builder.getContext(), static_cast<unsigned>(count), u8Type);
+  requestStringHelper("__emitrust_bytes_as_u8");
+  Value image = builder
+                    .create<emitrust::CallOpaqueOp>(
+                        loc, TypeRange{bytesType},
+                        builder.getStringAttr("__emitrust_bytes_as_u8"),
+                        /*args=*/ArrayAttr(),
+                        ValueRange{loadPlace(loc, arrayPlace)})
+                    .getResult(0);
+  Value bytesPlace = createVariablePlace(loc, bytesType);
+  builder.create<emitrust::AssignOp>(loc, bytesPlace, image);
+  if (isMutParam)
+    byteViewWritebacks->push_back(
+        ByteViewWriteback{bytesPlace, arrayPlace, ByteViewPlan(), elementType,
+                          static_cast<unsigned>(count)});
+  // `root` names the VIEWED array, not the image: the copy-out stores the
+  // image back over the array, so a second argument that also borrows it
+  // (`f((unsigned char *)raw, raw)`) would have its writes stomped by a
+  // reconstitution from a stale image. Keying the borrow here routes that
+  // pair into `emitCall`'s existing same-base rejection instead.
+  root = var;
+  result = builder
+               .create<emitrust::SliceOfOp>(
+                   loc, paramType, bytesPlace,
+                   createIntConstant(loc, cursorType, 0), isMutParam)
+               .getResult();
+  return true;
+}
+
 FailureOr<bool> CImporter::tryEmitByteViewArgument(
     Location loc, const clang::Expr *argument, Type paramType,
     bool isMutParam, const clang::VarDecl *&root,
@@ -6459,16 +6582,52 @@ FailureOr<bool> CImporter::tryEmitByteViewArgument(
   if (!destType->isPointerType() ||
       !isU8ScalarType(destType->getPointeeType()))
     return false;
-  const auto *addrOf =
-      llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(cstyle->getSubExpr()));
-  if (!addrOf || addrOf->getOpcode() != clang::UO_AddrOf)
-    return false;
-  const auto *ref =
-      llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(addrOf->getSubExpr()));
-  if (!ref)
-    return false;
-  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  // The cast operand is one of exactly two spellings, and which one it is
+  // matters past the address it denotes:
+  //   * `&obj` -- the Wave 1 object-representation view when `obj` is a
+  //     scalar or a record, and FR-229 capability E when `obj` is an
+  //     ARRAY (`(unsigned char *)&raw`, the corpus 039 spelling). C says
+  //     `&arr` and `arr` denote the same address; the importer only ever
+  //     had a lowering for the decayed form, so `&arr` was a flat
+  //     rejection whatever the element type was.
+  //   * `arr` decayed -- capability D, and ONLY when the element domain
+  //     actually has to cross. `(unsigned char *)raw` over a ui8 array is
+  //     the region base itself and already lowers correctly through the
+  //     pointer decomposition below; intercepting it would move a working
+  //     golden for nothing.
+  const clang::Expr *operand = stripTrivia(cstyle->getSubExpr());
+  const clang::VarDecl *var = nullptr;
+  bool viaAddrOf = false;
+  if (const auto *addrOf = llvm::dyn_cast<clang::UnaryOperator>(operand);
+      addrOf && addrOf->getOpcode() == clang::UO_AddrOf) {
+    const auto *ref =
+        llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(addrOf->getSubExpr()));
+    if (!ref)
+      return false;
+    var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+    viaAddrOf = true;
+  } else if (const auto *decay =
+                 llvm::dyn_cast<clang::ImplicitCastExpr>(operand);
+             decay && decay->getCastKind() == clang::CK_ArrayToPointerDecay) {
+    const auto *ref =
+        llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(decay->getSubExpr()));
+    if (!ref)
+      return false;
+    var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  }
   if (!var)
+    return false;
+
+  // FR-229 capability D/E: a whole BYTE ARRAY viewed as `[u8]`.
+  if (var->getType()->isArrayType()) {
+    FailureOr<bool> handled = tryEmitByteArrayViewArgument(
+        loc, var, viaAddrOf, paramType, isMutParam, root, byteViewWritebacks,
+        result);
+    if (failed(handled))
+      return failure();
+    return *handled;
+  }
+  if (!viaAddrOf)
     return false;
 
   ByteViewPlan plan;

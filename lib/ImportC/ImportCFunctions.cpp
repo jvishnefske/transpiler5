@@ -4066,6 +4066,40 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "        i += 1;\n"
        "    }\n"
        "}"},
+      // FR-229 Wave 2 (capability D): the i8/u8 BYTE-ARRAY DOMAIN
+      // CROSSING. C's `char` and `unsigned char` are one storage domain;
+      // the emitted Rust's `i8` and `u8` are two, and `emitrust.slice_of`
+      // refuses to bridge them at the verifier ("result slice element
+      // type 'ui8' does not match the base element type 'i8'"). These two
+      // are that bridge, and they are each other's exact inverse: Rust's
+      // `as` between `i8` and `u8` is defined as the identity on the bit
+      // pattern, so the copy-in/copy-out round trip is the identity on
+      // every byte -- which is what a callee that writes only PART of the
+      // view depends on. Const-generic over N so one definition serves
+      // every array extent, and both are ordinary safe Rust: the whole
+      // point of the copy shape is that it DISCHARGES the object-
+      // representation obligation rather than relocating it into
+      // `unsafe`.
+      {"__emitrust_bytes_as_u8",
+       "fn __emitrust_bytes_as_u8<const N: usize>(s: [i8; N]) -> [u8; N] {\n"
+       "    let mut o = [0u8; N];\n"
+       "    let mut i = 0usize;\n"
+       "    while i < N {\n"
+       "        o[i] = s[i] as u8;\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    o\n"
+       "}"},
+      {"__emitrust_bytes_as_i8",
+       "fn __emitrust_bytes_as_i8<const N: usize>(s: [u8; N]) -> [i8; N] {\n"
+       "    let mut o = [0i8; N];\n"
+       "    let mut i = 0usize;\n"
+       "    while i < N {\n"
+       "        o[i] = s[i] as i8;\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    o\n"
+       "}"},
   };
   for (const auto &helper : kStringHelpers) {
     if (!neededStringHelpers.contains(helper.name) ||

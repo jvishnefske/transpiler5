@@ -14364,9 +14364,66 @@ piece and becomes FR-45.
   escaping views each refused LOCATED with its own ledger needle; the
   `byte-region-aggregates-invalid.c` pin SPLIT rather than deleted; runtime
   byte-diff on all four shapes; TRACTOR measured and reported as PROGRAMS.
-  **WAVE 2 (C + D + E, +5 more):** the memcpy object-representation
-  source/dest, the i8/u8 byte-view domain, and the `&array` cast. D has a
-  verifier-level refusal today and deserves its own spike record.
+  **WAVE 2 (C + D + E) -- LANDED 2026-09-10, measured +5: TRACTOR 50 -> 55.**
+  Newly PASS: `037_cast_to_char_ptr_int_no_strict_aliasing`, its `_lib`,
+  `038_..._float_..._lib`, `039_..._struct_...`, its `_lib`. Exactly the
+  spike's projection again, zero regressions and zero other outcome changes;
+  EMIT 62 -> 67. **The family is now 10 of 12**; `035` and `038` `exec` are
+  short only on `scanf %f` (capability S), which was always out of wave.
+  **WAVE 2 INTRODUCED NO NEW REFUSAL WORDING AT ALL** -- every rejection routes
+  into a Wave 1 or pre-existing string, so no new `RejectionLedger` needle was
+  needed and nothing new landed in the census's `other` bucket. Verified by
+  calling `classify_blocker` directly and by `--recover` tag pins.
+  **FOUR DEVIATIONS, three of them better than what I specified:**
+   1. **MY ANCHOR WAS WRONG AGAIN, AND IT IS THE SAME CLASS OF ERROR AS
+      WAVE 1's.** I gave `ImportCExpressions.cpp:6810` as the element-type
+      gate; `:6811` is the STRING-LITERAL-BACKING gate and the local-array one
+      is `:6984` -- and **neither is reached**, because `emitPointerRValue`
+      dies first at `ImportC.cpp:4119`. Twice in two waves I passed a spike's
+      anchor through without re-verifying it.
+   2. **Capability D is NOT the per-byte unrolled `as u8` I described.**
+      Unrolling N casts is O(N) emitted statements and would have needed an
+      arbitrary size cap plus a new refusal wording for exceeding it. The
+      implementation uses two const-generic safe helpers,
+      `__emitrust_bytes_as_u8<const N>([i8; N]) -> [u8; N]` and its exact
+      inverse, riding `emitrust.call_opaque`: **O(1) emitted code, no cap, no
+      new wording, still zero `unsafe`, still bit-preserving per byte.**
+   3. **Capability C materializes NO intermediate image.** `memcpy(raw, &obj,
+      sizeof obj)` scatters each component's `to_ne_bytes` straight into the
+      DESTINATION at the C offset past the destination cursor, through the
+      existing `emitWideByteStore` -- so `memcpy(w + 8, &x, 4)` works for free.
+   4. **`(unsigned char *)&arr` over an already-`u8` array makes NO COPY**; it
+      borrows the region, joining the decay spelling's existing lowering. A
+      copy there would be a needless behaviour change for a mutating callee,
+      and it is pinned with an `AV-NOT` on the helper name. Relatedly, the
+      domain crossing is intercepted ONLY when the domain actually has to
+      cross -- which is why the sweep measured **0 moved** for the second wave
+      running.
+  **REPORTED, NOT STRETCHED -- four shapes deliberately left refusing**, each
+  verified to keep a located rejection: the memcpy object-representation
+  DEST direction (`memcpy(&x, raw, sizeof x)`; this entry's acceptance line
+  said "source/dest" but the corpus needs only source); the
+  implicit-conversion spelling `print_hex(raw, n)` with no cast, which arrives
+  as a `BitCast` node and would have muddied the sweep; a MEMBER byte array
+  `(unsigned char *)s.buf`, since the matcher requires a `DeclRefExpr`; and a
+  partial or windowed view (`(unsigned char *)&raw[1]`, `memcpy(raw, &x, 2)`),
+  for which the copy-out has no windowed form. All four are pinned as
+  negatives rather than left to chance.
+  ADVERSARIAL PROBES: `f((u8*)a, a)` and `f((u8*)&a, (u8*)&a)` take the
+  aliasing rejection; two DISTINCT arrays both mutably viewed and both written
+  by the callee are byte-identical to native; an over-length read on a 4-byte
+  array (UB in the C) panics `index out of bounds` rather than reading stack
+  garbage.
+  The `byte-view-invalid.c` prose item (5) was **corrected, not weakened** --
+  it claimed `&arr` was wholly out of scope, and its `array-base.c` sub-unit
+  (`int a[3]`) is now explicitly the REJECTING side of the symmetry pin.
+  RUN and CHECK lines untouched.
+  Gate 1056/1056 (1052 + 4 new), clippy 57 (+0) at epoch-7, binding both axes
+  flat, CTestSuite 220/220, Cpp17Suite 35/35, golden sweep over 1108 sources
+  with **0 MOVED** (2 newly emitting, both the new tests). All re-verified
+  independently in the main tree.
+  **WAVE 3, the residue (NOT scheduled):** `scanf %f` for the last two family
+  members, and the four shapes listed above if demand ever appears.
 
 - [ ] FR-228 (opened 2026-09-09, found by the FR-224 implementation's own
   byte-diff oracle while trying to admit `abort`): **EVERY EMITTED CRATE HAS
