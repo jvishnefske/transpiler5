@@ -13595,6 +13595,39 @@ piece and becomes FR-45.
       exec  13 PASS / 92     lib  28 PASS / 160
   **BLOCKER-SET DEPTH over the 148 non-passing cases that reach the importer:**
       48 need 1 fix   19 need 2   33 need 3   48 need 5
+  **CORRECTED 2026-09-09: EVERY DEPTH ABOVE IS A LOWER BOUND, NOT A COUNT, AND
+  THE INSTRUMENT CANNOT BE MADE EXACT.** `--recover` drops whole TOP-LEVEL
+  ITEMS: the importer bails at the first error in a body, recovery discards
+  that entire function, and nothing further inside it is ever attempted. So
+  every blocker INTERIOR to a rejected function is structurally invisible.
+  Measured instance -- `B01_synthetic/004_nineality_sieve` reports depth 1
+  (`argv`) and needs AT LEAST FOUR: `argv`, the `strtol` family with an
+  `endptr` out-parameter, `fprintf` to `stderr`, and a pointer-identity test
+  of `endptr` against `argv[1]`. None of the latter three can surface while
+  `main` is dropped. **This means "48 need 1 fix" is not "48 are one fix
+  away"** -- it is "48 show one blocker at recovery granularity", which is the
+  first-failure error wearing a set-cover costume, and it is why FR-223's own
+  ranked item (3) "argv support" was understated as a single fix.
+  `scripts/tractor-census.py` now (a) labels the depth a LOWER BOUND, (b)
+  records a per-case `dropped_items` count, and (c) SPLITS the sole-blocker
+  table into CONFIRMED (no dropped items, so the fix really does clear the
+  case at the emit stage) and PARTIAL (a dropped item hides an unknown
+  remainder). Re-measured with the fixed tool, `argv` moves to PARTIAL and the
+  `libc:` family stays CONFIRMED -- which is the independent confirmation of
+  the manual reading above.
+  **A SECOND BLIND SPOT, FIXED:** when recovery drops `c_main`, a BIN crate
+  cannot be emitted at all ("the input does not define a 'main' function"), so
+  NO crate directory and NO progress JSON were written and the census scored
+  those cases depth 0 -- no information, for exactly the cases whose only
+  function failed. `emitrust-cc`'s own diagnostic names the remedy, so the
+  tool now retries as `--crate-type=lib`. That recovers 6 cases. It does NOT
+  recover the other 48, which fail in clang's PARSER on a missing header
+  before any import happens; those two classes are now distinct `notes` values
+  because their remedies differ entirely.
+  **AND THE TWO 48-CASE COHORTS IN THIS ENTRY ARE NOT THE SAME 48** (see
+  FR-225): the "48 need 5" are SPHINCS+ **lib** extractions, while the "48
+  openssl" are SPHINCS+ **exec** KAT drivers. Same 28 source files, different
+  TARGET CLOSURE.
   **AND THE 5-FIX SET CLEARS +82 EMIT -- BUT ALL 82 ARE `lib`, ZERO ARE
   `exec`.** Clearing emit is not PASS: a lib case must then export a
   dlsym-able symbol. That is FR-178's finding, and the three-stage check
@@ -13742,6 +13775,72 @@ piece and becomes FR-45.
   for THIS corpus and a bad general doctrine -- reimplementing a dependency
   does not scale and silently forks its semantics. It is recorded so the
   option is visible, not because it should be the plan.
+
+- [ ] FR-225 (opened 2026-09-09, from re-deriving FR-223 against the corpus
+  itself rather than against its case list): **THE 252-CASE CORPUS IS 125
+  PROGRAMS, AND ONE OF THEM IS 128 CASES.**
+  `test_case` is a SYMLINK in 127 of the 252 cases -- `tractor-eval.discover`
+  documents this and follows it correctly, so the SCORE is right; what was
+  never done is resolving those links to ask how many DISTINCT programs the
+  corpus contains. Measured by `os.path.realpath` over every case:
+      252 cases  ->  125 distinct source trees
+      124 trees are 1 case each;  ONE tree is 128 cases (51% of the corpus)
+  The 128 are SPHINCS+, all sharing
+  `005_sphincs_PQCgenKAT_sign_blake_128f_simple/test_case`, differing only in
+  build configuration (PARAMS macro, hash function) and in what the harness
+  asks for: **48 exec + 80 lib**.
+  **THE SCORE RESTATED HONESTLY: 41/252 cases IS 41/124 ORDINARY PROGRAMS
+  (33%) PLUS 0/128 SPHINCS+ CASES.** Every per-case ranking the project has
+  ever done was half-dominated by one program's configuration count. This is
+  the corpus-level form of the same counting error FR-221 hit at site level,
+  and it is why that entry's "80 of them one file built 128 ways" was an
+  understatement rather than an anomaly.
+  **WHAT IT IMPLIES ABOUT WHERE THE CASES ARE:** the ordinary cohort has a
+  hard ceiling of 124, so its entire remaining prize is **83 cases**. SPHINCS+
+  alone is **128**. Nothing else on the board is within a factor of five.
+  **BUT THE REACHABLE SPHINCS+ PRIZE IS 20, NOT 128, AND THE TAXONOMY SAYS SO
+  WITHOUT ANY NEW WORK.** The 80 lib cases are only **FOUR distinct exported
+  symbols**, 20 configurations each:
+   - `initialize_hash_function(spx_ctx *ctx)` -- ONE struct pointer,
+     **IMPORT/EXPORT CLASS 1, exportable**. 20 cases.
+   - `prf_addr(unsigned char *out, const spx_ctx *ctx, const uint32_t addr[8])`
+   - `gen_message_random(R, sk_prf, optrand, m, mlen, ctx)`
+   - `hash_message(digest, tree, leaf_idx, R, pk, m, mlen, ctx)`
+     -- three, four and five reference parameters respectively, with output
+     buffers whose lengths are SPX_N macros the signature never states.
+     **FR-181's HARD NO-GO, verbatim: multi-reference C-ABI exports.** 60
+     cases, unreachable without overturning a recorded NO-GO. `m`/`mlen` is a
+     declared pair (CLASS 2) but the other buffers are not, and one
+     undeclarable length is enough to refuse the whole signature.
+  So the corpus's largest lever is `initialize_hash_function` at **20 cases**,
+  and it is gated behind the 5-fix import package the census measured for
+  every SPHINCS+ lib case:
+      aliasing mutable pointer arguments      non-constant array size
+      string function argument must designate a char array
+      the address of a scalar object cannot be passed as a slice parameter
+      unsupported pointer cast (ArrayToPointerDecay)
+  **THE 48 exec CASES ARE STRICTLY HARDER THAN THE 80 lib ONES, and the reason
+  is TARGET CLOSURE, not scope** -- they are the same 28 source files. The lib
+  targets' closures exclude `rng.c`; the bin target's closure includes it
+  through `PQCgenKAT_sign.c` -> `randombytes`, which is the whole of why
+  openssl gates them. So libcrypto in the devshell yields **ZERO cases by
+  itself**: it converts 48 unmeasurable cases into measurable ones, which then
+  face the 5-fix package over a 28-file whole-program closure PLUS a working
+  `main`. **FR-223 ranked that item (1); on this evidence it is LAST.**
+  RANKED PATH FORWARD, REPLACING FR-223's:
+   1. **`initialize_hash_function`, 20 cases** -- the 5-fix package, then a
+      CLASS 1 export. Costed as a package; no member of it is worth anything
+      alone, which is exactly what FR-221 measured when it deleted one member
+      and got +0.
+   2. **FR-224's shim table, +4 to +6** -- small, independent, in flight.
+   3. **argv, up to +5** but NOT one fix (see FR-223's correction).
+   4. **The other three SPHINCS+ symbols, 60 cases** -- blocked on FR-181's
+      HARD NO-GO. Do not start without overturning it first.
+   5. **openssl in the devshell** -- a measurement prerequisite with no direct
+      yield.
+  ACCEPTANCE: none of the above is implemented by this entry. It is a
+  measurement, and its claim is that the ranking above is the one the corpus
+  supports.
 
 - [x] FR-220 (opened and LANDED 2026-09-09 from an owner question -- "is there
   a way to not emit dead code and remove the override"): **THE ANSWER WAS NOT
