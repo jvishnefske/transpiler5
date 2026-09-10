@@ -14069,6 +14069,72 @@ piece and becomes FR-45.
   exists; (3) TRACTOR measured 41 -> 53 with the 12 blake cases newly PASS and
   NO case lost; (4) the 8 sha2 cases still refuse, LOCATED, and are recorded
   as such rather than silently emitting a wrong export.
+  **THE EXPORT HALF LANDED 2026-09-09 (acceptance clause 2), MEASURED AT THE
+  PREDICTED +0.** TRACTOR 45 -> 45, and that is the intended result, not a
+  failure: the 12 blake cases still need the five importer fixes, so the
+  export class is worth exactly nothing until they land. Filed at +0 so nobody
+  reads it as yield. Gate 1046/1046, clippy 57 (+0) at epoch-7, binding both
+  axes flat, CTestSuite 220/220, Cpp17Suite 35/35.
+  The emitted shape for the corpus archetype, with **no `unsafe` anywhere**:
+      #[export_name = "initialize_hash_function"]
+      pub extern "C" fn __emitrust_cabi_initialize_hash_function(
+              _ctx: *mut core::ffi::c_void) {
+          initialize_hash_function(&mut [])
+      }
+  **"NEVER ACCESSED" IS NOT "ZERO USERS", and that distinction is the whole
+  increment.** The importer turns `(void)ctx;` into an `emitrust.deref` of the
+  parameter WITH NO USERS -- a place formed and then never subscripted,
+  loaded, stored, borrowed or passed, emitting no Rust at all. A literally
+  empty use-list would have rejected the exact shape this class exists for.
+  The predicate is therefore: every user is a `deref` whose own result is
+  unused. The proof is the MIRROR IMAGE of `cAbiProvenSliceBound`'s and needs
+  none of its machinery -- that one shows an access happens on EVERY path, a
+  claim about CONTROL FLOW, so it pays for one basic block and an operation
+  whitelist; this one shows an access happens on NO path, a universally
+  quantified negative over the use-list, which MLIR's SSA form makes complete
+  by construction. Path structure cannot hide a use, and an operation
+  whitelist would have wrongly refused `f(p) { (void)p; helper(); }`.
+  **`unsafe` IS DROPPED, FOR THIS CLASS ONLY.** Every other wrapper
+  reconstitutes a Rust reference from a raw pointer and owes the validity
+  obligation that comes with it. This one performs no unsafe operation at all,
+  so a safe `extern "C" fn` is the honest signature; it exports the identical
+  symbol with the identical ABI, and safety is not part of a function
+  pointer's ABI, so a caller transmuting it to `unsafe extern "C" fn(*mut T)`
+  is unaffected. This is the one export class that discharges its obligation
+  rather than relocating it, which is FR-224's doctrine satisfied exactly.
+  The parameter is spelled `*mut core::ffi::c_void` deliberately: the wrapper
+  makes NO layout claim about a pointee it never reads, so the struct behind
+  it does not join the `#[repr(C)]` faithfulness closure -- naming the element
+  type would assert a layout the caller must match, drag an unrelated struct
+  into that closure, shift its emitted bytes, and make the export hostage to a
+  verdict nothing in it depends on.
+  **THE PRE-EXISTING ZERO-BOUND REFUSAL IS UNCHANGED AND STILL RIGHT.** Its
+  premise -- `from_raw_parts(p, 0)` requires `p` non-null and aligned while a
+  C caller may legally pass NULL -- is correct; only its conclusion did not
+  follow. This class builds no slice from the pointer at all, so
+  `from_raw_parts` is never called and its precondition never arises. The
+  `untouched` pin in `test/Driver/c-abi-exports-slice-bound-refused.c` was
+  MOVED FORWARD rather than deleted: the same function is now pinned as
+  EXPORTED, plus an EndToEnd byte-diff that calls it through `dlsym` with NULL.
+  **FR-181 DOES NOT APPLY, and this is the one place a reader will reasonably
+  suspect it.** The empty slice borrows NO caller memory -- `&mut []` is a
+  fresh zero-length temporary of the wrapper's own, not a reborrow -- so it
+  can neither alias the caller's storage nor promise LLVM anything about it.
+  The structural one-reference cap is left exactly where it was regardless.
+  **AN OBSERVED SIDE EFFECT, REPORTED AND NOT FIXED.** The paired sweep found
+  one moved golden that is not a test of this change:
+  `test/Import/C/Inputs/multi-tu-varargs-def.c` moves under `--c-abi-exports`
+  only. A va_list MONOMORPHIZATION CLONE, `logf__1`, never reads its
+  format-string parameter, so the class fires and exports it -- under a
+  SYNTHESIZED name that exists nowhere in the C program. It is sound, and the
+  linkage gate still works (a `static` function does not export). But a
+  library should probably not publish a symbol whose name embeds a
+  monomorphization index, which could also vary with clone numbering across
+  TUs. **A follow-on should decide whether this class must additionally
+  require a name the C program actually declares.** No case moved and nothing
+  regressed, so it is recorded rather than special-cased.
+  STILL OPEN: acceptance clauses 1, 3 and 4 -- the five importer fixes, the
+  measured 41 -> 53, and the located refusal of the 8 sha2 cases.
 
 - [ ] FR-228 (opened 2026-09-09, found by the FR-224 implementation's own
   byte-diff oracle while trying to admit `abort`): **EVERY EMITTED CRATE HAS

@@ -52,10 +52,21 @@
 //    gives every non-const-byte pointer a `&mut` slice, so this shape is over
 //    rule 4 as well; either refusal is correct.)
 //
-// 6. NO ACCESS AT ALL. `untouched` never reads p. The bound would be 0, and
-//    `from_raw_parts(p, 0)` STILL requires p to be non-null and aligned --
-//    while a C caller may legally pass NULL for a pointer nothing reads. A
-//    zero bound is refused rather than exported.
+// 6. NO ACCESS AT ALL -- MOVED, NOT DELETED. `untouched` used to live here,
+//    and FR-226 flipped it: the pin moved FORWARD to
+//    test/Driver/c-abi-exports-unaccessed-pointer.c, where the same function
+//    is now pinned as EXPORTED, and to
+//    test/EndToEnd/c-abi-exports-unaccessed-dlopen.c, which byte-diffs it
+//    against the clang native with NULL as an argument. What is refused here
+//    is unchanged and stays refused: a ZERO BOUND. `from_raw_parts(p, 0)`
+//    still requires p non-null and aligned while a C caller may legally pass
+//    NULL, so a slice is never BUILT from a pointer nothing reads. FR-226's
+//    point is that the conclusion "therefore do not export" does not follow
+//    from that premise -- its wrapper builds no slice at all, it drops the
+//    pointer and passes an EMPTY slice of its own, so `from_raw_parts` is
+//    never called and its precondition never arises. Every shape in THIS file
+//    accesses its pointer, which is why none of them qualifies for that class
+//    and why removing `untouched` did not weaken any of the seven reasons.
 //
 // 7. A SLICE BESIDE A REFERENCE. `both` takes a byte slice and a struct
 //    pointer. That is two references, and FR-181's structural cap is not
@@ -132,12 +143,8 @@ void fill(unsigned char *p) {
 // WARN-DAG: c-abi-exports-slice-bound-refused.c:[[#@LINE+1]]:{{[0-9]+}}: warning: --c-abi-exports: no C-ABI export for 'word_sum': its signature is not all-scalar (a C-ABI entry point may only take and return builtin integer and floating-point types); it stays a plain 'pub fn' and is not reachable by dlsym
 uint32_t word_sum(const uint32_t *p) { return p[0] + p[1]; }
 
-// 6. No access at all: a zero-length slice still demands a non-null pointer.
-// WARN-DAG: c-abi-exports-slice-bound-refused.c:[[#@LINE+1]]:{{[0-9]+}}: warning: --c-abi-exports: no C-ABI export for 'untouched': its signature is not all-scalar (a C-ABI entry point may only take and return builtin integer and floating-point types); it stays a plain 'pub fn' and is not reachable by dlsym
-int untouched(const unsigned char *p) {
-  (void)p;
-  return 7;
-}
+// 6. No access at all is no longer refused; see the header. `untouched` moved
+//    to c-abi-exports-unaccessed-pointer.c.
 
 struct pt { int x; int y; };
 

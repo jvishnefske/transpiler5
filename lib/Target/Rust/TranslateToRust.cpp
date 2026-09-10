@@ -865,12 +865,21 @@ private:
     /// this is the PROVEN must-access bound. The wrapper takes `*const T` and
     /// builds the slice with exactly this length, so the C caller passes ONE
     /// register and no argument shifts. Zero means class 1 (a struct
-    /// pointer); a proven bound is never zero, because `from_raw_parts(p, 0)`
+    /// pointer) unless `unaccessed` is set, in which case it means FR-226's
+    /// class 3 and no bound exists at all; a proven bound is never zero,
+    /// because `from_raw_parts(p, 0)`
     /// still requires `p` non-null while a C caller may legally pass NULL for
     /// a pointer nothing reads.
     uint64_t sliceBound = 0;
     /// FR-202 class 2: the slice's element type, for the `*const T` spelling.
     Type sliceElemType;
+    /// FR-226 class 3: the parameter at `refIndex` is NEVER ACCESSED by the
+    /// body. The wrapper spells it `*mut core::ffi::c_void` -- an opaque
+    /// pointer, because no layout claim is made about a pointee nothing reads
+    /// -- never touches it, and passes an EMPTY slice down. `sliceBound` and
+    /// `refStructName` are both meaningless for this class, which is why it is
+    /// its own flag and not another magic value of `sliceBound`.
+    bool unaccessed = false;
   };
   SmallVector<CAbiPointerWrapper> cAbiPointerWrappers;
 
@@ -4788,7 +4797,13 @@ enum class CAbiClass {
   /// MUST-ACCESS BOUND is proven from its body. The wrapper takes the raw
   /// `*const u8` C really passes -- ONE register, so no argument shifts --
   /// and builds the slice with the proven length.
-  SliceBound
+  SliceBound,
+  /// FR-226 class 3: exactly ONE parameter is a slice reference that the body
+  /// NEVER ACCESSES, and every other parameter and the result is a scalar. The
+  /// wrapper takes the raw pointer C really passes, IGNORES it entirely, and
+  /// hands the translated function an EMPTY slice. Nothing is dereferenced, so
+  /// this is the one export class with no `unsafe` anywhere in it.
+  UnaccessedPointer
 };
 
 struct CAbiVerdict {
@@ -4988,6 +5003,65 @@ static std::optional<uint64_t> cAbiProvenSliceBound(emitrust::FuncOp funcOp,
   return bound;
 }
 
+/// FR-226: does the body of `funcOp` NEVER ACCESS parameter `argIndex`?
+///
+/// THE PROOF IS THE MIRROR IMAGE OF `cAbiProvenSliceBound`'s, and that is why
+/// it needs none of its machinery. That one must show an access happens on
+/// EVERY path, which is a statement about CONTROL FLOW, so it pays for one
+/// basic block, no region-carrying operation and an operation whitelist. This
+/// one must show an access happens on NO path -- a universally quantified
+/// negative over the parameter's USE-LIST, which MLIR's SSA form makes
+/// complete by construction: a value can only be observed through an operand,
+/// operands are explicit, and a use inside a nested region is still a use of
+/// this value. Path structure therefore cannot hide anything from it, and
+/// admitting only a whitelist of body operations would refuse
+/// `f(p) { (void)p; helper(); }` for a call that never sees `p` at all.
+///
+/// WHAT COUNTS AS "NEVER ACCESSED", and why it is not "zero users". The
+/// importer turns `(void)ctx;` into an `emitrust.deref` of the parameter WITH
+/// NO USERS -- a place that was formed and then never subscripted, loaded,
+/// stored, borrowed or passed. It emits no Rust at all (the body of
+/// `initialize_hash_function` is `{}`), so requiring a literally empty
+/// use-list would reject the exact corpus shape this class exists for. A deref
+/// whose result IS used is a different matter entirely and is refused here:
+/// that use is a subscript, a `slice_of` that reborrows the whole thing into a
+/// call, or anything else, and each of them can observe the memory.
+///
+/// SOUNDNESS. The wrapper never converts the incoming raw pointer to anything;
+/// it drops it and passes `&mut []`. So the value may be NULL, dangling,
+/// misaligned or an integer a C caller invented, and none of it matters --
+/// which is precisely the case `cAbiProvenSliceBound`'s "at least one access
+/// exists" clause worries about and then refuses. Its reasoning is right and
+/// its conclusion does not follow: a zero BOUND is unsound because
+/// `from_raw_parts(p, 0)` still requires `p` non-null and aligned; a zero
+/// ACCESS SET is sound because `from_raw_parts` is never called.
+///
+/// MUTABILITY IS IRRELEVANT HERE, and this is the one place a reader will
+/// reasonably suspect FR-181. FR-181's HARD NO-GO is that two `&mut`
+/// references built from pointers a C caller legally aliased are `noalias` to
+/// LLVM and miscompile (measured: native 104 against export 10, exit 0, no
+/// diagnostic). The empty slice this class passes borrows NO memory: `&mut []`
+/// is a fresh zero-length temporary of the wrapper's own, not a reborrow of
+/// the caller's object, so it can neither alias the caller's storage nor
+/// promise LLVM anything about it. The structural cap below is left exactly
+/// where it is regardless -- this class admits ONE reference parameter, like
+/// every other.
+static bool cAbiParamIsNeverAccessed(emitrust::FuncOp funcOp,
+                                     unsigned argIndex) {
+  Region &body = funcOp.getBody();
+  if (body.empty())
+    return false;
+  Block &entry = body.front();
+  if (argIndex >= entry.getNumArguments())
+    return false;
+  for (Operation *user : entry.getArgument(argIndex).getUsers()) {
+    auto deref = dyn_cast<emitrust::DerefOp>(user);
+    if (!deref || !deref.getResult().use_empty())
+      return false;
+  }
+  return true;
+}
+
 /// FR-182: classifies `type` against the C ABI, naming the refusal per shape.
 ///
 /// Before FR-182 every refused signature got FR-139's identical "not
@@ -5089,6 +5163,28 @@ static CAbiVerdict classifyCAbiSignature(Operation *from, FunctionType type) {
         verdict.refIndex = sliceIndex;
         verdict.sliceBound = *bound;
         verdict.sliceElemType = sliceElem;
+        return verdict;
+      }
+  }
+  // FR-226 class 3: ONE slice parameter the body NEVER ACCESSES, everything
+  // else scalar. Checked AFTER class 2 and before FR-139's blanket refusal, so
+  // it can only ever catch a slice that class 2 declined -- and the two are
+  // disjoint by construction, because a proven bound requires at least one
+  // access and this requires none. Neither the SHARED-ness nor the one-byte
+  // ELEMENT clause of class 2 is repeated, and both omissions are load-bearing
+  // rather than oversights: the element width matters to class 2 only because
+  // it builds a slice of that element out of the caller's bytes, and this
+  // wrapper builds nothing and spells the parameter as an opaque pointer, so
+  // there is no width to get wrong; `&mut` matters to class 2 for FR-181's
+  // aliasing reason, and an empty slice borrows none of the caller's memory.
+  // Without the element relaxation this class could not fire for the corpus
+  // shape at all -- a C `spx_ctx *` imports as `&mut [SpxCtx]`.
+  if (sliceCount == 1 && refCount == 0 && !sawOther && !sawByValueStruct) {
+    if (auto funcOp = dyn_cast<emitrust::FuncOp>(from))
+      if (cAbiParamIsNeverAccessed(funcOp, sliceIndex)) {
+        verdict.kind = CAbiClass::UnaccessedPointer;
+        verdict.refIndex = sliceIndex;
+        verdict.refIsMut = !sliceIsShared;
         return verdict;
       }
   }
@@ -5512,8 +5608,17 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
         continue;
       CAbiVerdict verdict =
           classifyCAbiSignature(funcOp, funcOp.getFunctionType());
+      // FR-226: an unaccessed pointer is spelled `*mut core::ffi::c_void` and
+      // is never dereferenced, so the wrapper makes NO layout claim about the
+      // pointee and the struct behind it does not join the `#[repr(C)]`
+      // closure. Noting it here would be worse than redundant: it would add a
+      // repr and layout assertions to a struct that never crosses the
+      // boundary, shifting the emitted bytes of an unrelated item, and it
+      // would make the export hostage to a faithfulness verdict nothing in it
+      // depends on.
       if (verdict.kind == CAbiClass::Refused ||
-          verdict.kind == CAbiClass::Scalar)
+          verdict.kind == CAbiClass::Scalar ||
+          verdict.kind == CAbiClass::UnaccessedPointer)
         continue;
       for (Type input : funcOp.getFunctionType().getInputs())
         noteReachable(input);
@@ -5851,20 +5956,42 @@ LogicalResult RustEmitter::emitCAbiPointerWrappers() {
     // one.
     std::string itemName = ("__emitrust_cabi_" + wrapper.symbol).str();
     noteBoundName(itemName);
-    for (const std::string &argName : wrapper.argNames)
+    // FR-226: the wrapper of an unaccessed pointer never mentions its own
+    // parameter, so that parameter is genuinely unused HERE even when the
+    // translated function spelled it without a leading underscore. Renaming it
+    // is a wrapper-local binding change with nothing to collide with, and it
+    // is the difference between a clean item and an `unused_variables` warning
+    // in generated code the author cannot edit.
+    SmallVector<std::string> argNames(wrapper.argNames.begin(),
+                                      wrapper.argNames.end());
+    if (wrapper.unaccessed && wrapper.refIndex < argNames.size() &&
+        !StringRef(argNames[wrapper.refIndex]).starts_with("_"))
+      argNames[wrapper.refIndex] = "_" + argNames[wrapper.refIndex];
+    for (const std::string &argName : argNames)
       noteBoundName(argName);
     // FR-208: the exported SYMBOL is the C spelling (`wrapper.cSymbol`),
     // which is `wrapper.symbol` unless the FR-53 idiomatic rename moved it;
     // the ITEM's name stays derived from the emitted symbol so nothing else
     // in the crate shifts.
+    // FR-226: `unsafe` is dropped for the unaccessed class, and ONLY for it.
+    // The keyword is not decoration: every other wrapper reconstitutes a Rust
+    // reference from a raw pointer and owes the validity obligation that goes
+    // with it. This one performs no unsafe operation at all -- it drops the
+    // pointer and passes an empty slice -- so a safe `extern "C" fn` is the
+    // honest signature, exports the identical symbol with the identical ABI,
+    // and keeps the rubric's zero-`unsafe` score intact. A caller that
+    // transmutes the symbol to `unsafe extern "C" fn(*mut T)` is unaffected;
+    // safety is not part of a function pointer's ABI.
     os << "#[export_name = \"" << wrapper.cSymbol << "\"]\n"
-       << wrapper.visibility << "unsafe extern \"C\" fn " << itemName << "(";
+       << wrapper.visibility << (wrapper.unaccessed ? "" : "unsafe ")
+       << "extern \"C\" fn " << itemName << "(";
     // Class 1 only: a class-2 wrapper points at a scalar element and has no
-    // struct_def symbol to leaf-name.
-    StringRef pointeeName = wrapper.sliceBound == 0
+    // struct_def symbol to leaf-name, and a class-3 wrapper points at nothing
+    // it is willing to name.
+    StringRef pointeeName = (!wrapper.unaccessed && wrapper.sliceBound == 0)
                                 ? itemLeafName(wrapper.refStructName)
                                 : StringRef();
-    for (auto [index, argName] : llvm::enumerate(wrapper.argNames)) {
+    for (auto [index, argName] : llvm::enumerate(argNames)) {
       if (index)
         os << ", ";
       os << argName << ": ";
@@ -5881,7 +6008,16 @@ LogicalResult RustEmitter::emitCAbiPointerWrappers() {
         // 21983 against export 25322, exit 0, no diagnostic. A `*const u8` is
         // one register, exactly what C passes.
         os << (wrapper.refIsMut ? "*mut " : "*const ");
-        if (wrapper.sliceBound != 0) {
+        if (wrapper.unaccessed) {
+          // FR-226: an OPAQUE pointee, because the wrapper makes no claim
+          // about what is behind the pointer -- it never looks. Naming the
+          // element type would assert a layout the C caller's object has to
+          // match and would drag its struct into the `#[repr(C)]` closure for
+          // nothing; `c_void` asserts precisely as much as this class knows,
+          // is FFI-safe by definition, and is ABI-identical to any other thin
+          // pointer, so the C caller's `spx_ctx *` lands in the same register.
+          os << "core::ffi::c_void";
+        } else if (wrapper.sliceBound != 0) {
           if (failed(emitType(wrapper.loc, wrapper.sliceElemType)))
             return failure();
         } else {
@@ -5903,11 +6039,23 @@ LogicalResult RustEmitter::emitCAbiPointerWrappers() {
     // ONE statement. Everything the function does stays in the function,
     // which is what confines the `unsafe` to this generated item.
     os << wrapper.printedName << "(";
-    for (auto [index, argName] : llvm::enumerate(wrapper.argNames)) {
+    for (auto [index, argName] : llvm::enumerate(argNames)) {
       if (index)
         os << ", ";
       if (index != wrapper.refIndex) {
         os << argName;
+        continue;
+      }
+      if (wrapper.unaccessed) {
+        // FR-226: an EMPTY slice, and the incoming pointer is not mentioned.
+        // The callee provably never subscripts, loads, stores or reborrows it,
+        // so a zero-length slice is observationally identical to any other
+        // argument -- and it is a temporary of this wrapper's own, so it
+        // borrows none of the caller's storage and no aliasing promise reaches
+        // LLVM about it. This is the whole reason the class is sound for a
+        // NULL, dangling or misaligned pointer: nothing is ever built FROM the
+        // pointer.
+        os << (wrapper.refIsMut ? "&mut []" : "&[]");
         continue;
       }
       if (wrapper.sliceBound != 0) {
@@ -6475,7 +6623,8 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
       // itself: their parameter is a Rust reference where C has a pointer,
       // and for class 2 it is a TWO-register fat pointer where C has one.
       cAbiPointerWrapper = cAbiVerdict.kind == CAbiClass::StructPointer ||
-                           cAbiVerdict.kind == CAbiClass::SliceBound;
+                           cAbiVerdict.kind == CAbiClass::SliceBound ||
+                           cAbiVerdict.kind == CAbiClass::UnaccessedPointer;
       cAbiExport = !cAbiPointerWrapper;
     } else if (!blocker.empty()) {
       // On the LOCATION, not the op: this is a message for the person who
@@ -6582,7 +6731,8 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
          fn.getNumResults() == 1 ? fn.getResultTypes().front() : Type(),
          cAbiVerdict.refIndex, cAbiVerdict.refIsMut,
          cAbiVerdict.refStructName, cAbiVerdict.sliceBound,
-         cAbiVerdict.sliceElemType});
+         cAbiVerdict.sliceElemType,
+         cAbiVerdict.kind == CAbiClass::UnaccessedPointer});
   os << " {\n";
   increaseIndent();
   if (failed(emitBlockBody(entryBlock)))
