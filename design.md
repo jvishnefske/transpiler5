@@ -13920,13 +13920,49 @@ piece and becomes FR-45.
   cannot be passed as a slice parameter". Those 60 cases need those fixes
   **plus** the multi-reference export NO-GO overturned, so FR-225's ranking of
   them last is unchanged.
-  ACCEPTANCE: (1) `utils.c:79`'s two-reslice shape imports, by the FR-201
-  granularity route or `split_at_mut`, with a runtime byte-diff pin; (2) a
-  pointer parameter with no accesses in the body exports with the C ABI and a
-  bare symbol, refusing located when any access exists; (3) TRACTOR measured
-  41 -> 53 with the 12 blake cases newly PASS and NO case lost; (4) the 8 sha2
-  cases still refuse, LOCATED, and are recorded as such rather than silently
-  emitting a wrong export.
+  **CORRECTED 2026-09-09, SAME HOUR, BEFORE ANY OF IT WAS DISPATCHED: THE
+  HEADLINE OF THIS ENTRY IS WRONG. IT IS NOT TWO FIXES. THE CENSUS'S FIVE WAS
+  RIGHT, AND I REACHED "ONE" BY COMMITTING THE FIRST-FAILURE ERROR AT
+  SINGLE-CASE LEVEL -- ONE ENTRY AFTER WRITING FR-225 ABOUT IT.**
+  `emitrust-cc` in STRICT mode STOPS AT THE FIRST ERROR. I read "exactly one
+  error" off twenty strict runs and concluded one blocker. Recovery does not
+  stop: it stubs every rejected item and names each reason. On the same case
+  and the same target closure it yields **14 stubbed top-level items across
+  FIVE distinct blockers**:
+      6  the address of a scalar object cannot be passed as a slice parameter
+      4  non-constant array size
+      2  unsupported pointer cast (ArrayToPointerDecay)
+      1  aliasing mutable pointer arguments (two arguments borrow 'buffer')
+      1  string function argument must designate a char array
+  which is the census's set exactly. **The 20 cases all report the same FIRST
+  error because emission halts there, not because it is their only one.**
+  And ALL FOURTEEN must import, because `tractor-eval.py`'s own contract is
+  "**STRICT MODE ONLY: never `--recover`, never `--incremental`. The rubric
+  awards no partial credit**" -- a crate whose 13 unrelated functions are
+  `unimplemented!()` scores zero even though the ONE dlsym'd symbol works.
+  **REVISED COST: the 12 blake cases need the census's FIVE importer fixes
+  PLUS the unaccessed-pointer export -- SIX, not two.** Still the largest
+  measured lever in the corpus, at three times the price this entry first
+  quoted.
+  **WHAT SURVIVES THE CORRECTION, all of it independently verified:** the
+  export analysis is untouched -- a C `T *` parameter imports as `&mut [T]`
+  and CLASS 1 cannot fire; the body is `{ (void)ctx; }` so CLASS 2 has zero
+  accesses to bound; the unaccessed-pointer class is sound and needs no
+  `unsafe`; the harness confirms it wants `extern "C" fn(*mut Ctx)` with
+  `in == out`; and the yield is **12, not 20**, on the blake/sha2 split. Only
+  the import-side cost was wrong.
+  **THE METHOD LESSON, which is the durable part: A STRICT-MODE ERROR IS A
+  FIRST-FAILURE READING OF A SINGLE CASE.** Never read a case's blocker set
+  from strict output, however many cases agree -- twenty agreeing runs are
+  twenty first failures, not corroboration. Re-run with `--recover` and COUNT
+  THE STUBS. This is now enforced as a rule in CLAUDE.md.
+  ACCEPTANCE, revised: (1) all five census blockers import for this target
+  closure, verified by `--recover` producing **zero stubs**, not by strict
+  reporting no error; (2) a pointer parameter with no accesses in the body
+  exports with the C ABI and a bare symbol, refusing located when any access
+  exists; (3) TRACTOR measured 41 -> 53 with the 12 blake cases newly PASS and
+  NO case lost; (4) the 8 sha2 cases still refuse, LOCATED, and are recorded
+  as such rather than silently emitting a wrong export.
 
 - [ ] FR-227 (opened 2026-09-09, measuring the export boundary rather than the
   importer): **THE EXPORT GATE, NOT THE IMPORTER, IS WHERE THIS CORPUS'S

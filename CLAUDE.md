@@ -64,6 +64,20 @@ honest figure was +4 to +6. Assume you are about to do this too.
 zero if all 83 also need four other fixes. Use the census's set-cover, not
 the frequency column.
 
+**A STRICT-MODE ERROR IS A FIRST-FAILURE READING OF ONE CASE.** `emitrust-cc`
+halts at the first error, so its output tells you a case's FIRST blocker and
+nothing about the rest. Never read a blocker set from strict output — and
+agreement across cases is not corroboration: twenty cases reporting the same
+first error are twenty first failures. Re-run with `--recover` and **count the
+`unimplemented!` stubs**, which is what FR-226 should have done (it read
+"exactly one error" off twenty strict runs; recovery showed 14 stubs across
+five blockers, and the entry had to be corrected within the hour).
+
+**Clearing every blocker is required, not just the ones your symbol needs.**
+`tractor-eval.py` is STRICT MODE ONLY, never `--recover`: a crate whose
+thirteen unrelated functions are `unimplemented!()` scores zero even when the
+one dlsym'd symbol works.
+
 **Clearing a stage is not passing.** The rubric is emit → `cargo build` →
 `dlopen`+`dlsym`, with NO partial credit. A `lib` case that clears emit still
 needs an exportable symbol. Always report which stage a number refers to.
@@ -198,3 +212,10 @@ byte-diff as proof of soundness for these classes:
   pressure comes from `/nix/store` and `~/.cache`; each agent worktree build
   is ~475M.
 - **Concurrency**: max 3 agents. Do not start a build below ~11G free.
+- **The Bash cwd persists across calls, and a `cd` into an agent worktree will
+  silently retarget your next `git commit`, `meson test -C build`, and every
+  relative path you edit.** This happened: an FR entry was written into an
+  agent's worktree and committed on its branch. It was harmless only because
+  the agent had not started editing yet. Start commands that touch the main
+  tree with `cd /home/j/transpiler5 &&`, and check the testlog path meson
+  prints — it names the tree the run actually used.
