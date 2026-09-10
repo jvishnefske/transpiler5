@@ -13659,6 +13659,33 @@ piece and becomes FR-45.
   of the 82 stay SYMBOL_MISSING no matter how good the importer gets.
   **THE CHEAPEST REAL YIELD IS STILL THE 1- AND 2-FIX ROWS**, and they are the
   only rows with `exec` cases in them -- the cases that need no export at all.
+  **CORRECTED AGAIN 2026-09-09, AND THIS ONE IS A DEFECT IN THE INSTRUMENT
+  ITSELF: THE "SOLE BLOCKER, CONFIRMED" COLUMN ABOVE WAS ~92% UNVERIFIED.**
+  Found by the FR-229 spike, not by me, and I had the evidence in front of me
+  and rationalised it away.
+  `RejectionLedger.cpp` prints `item.stubbed ? "stubbed" : "dropped"`, and
+  `tractor-census.py` counted only the string `dropped `. **A STUBBED ITEM
+  HIDES ITS INTERIOR EXACTLY AS A DROPPED ONE DOES** -- the importer bails at
+  the first error inside any item it rejects, either way. Corpus-wide the
+  counts are **138 stubbed against 12 dropped**, so the regex saw almost
+  nothing: **36 of the 39 cases this tool labelled CONFIRMED contained a
+  stubbed item.** In-situ proof rather than argument -- neutralising ONLY the
+  `memcpy` in `037_..._no_strict_aliasing` makes the NEXT blocker appear in
+  the same function, and `039` then needs a THIRD.
+  **THERE IS NO "CONFIRMED" SET AND THERE CANNOT BE ONE.** Every non-passing
+  case has at least one rejected item -- that is what makes it non-passing --
+  so every blocker set is a LOWER BOUND and every yield figure an UPPER BOUND,
+  full stop. The column has been removed rather than repaired; the tool now
+  reads per-item `status` out of the progress JSON instead of regexing stderr,
+  prints SINGLE-BLOCKER CASES as an explicit upper bound, and adds a
+  REJECTED ITEMS PER CASE histogram so a reader can see how much code is
+  hidden behind the stubs.
+  **AND THE INSTRUMENT NOW HAS ITS FIRST CALIBRATION POINT, WHICH IS WORTH
+  MORE THAN THE COLUMN WAS: it predicted +14 EMIT for the system-header fix
+  and FR-224 delivered +7.** Roughly HALF -- three of the fourteen had a
+  second blocker behind the stub and one was refused on policy. **Discount
+  this table by about a factor of two until there are more data points**, and
+  read the 5-fix row's +82 as "at most 82", not as a plan.
   **AND THE 5-FIX SET CLEARS +82 EMIT -- BUT ALL 82 ARE `lib`, ZERO ARE
   `exec`.** Clearing emit is not PASS: a lib case must then export a
   dlsym-able symbol. That is FR-178's finding, and the three-stage check
@@ -14135,6 +14162,101 @@ piece and becomes FR-45.
   regressed, so it is recorded rather than special-cased.
   STILL OPEN: acceptance clauses 1, 3 and 4 -- the five importer fixes, the
   measured 41 -> 53, and the located refusal of the 8 sha2 cases.
+
+- [ ] FR-229 (opened and SPIKED 2026-09-09): **THE CHAR-POINTER BYTE-VIEW
+  FAMILY -- GO WITH CONSTRAINTS, 12 PROGRAMS NOT 4, AND THE SPIKE FOUND A
+  DEFECT IN THE CENSUS ON ITS WAY PAST.**
+  **THE BRIEF WAS WRONG IN THREE WAYS AND ALL THREE WERE MEASURED, WHICH IS
+  WHY SPECS ARE WRITTEN AS REFUTABLE LEADS:**
+   1. **It is 12 programs, not 4.** The family is 034/035/036/037/038/039 x
+      {`exec`, `_lib`}, and **035/038 are the `float` variants my brief never
+      mentioned**. Six are `exec`.
+   2. **"CONFIRMED sole blocker" was false for 037/038/039**, proven IN SITU
+      rather than argued: neutralise ONLY the `memcpy` in the real corpus file
+      and the NEXT blocker appears in the same function; 039 then needs a
+      THIRD.
+   3. **The cause is a defect in `scripts/tractor-census.py`** -- see FR-223's
+      correction. It counted only `dropped` while the ledger prints
+      `stubbed` OR `dropped`, and a stubbed item hides its interior
+      identically. 138 stubbed against 12 dropped corpus-wide.
+  **THE ZERO-`unsafe` ANSWER TO "THE OBJECT REPRESENTATION OF T", VERIFIED BY
+  BYTE-DIFF ON 22 VECTOR/INPUT PAIRS:** for a scalar, `T::to_ne_bytes(x)` into
+  a synthetic `[u8; N]` local; for an aggregate, per-field `to_ne_bytes`
+  scattered **at the field's byte offset in C declaration order**, which makes
+  Rust's own struct layout irrelevant and is exactly why this is sound where
+  `transmute` is not. **The no-padding proof is ALREADY IN THE IR** as
+  `emitrust.abi_layout = {align, offsets, size}` on `struct_def`, clang's own
+  numbers. **No new dialect ops are needed** for any of the four shapes;
+  `f32`/`f64::to_ne_bytes` flow through `emitrust.call_opaque` unchanged, and
+  only `neBytesTypeName` (`ImportC.cpp:3019`, integer-only) has to widen.
+  Machinery that already exists: `emitWideByteStore` (`ImportC.cpp:3078`) and
+  its `emitWideByteLoad` twin, `annotateAbiFaithfulness`, and
+  `isByteRegionRecord` -- though that last is only a PARTIAL precedent, since
+  it demands `unsigned char` leaves and REPLACES the struct with `[u8; N]`.
+  **FOUR SHAPES THAT MUST STAY LOCATED REJECTIONS, two of them measured
+  miscompiles:**
+   1. **PADDED AGGREGATES.** One program, one clang `-O0` binary, one run,
+      same struct value, two different byte strings -- `0100000007000000` on a
+      clean stack against `01dddddd07000000` after dirtying the frame. The
+      padding is INDETERMINATE, and this is precisely the byte-diff oracle's
+      uninitialized-memory blind spot (FR-212). Admit only when
+      `size == sum(field sizes)` and the offsets are contiguous, read off
+      `abi_layout`.
+   2. **A BYTE VIEW WHOSE CALLEE WRITES, WITH NO WRITE-BACK.** Measured:
+      native `-1431655766` against a naive Rust `1`, silently wrong. Always
+      write back (`from_ne_bytes` after the call) or refuse. Dead-store
+      elimination removes the write-back when the object is never read again,
+      confirmed in the round-trip.
+   3. **AN ESCAPING BYTE VIEW.** `unsigned char *p = (unsigned char *)&x;` is
+      already refused as `pointer assigned a non-address value`, and **that
+      guard is what makes the non-escape premise hold for free -- do not
+      touch it.**
+   4. **THE GLOBAL + `*p++` AGGREGATE WALK.** `byte-region-aggregates-invalid.c`
+      pins it deliberately. 036 differs on both axes (local object, `p[i]`
+      indexed), so admitting it means **SPLITTING that pin, not deleting it.**
+  **HONEST YIELD LADDER, in PROGRAMS at the PASS stage** (A = scalar byte view
+  at a slice arg, Af = float widening, B = padding-free aggregate view,
+  C = memcpy with an object-representation source, D = the i8/u8 domain
+  crossing, E = `(unsigned char *)&arr`, S = `scanf %f`, out of family):
+      A            -> +2      A+Af         -> +3      A+Af+B  -> +5
+      +C+D         -> +7/+8   +E           -> +10     +S      -> +12
+  **Non-family residue is ZERO for 10 of the 12**, measured by replacing each
+  `driver` body with a supported byte print in the real corpus sources; 035
+  and 038 report only `scanf %f`. The `_lib` twins are **not** FR-224's export
+  trap -- their exported signature is a by-value scalar and it emits
+  `#[no_mangle] pub extern "C" fn driver(_x: i32)` with zero `unsafe` -- but
+  they die at emit, so **the lib half is PROJECTED, not measured.**
+  **A HARD VERIFIER STOP WORTH KNOWING:** `slice_of` cannot bridge i8 to u8
+  (`result slice element type 'ui8' does not match the base element type
+  'i8'`). The zero-`unsafe` route is a copy-in/copy-out `[u8; N]` view with
+  per-byte `as u8`/`as i8`, which is bit-preserving in Rust and round-trips
+  through the dialect.
+  **THE LARGEST UNRESOLVED UNKNOWN, reported rather than guessed:** where the
+  post-call WRITE-BACK hook goes. `GlobalWriteback` exists for lvalues, but
+  the argument path returns a `Value` while the call op is built by its
+  caller, and `RejectionLedger.cpp:236` states outright that "the method-call
+  path has no writeback flush". It cannot be settled without writing the code.
+  Also unresolved: which rendering the borrow-bundle planner picks for the
+  synthetic byte-view local (probes show both an `&mut [u8]` slice and an
+  owner-bundle method for near-identical inputs) -- both are safe, so the risk
+  is to golden SHAPE, not correctness.
+  GOLDEN MOVEMENT TO EXPECT: the Kernel rejection report pins **1060x**
+  `CStyleCastExpr`, **842x** the scalar-as-slice wording and **6x** the
+  element-type wording. Those are **EVENT counts over kernel sites, not
+  programs** -- they will move and must be re-verified, never re-blessed. Any
+  new wording needs a row in BOTH `RejectionLedger.cpp` and
+  `run_realworld.py`'s `classify_blocker`, which are hand-mirrored by
+  contract; all four current diagnostics classify as `[other]` today.
+  ACCEPTANCE, split into two waves as the spike recommends.
+  **WAVE 1 (A + Af + B, +5 projected):** scalar and padding-free-aggregate
+  byte view at a slice argument, with MANDATORY write-back; float widening of
+  `neBytesTypeName`; padded aggregates, global bases, `*p++` walks and
+  escaping views each refused LOCATED with its own ledger needle; the
+  `byte-region-aggregates-invalid.c` pin SPLIT rather than deleted; runtime
+  byte-diff on all four shapes; TRACTOR measured and reported as PROGRAMS.
+  **WAVE 2 (C + D + E, +5 more):** the memcpy object-representation
+  source/dest, the i8/u8 byte-view domain, and the `&array` cast. D has a
+  verifier-level refusal today and deserves its own spike record.
 
 - [ ] FR-228 (opened 2026-09-09, found by the FR-224 implementation's own
   byte-diff oracle while trying to admit `abort`): **EVERY EMITTED CRATE HAS

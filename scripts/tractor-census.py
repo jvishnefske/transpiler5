@@ -148,11 +148,20 @@ def recover_blockers(case, cc: Path, out_dir: Path, extra_cflags: str):
         proc = run(retry) or proc
         note = "dropped-main"
 
-    # How many top-level items recovery discarded. Any non-zero count means
-    # this case's blocker set is PARTIAL by construction: the interior of a
-    # dropped item is never imported, so its remaining blockers cannot appear.
-    dropped = len(re.findall(r"^\s*\S+:\d+:\d+: dropped ",
-                             proc.stderr or "", re.M))
+    # How many top-level items recovery REJECTED -- stubbed OR dropped.
+    #
+    # THIS COUNTED ONLY `dropped` UNTIL 2026-09-09 AND THAT WAS A REAL DEFECT
+    # IN THIS TOOL. `RejectionLedger.cpp` prints
+    # `item.stubbed ? "stubbed" : "dropped"`, and a STUBBED item hides its
+    # interior exactly as a dropped one does -- the importer bails at the
+    # first error in a body either way, so nothing further inside it is ever
+    # attempted. Corpus-wide the counts are 138 stubbed against 12 dropped, so
+    # the old regex saw almost nothing: 36 of 39 cases this tool called
+    # "SOLE BLOCKER, CONFIRMED" contained a stubbed item, i.e. that column was
+    # ~92% unverified. Read the per-item `status` out of the progress JSON
+    # below instead of regexing stderr, which is why this returns 0 here and
+    # is filled in from the JSON.
+    dropped = 0
 
     if not prog.exists():
         # The case never reached the importer at all -- clang failed to parse
@@ -173,6 +182,11 @@ def recover_blockers(case, cc: Path, out_dir: Path, extra_cflags: str):
 
     blockers = set()
     items = data.get("items") or data.get("entries") or []
+    totals = data.get("totals") or {}
+    dropped = int(totals.get("stubbed", 0)) + int(totals.get("dropped", 0))
+    if not totals:
+        dropped = sum(1 for it in items if isinstance(it, dict)
+                      and (it.get("status") or "") in ("stubbed", "dropped"))
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -296,36 +310,43 @@ def main() -> int:
     for b, n in freq.most_common(12):
         print(f"  {n:4}  {b[:76]}")
 
-    # THE NUMBER PEOPLE RANK ON, so it is split by how much it can be
-    # trusted. A depth-1 case with NO dropped item genuinely needs one fix:
-    # every other item imported, and this was the only complaint. A depth-1
-    # case WITH a dropped item needs one fix TO GET FURTHER -- the dropped
-    # item's interior was never imported, so its remaining blockers cannot
-    # have been counted. Ranking work on the second group as though it were
-    # the first is the first-failure error wearing a set-cover costume.
+    # THE NUMBER PEOPLE RANK ON, and there is no honest way to make it a
+    # lower bound as well as an upper one.
+    #
+    # THIS TOOL ONCE PRINTED A "SOLE BLOCKER, CONFIRMED" COLUMN AND IT WAS
+    # WRONG. The idea was that a case with no REJECTED item had a complete
+    # blocker set -- but every non-passing case has at least one rejected
+    # item, that being what makes it non-passing, and the importer bails at
+    # the FIRST error inside any item it rejects. So a case reporting one
+    # blocker may need one fix or five, and nothing short of making the fix
+    # distinguishes them. Every set below is a LOWER BOUND and every yield an
+    # UPPER BOUND, always.
+    #
+    # MEASURED CALIBRATION, one data point: this tool predicted +14 EMIT for
+    # the system-header fix; FR-224 implemented it and delivered +7. Roughly
+    # HALF, because three of the fourteen had a second blocker behind the stub
+    # and one was refused on policy. Discount accordingly until there are more
+    # data points.
     solo = collections.Counter()
-    solo_partial = collections.Counter()
     for name, v in todo.items():
-        if len(v) != 1:
-            continue
-        (solo_partial if dropped.get(name) else solo).update(v)
-    print("\nSOLE BLOCKER, CONFIRMED (no dropped items, so fixing this ALONE "
-          "clears\nthe case at the EMIT stage) -- the real marginal yield:")
+        if len(v) == 1:
+            solo.update(v)
+    print("\nSINGLE-BLOCKER CASES -- AN UPPER BOUND on what one fix clears at"
+          "\nEMIT, never a promise. The interior of every rejected item is"
+          "\nunimported, so a second blocker can hide behind any of these:")
     if not solo:
         print("  (none)")
-    for b, n in solo.most_common(12):
-        print(f"  +{n:3}  {b[:76]}")
-    if solo_partial:
-        print("\nSOLE BLOCKER, PARTIAL (this case ALSO dropped an item whose "
-              "interior was\nnever imported -- fixing this reveals the next "
-              "blocker, it does not clear\nthe case). DO NOT ADD THESE TO THE "
-              "CONFIRMED COLUMN:")
-        for b, n in solo_partial.most_common(12):
-            print(f"  ?{n:3}  {b[:76]}")
+    for b, n in solo.most_common(14):
+        print(f"  <={n:3}  {b[:76]}")
     print("\nAND AT THE EMIT STAGE ONLY. A `lib` case that clears emit must "
           "still\nexport a dlsym-able symbol before it counts as PASS; check "
           "`kind` in the\nrubric's results.json before quoting any of these "
           "as a yield.")
+    ri = collections.Counter(dropped.get(k, 0) for k in todo)
+    print("\nREJECTED ITEMS PER CASE (how much code is hidden behind the "
+          "stubs --\nmore items means a looser bound):")
+    for k in sorted(ri):
+        print(f"  {ri[k]:4} cases have {k} rejected item(s)")
 
     # SET COVER. Two exclusions, both of which changed the answer materially
     # when they were added, so neither is cosmetic:
@@ -335,21 +356,24 @@ def main() -> int:
     #     in the candidate pool let the optimiser "spend" a fix on it and
     #     report a 4-fix set of +34, which no amount of engineering could
     #     deliver.
-    #   * PARTIAL CASES. A case with a dropped item hides an unknown
-    #     remainder, so counting it as CLEARED asserts something the
-    #     instrument cannot see. Excluding them makes every number below a
-    #     case that really would clear the EMIT stage.
-    #
-    # The result is still EMIT-only: a `lib` case that clears emit must then
-    # export a dlsym-able symbol, which is why the exec/lib split is printed.
+    # The result is EMIT-only and an UPPER BOUND on both counts: a `lib` case
+    # that clears emit must then export a dlsym-able symbol (hence the
+    # exec/lib split), and every case's blocker set is a lower bound because
+    # the interior of its rejected items was never imported. An earlier
+    # version excluded "partial" cases here in the belief that the rest were
+    # verified; there is no such set, so nothing is excluded on that basis
+    # now. Measured calibration: predicted +14 EMIT for the system-header fix,
+    # delivered +7.
     NON_ACTIONABLE = {"unreached-by-import", ""}
     solid = {k: v - NON_ACTIONABLE for k, v in todo.items()}
-    solid = {k: v for k, v in solid.items() if v and not dropped.get(k)}
+    solid = {k: v for k, v in solid.items() if v}
     cands = [b for b, _ in collections.Counter(
         b for v in solid.values() for b in v).most_common(20)]
-    print(f"\nSET COVER over the top {len(cands)} ACTIONABLE blockers, "
-          f"partial cases excluded\n(combinations up to {args.max_combo}); "
-          f"{len(solid)} of {len(todo)} non-passing cases qualify:")
+    print(f"\nSET COVER over the top {len(cands)} ACTIONABLE blockers "
+          f"(combinations up to {args.max_combo});\n{len(solid)} of "
+          f"{len(todo)} non-passing cases have an actionable blocker.\n"
+          f"EVERY FIGURE IS AN UPPER BOUND -- see the note above the "
+          f"single-blocker table.")
     best_by_size = {}
     for k in range(1, args.max_combo + 1):
         best = (0, None)
@@ -378,8 +402,8 @@ def main() -> int:
         "depth_is_lower_bound": True,
         "depth": {str(k): v for k, v in depth.items()},
         "frequency": dict(freq.most_common()),
-        "sole_blocker_confirmed": dict(solo.most_common()),
-        "sole_blocker_partial": dict(solo_partial.most_common()),
+        "single_blocker_upper_bound": dict(solo.most_common()),
+        "rejected_items": dropped,
         "set_cover": {str(k): {"cleared": v[0], "fixes": list(v[1] or [])}
                       for k, v in best_by_size.items()},
     }
