@@ -13715,44 +13715,85 @@ piece and becomes FR-45.
   not patched or measured; SPHINCS+'s post-aliasing chain was enumerated but
   not costed.
 
-- [ ] FR-222 DEFECT (opened 2026-09-09 by the FR-221 spike): **TWO READ-ONLY
-  BORROWS OF ONE OBJECT ARE REFUSED, AND TWO COPIES OF THE SAME RULE
-  DISAGREE ABOUT WHETHER THEY SHOULD BE.**
-  `emitCall`'s aliasing key ignores borrow MUTABILITY, so
-  `f(const S *a, const S *b)` called as `f(p, p + 4)` is refused --
-  **provably wrongly**: with the check disabled it emits
-  `fn tu0_f(a: &[u8], b: &[u8])` with two shared reslices, `cargo build` is
-  clean, and stdout is **byte-identical to the clang -O2 native**. The
-  diagnostic's own word "mutable" is factually wrong for that shape.
-  **THE C++ ARM ALREADY HAS THE RULE RIGHT, AND ITS COMMENT MIS-STATES THE C
-  ARM.** `ImportCExpressions.cpp:3633` (landed by FR-203) reads
-  `if (heldRoot == argRoot && (argIsMut || heldIsMut))`, and its comment at
-  `:3613-3619` asserts *"Two borrows of one object are sound only if BOTH are
-  shared. ... `emitCall` applies the same rule to a free function's arguments;
-  the only thing this adds is that the receiver counts as one of the
-  borrows."* **`emitCall` does not apply the same rule.** The check is
-  duplicated at FOUR non-mutability-aware sites -- `:3140` (direct call),
-  `:3157` (heap arm), `:7314` (FR-93 multi-base dispatch), `:7466`
-  (CallIndirect) -- against two aware ones (`:3633`, `:3745`).
-  THE INCREMENT: make `:3140` and `:3157` mutability-aware, mirroring `:3633`
-  verbatim -- `borrowRoots` carries `{root, path, mut}`, `borrowBackings`
-  carries `{value, mut}`, and the collision is skipped when neither borrow is
-  mutable. **~20 lines, no new ops, no new types, no dialect change.**
-  MEASURED on an evidence patch that was then reverted: **full gate
-  1035/1035**, TRACTOR **41 -> 41 with `newly PASS: []`, `lost PASS: []` and
-  ZERO per-case outcome or detail changes** -- FR-201's additivity signature
-  exactly. The shape battery is byte-unchanged except the one shape that now
-  emits.
-  **THIS IS AN EMIT-STAGE CORRECTNESS WIN WORTH +0 PASS, and it is filed with
-  that label so nobody mistakes it for yield.** It is worth landing anyway: it
-  removes a refusal of a correct program, and it removes a disagreement
-  between two copies of one rule where one copy's comment claims they agree.
-  It is also the prerequisite for any const-shared or MOD/REF widening.
-  The heap arm (`:3157`) is DEAD in the TRACTOR corpus (reason split: 83
-  root-object, 0 heap), so it is fixed for consistency rather than yield.
-  `:7314` and `:7466` were NOT patched or measured -- a follow-on should
-  decide whether the rule belongs in one shared helper rather than four
-  copies, which is the actual root cause of the disagreement.
+- [x] FR-222 DEFECT (opened and LANDED 2026-09-09 by the FR-221 spike): **TWO
+  READ-ONLY BORROWS OF ONE OBJECT WERE REFUSED, AND TWO COPIES OF THE SAME
+  RULE DISAGREED ABOUT WHETHER THEY SHOULD BE.**
+  `emitCall`'s aliasing collision key ignored borrow MUTABILITY, so
+  `f(const S *a, const S *b)` called as `f(p, p + 4)` was refused -- provably
+  wrongly. `:3141` (direct call) and `:3155` (heap arm) are now
+  mutability-aware, mirroring FR-203's `:3633` verbatim: `borrowRoots` carries
+  `{root, path, isMut}`, `borrowBackings` carries `{value, isMut}`, and the
+  collision is skipped when NEITHER borrow is mutable. **+47/-12, no new ops,
+  no new types, no dialect change.**
+  `:3633`'s own comment had asserted *"`emitCall` applies the same rule to a
+  free function's arguments"* -- it did not. Four non-mutability-aware sites
+  against two aware ones.
+  MEASURED: the admitted shape emits `fn tu0_f(a: &[u8], b: &[u8]) -> i32`
+  with two shared reslices, `cargo build --release` clean, stdout
+  **byte-identical to the clang native at both seeds**.
+  **A JUDGEMENT CALL ON MUTABILITY'S SOURCE, worth recording:** it is read off
+  `borrowType`, not `input`. For FR-88's nullable slot `input` is the `Option`
+  WRAPPER while `borrowType` is the synthesized shared `&[u8]` inside it, so
+  reading `input` would have misclassified that borrow.
+  **THE SPIKE'S OWN WITNESS WAS VACUOUS, and the implementing agent caught
+  it.** `b13_native.c` gives its buffer a `main`-local `u8 b[8]`, which lets
+  the Phase-4 owner lift promote the region into `i64` indices -- so it
+  ALREADY PASSED at baseline and would have pinned nothing. The real witness
+  puts the buffer in a struct field (`struct Box { u8 buf[16]; int tag; }`) so
+  the lift cannot promote it and the arguments stay genuine borrows.
+  SIX NEGATIVE SHAPES PINNED with exact wording, all still refused: `f(p, p)`;
+  `f(p, p+1)`; object plus its own field; **mut then shared**; **shared then
+  mut** (a symmetry pin -- a rule reading only the incoming argument would let
+  this through); and the mutable heap two-cursor, which additionally carries a
+  `-NOT` on the object wording for FR-146's null-root safety.
+  **TWO SHAPES ON THE SPEC'S NEGATIVE LIST DO FLIP IN THEIR ALL-CONST
+  SPELLINGS, reported rather than special-cased**: the heap two-cursor with
+  both sides `const unsigned char *`, and object-plus-own-field where the
+  struct is an all-`u8` byte region and both params are const. Both are the
+  direct consequence of `(argIsMut || heldIsMut)` and both emit legal Rust.
+  **Special-casing them back to refusals would have reintroduced exactly the
+  disagreement this entry exists to remove.** The existing
+  `malloc-region-slice-arg-invalid.c` pin is untouched and green because it
+  uses `const char *`, and plain `char` is `Char_S` on x86-64 so
+  `isU8ScalarType` is false and those params stay `&mut [i8]`.
+  **THE DIAGNOSTIC NEEDED NO REWORDING, and the reason is the finding
+  inverted:** "aliasing mutable pointer arguments" is now TRUE wherever it
+  fires, because post-patch it only fires when at least one borrow really is a
+  `MutRefType`. It was FALSE for the shared/shared case before -- that WAS the
+  defect, and fixing the predicate fixed the sentence. The text is pinned
+  verbatim in 10 test files plus 126 times in
+  `test/Kernel/.../rejection-report.txt`, and FR-203 established "one rule,
+  one message" by reusing FR-48's sentence unchanged.
+  Gate **1040/1040**; clippy 57 -> 57 (+0), 294 crates, 0 skipped; binding
+  both axes flat; both corpus ratchets unmoved with manifests untouched;
+  **TRACTOR 41/252 with ZERO per-case outcome or detail changes** -- FR-201's
+  additivity signature reproduced. Golden movement measured twice: a paired
+  1,228-input differential sweep found **exactly one** change, the new test
+  file's own rc 1 -> 0, and the full lit suite covers the `split-file`
+  sub-units the sweep is blind to.
+  **AN INDEPENDENT CONFIRMATION OF FR-221's REASON SPLIT falls out of the
+  zero:** the 83 aliasing cases are still 83, because every corpus site has at
+  least one mutable side -- `merge_sort_lib`'s `le(spritebatch_sprite_t *a,
+  ...)` is non-const in the C, so both borrows type as `&mut` regardless of
+  the callee being read-only.
+  **THIS IS AN EMIT-STAGE CORRECTNESS WIN WORTH +0 PASS**, recorded with that
+  label so no later reader mistakes it for yield.
+  ON UNIFYING THE FOUR COPIES (reported, NOT done): they unify into **TWO**
+  helpers, not one, and the split is not where the duplication looks like it
+  is. `:3141`, `:7349` and `:7501` share a genuinely identical loop body --
+  same prefix-overlap test, same sentence, same `push_back` -- and want one
+  `checkBorrowCollision` helper; folding them would have made this increment
+  three lines instead of twenty. The heap arm should NOT join them (different
+  key space: a synthesized `Value` backing, no path, deliberately null-root
+  per FR-146), nor should the C++ arm (it carries `borrowedThis`/`argIsThis`
+  receiver state no free call has). What all four should share is the
+  PREDICATE, so the sentence exists once in the tree.
+  SEQUENCING, with the risk named: `:7501` (CallIndirect) is cheap -- a
+  fn-pointer call is an ordinary free call and the argument transfers
+  verbatim. **`:7349` (FR-93 multi-base dispatch) needs its own spike**,
+  because it runs INSIDE a per-arm dispatch where `armRoots` is rebuilt per
+  arm, so making it mutability-aware could admit a shape whose arms
+  individually pass but which the FR-93 lowering then re-materialises.
 
 
 - [x] FR-219 (opened and LANDED 2026-09-09; implements FR-209, found by the
