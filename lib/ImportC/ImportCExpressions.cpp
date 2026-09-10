@@ -3095,11 +3095,29 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   // The diagnostic names the ALLOCATION and never a decl: a heap region's
   // root is null, and formatting `root->getName()` on one is exactly the
   // null dereference FR-146 was opened to fix.
-  SmallVector<std::pair<const clang::VarDecl *,
-                        SmallVector<const clang::FieldDecl *, 2>>,
-              4>
-      borrowRoots;
-  SmallVector<Value, 4> borrowBackings;
+  //
+  // FR-222: the key also carries the borrow's MUTABILITY, and a pair whose
+  // BOTH halves are shared does not collide. Two shared borrows of one
+  // object are sound in Rust — that is the whole point of `&` — so
+  // `f(const unsigned char *a, const unsigned char *b)` called as
+  // `f(p, p + 4)` emits two `&[u8]` reslices of one region, builds clean,
+  // and runs byte-identical to the native. Refusing it was a rejection of
+  // a CORRECT program, and the diagnostic's own word "mutable" was
+  // factually wrong for that shape. This is not a new rule: it is exactly
+  // the rule `emitCXXMemberCall` has carried since FR-203
+  // (`heldRoot == argRoot && (argIsMut || heldIsMut)`), whose comment
+  // already asserted that `emitCall` applied it. It did not, until now.
+  // Nothing else moves: a mutable borrow on EITHER side still collides, so
+  // `f(p, p)` / `f(p, p + 1)` over `T *`, an object beside its own field,
+  // every mut+shared pair, and the mutable heap two-cursor all keep their
+  // located rejection verbatim.
+  struct HeldBorrow {
+    const clang::VarDecl *root;
+    SmallVector<const clang::FieldDecl *, 2> path;
+    bool isMut;
+  };
+  SmallVector<HeldBorrow, 4> borrowRoots;
+  SmallVector<std::pair<Value, bool>, 4> borrowBackings;
   for (const PendingBorrow &borrow : borrows) {
     const clang::VarDecl *root = nullptr;
     Value allocBacking;
@@ -3116,6 +3134,11 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
                   emitrust::SliceType::get(IntegerType::get(
                       builder.getContext(), 8, IntegerType::Unsigned))))
             : input;
+    // FR-222: mirrors `emitCXXMemberCall`'s `argIsMut` exactly. A nullable
+    // slot's synthesized `borrowType` is the SHARED byte slice its Option
+    // wraps, so reading mutability off `borrowType` rather than `input`
+    // keeps FR-88's argument on the shared side of the rule.
+    bool borrowIsMut = llvm::isa<emitrust::MutRefType>(borrowType);
     FailureOr<Value> reference =
         emitBorrowArgument(loc, borrow.expr, borrowType, root, &rootPath,
                            &allocBacking);
@@ -3138,25 +3161,37 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
       }
     }
     if (root) {
-      for (const auto &held : borrowRoots) {
-        if (held.first != root)
+      for (const HeldBorrow &held : borrowRoots) {
+        if (held.root != root)
           continue;
-        size_t common = std::min(held.second.size(), rootPath.size());
-        if (llvm::ArrayRef(held.second).take_front(common) ==
+        // FR-222: two borrows of one object are sound only if BOTH are
+        // shared.
+        if (!borrowIsMut && !held.isMut)
+          continue;
+        size_t common = std::min(held.path.size(), rootPath.size());
+        if (llvm::ArrayRef(held.path).take_front(common) ==
             llvm::ArrayRef(rootPath).take_front(common))
           return emitError(loc)
                  << "unsupported: aliasing mutable pointer arguments (two "
                     "arguments borrow object '"
                  << root->getName() << "')";
       }
-      borrowRoots.push_back({root, rootPath});
+      borrowRoots.push_back({root, rootPath, borrowIsMut});
     }
     if (allocBacking) {
-      if (llvm::is_contained(borrowBackings, allocBacking))
+      for (const auto &held : borrowBackings) {
+        if (held.first != allocBacking)
+          continue;
+        // FR-222: same rule as the rooted arm above, so the two halves of
+        // one key space cannot disagree. Two SHARED open-ended windows on
+        // one allocation are `&v[i..]` beside `&v[j..]` — legal Rust.
+        if (!borrowIsMut && !held.second)
+          continue;
         return emitError(loc)
                << "unsupported: aliasing mutable pointer arguments (two "
                   "arguments borrow the same heap allocation)";
-      borrowBackings.push_back(allocBacking);
+      }
+      borrowBackings.push_back({allocBacking, borrowIsMut});
     }
     if (nullableSlot)
       reference = builder
