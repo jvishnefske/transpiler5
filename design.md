@@ -13627,41 +13627,110 @@ piece and becomes FR-45.
   would need the targeted attribute instead. `--preserve-c-names` carries its
   own allow header with three naming lints and needs the same treatment.
 
-- [ ] FR-221 (opened 2026-09-09; **THE LARGEST MEASURED LEVER IN THE TRACTOR
-  CORPUS AND IT HAS NEVER BEEN SPIKED**): **`aliasing mutable pointer
-  arguments` IS 83 OF 202 EMIT_FAIL CASES -- 41% OF ALL FAILURES AND 33% OF
-  THE WHOLE 252-CASE CORPUS.**
-  Surfaced by the FR-215 spike as an aside while it was measuring something
-  else, and re-derived at HEAD: the next genuine reason is 8. The 48
-  `missing header (openssl/conf.h)` above it are SPHINCS+ variants where that
-  is only the FIRST failure, worth +0 (FR-178, measured twice) -- so this is
-  roughly a TEN-FOLD lead over anything else on the board.
-  THE CHECK: `ImportCExpressions.cpp:3140-3160` refuses a call when two
-  arguments borrow the same root object, or the same heap allocation:
-  `unsupported: aliasing mutable pointer arguments (two arguments borrow
-  object 'X')`.
-  THE ARCHETYPE is `B01_organic/merge_sort_lib` -- `merge(arr, lo, mid, hi)`,
-  two slices of ONE array. That is not an aliasing hazard a human would
-  recognise; it is the single most ordinary shape in C.
-  **THE LEAD, and it is a strong one: FR-201 ALREADY SOLVED A SIBLING OF
-  THIS.** FR-201 established that the `mem*`/`str*` two-cursor unbuildable was
-  **BORROW GRANULARITY in the Phase-4 owner lift, not aliasing** -- the tell
-  being that DISJOINT ranges failed too. Its fix routed same-region cursors
-  through `__emitrust_memcpy_within`. FR-181 separately noted
-  `__emitrust_split_mut_u8` was "not needed" for FR-201's shape. Two slices of
-  one array is exactly what `split_at_mut` exists for in Rust, so the question
-  a spike must answer is whether the 83 are the same granularity problem
-  generalised, or genuine aliasing that no representation fixes.
-  CONSTRAINTS THAT DO **NOT** APPLY, so a spike does not mis-scope itself:
-  FR-181's HARD NO-GO is about the multi-reference C-ABI EXPORT boundary
-  (`noalias` on two `&mut` built from two C pointers a caller may legally
-  alias) -- these are INTERNAL calls, a different question. And FR-136's
-  points-to NO-GO stands: do not re-attempt points-to without a new idea.
-  FR-203 (2026-09-07) is recent adjacent context -- it fixed the
-  receiver/argument arm of this same family, where `placeExprRoot` never
-  peeled `UO_AddrOf`.
-  **NOT SPIKED.** Rank it first on measured yield: nothing else in the corpus
-  is within an order of magnitude.
+- [x] FR-221 (opened and SPIKED 2026-09-09): **NO-GO ON YIELD. THE 83 IS 83
+  RAW FIRST-FAILURE *EVENTS* OVER THREE SOURCE PROGRAMS AND FOUR SITES, AND I
+  MADE THE EXACT ERROR THIS ENTRY WAS WRITTEN TO WARN ABOUT.**
+  This entry ranked the aliasing front first on "83 of 202 EMIT_FAIL cases --
+  41% of failures and 33% of the whole corpus ... roughly a TEN-FOLD lead over
+  anything else on the board." **That counted EVENTS, not PROGRAMS.**
+  Decomposed by source location the 83 collapse to:
+      80  `P01_sphincs_plus .../utils.c:79:13`  -- ONE shared source tree,
+          `thash(buffer + SPX_N, buffer, 2, ctx, addr)`, built 128 ways
+       1  `B01_organic/merge_sort_lib .../lib.c:21:14`  -- `le(a + i, a + j)`
+       1  `B01_synthetic/030_mutable_buffer_overlap_extrahard .../main.c:13:5`
+       1  the `_lib` twin of the same call
+  A `--recover` scan over all 252, which sees aliasing rejections ANYWHERE
+  rather than only first, returns **exactly the same 83 cases** -- so there is
+  no hidden population behind other blockers. This is FR-136's "201 events vs
+  82 sites" and FR-178's first-failure lesson **one level down, committed at
+  the top of the board by the entry that cited both of them.**
+  **THE DECISIVE MEASUREMENT: DELETING THE ENTIRE CHECK IS WORTH +0.** With
+  both rejections gated off, the full three-stage harness returns PASS 41,
+  EMIT_FAIL 202, SYMBOL_MISSING 8 -- `newly PASS: []`, `lost PASS: []`. Every
+  one of the 83 hits ANOTHER emit blocker in the same TU and none reaches
+  `cargo build`: 81 to `non-constant array size` (VLAs), 1 to a string-function
+  argument, 1 to a scanf argument. Blocker depth per program is 2, 2, 2 and
+  **5 distinct blockers for SPHINCS+**.
+  **AND FR-181's HARD NO-GO *DOES* TRANSFER, which this entry explicitly told
+  the spike it did not.** The entry reasoned that FR-181 is about the C-ABI
+  EXPORT boundary while these are internal calls. Measured by hand-rewriting
+  `merge_sort_lib`'s C into the index form a perfect fix would produce: two
+  further blockers appear, and after clearing those the export is
+  `pub fn merge_sort(a: &mut [T], b: &mut [T], size: i32)` with **no
+  `#[no_mangle] extern "C"`** -- two reference parameters at the C-ABI
+  boundary, exactly FR-181's measured NO-GO. `merge_sort` IS the exported
+  entry point, so it was never the internal-call question. Same for
+  `030_lib`. **Both `_lib` archetypes stay SYMBOL_MISSING even with a perfect
+  aliasing fix.**
+  FR-201's granularity insight **half transfers, and the useful half is
+  already built.** The disjointness test says granularity: provably-disjoint
+  constant indices refuse, and so do two `const`-pointee READ-ONLY borrows.
+  But the mechanism does not transfer -- FR-201 could refine because the
+  callee was a KNOWN BUILTIN whose read/write order the importer models, which
+  is what makes `__emitrust_memcpy_within` sound; `thash` and `fma_array` are
+  user functions, and the only faithful lowering for a mut+shared overlap is a
+  staged copy, which is a **silent miscompile** whenever the callee reads an
+  index it already wrote. Meanwhile the merge_sort shape ALREADY IMPORTS when
+  the region is a caller-LOCAL constant array: the Phase-4 owner lift promotes
+  it and turns both pointers into `i64` indices into `self.data`. It is gated
+  to caller-locals by `planOwners` (`ImportCPlanning.cpp:309-325`), so a
+  parameter-rooted region can never be an owner base.
+  MACHINERY AUDIT, so the next attempt does not re-derive it: two shared
+  borrows need NO new ops (hand-written IR round-trips and cargo-builds);
+  `split_at_mut` is expressible today with no new ops via a 2-result
+  `emitrust.call_opaque` -- FR-181's "not needed" was about need, not
+  capability, and unlike FR-215's `ArrayType::isValidElementType` the dialect
+  does not refuse the shape; widening `const T *` to shared beyond u8
+  (`ImportCTypes.cpp:1283-1318`) is worth **0** for this family.
+  **THE ONE REAL FINDING IS A PROVABLY-WRONG REFUSAL, filed as FR-222.**
+  SHAPES THAT MUST STAY LOCATED REJECTIONS: `f(p, p)`, `f(p, p+1)`, object
+  plus its own field, any mut+shared over one root, the heap two-cursor.
+  NOT RESOLVED: whether a MOD/REF read-only inference is affordable (its
+  golden blast radius is unmeasured); the interprocedural
+  must-read-before-write analysis a staged copy would need is unbuilt and
+  uncosted; two of the four non-mutability-aware sites (`:7314`, `:7466`) were
+  not patched or measured; SPHINCS+'s post-aliasing chain was enumerated but
+  not costed.
+
+- [ ] FR-222 DEFECT (opened 2026-09-09 by the FR-221 spike): **TWO READ-ONLY
+  BORROWS OF ONE OBJECT ARE REFUSED, AND TWO COPIES OF THE SAME RULE
+  DISAGREE ABOUT WHETHER THEY SHOULD BE.**
+  `emitCall`'s aliasing key ignores borrow MUTABILITY, so
+  `f(const S *a, const S *b)` called as `f(p, p + 4)` is refused --
+  **provably wrongly**: with the check disabled it emits
+  `fn tu0_f(a: &[u8], b: &[u8])` with two shared reslices, `cargo build` is
+  clean, and stdout is **byte-identical to the clang -O2 native**. The
+  diagnostic's own word "mutable" is factually wrong for that shape.
+  **THE C++ ARM ALREADY HAS THE RULE RIGHT, AND ITS COMMENT MIS-STATES THE C
+  ARM.** `ImportCExpressions.cpp:3633` (landed by FR-203) reads
+  `if (heldRoot == argRoot && (argIsMut || heldIsMut))`, and its comment at
+  `:3613-3619` asserts *"Two borrows of one object are sound only if BOTH are
+  shared. ... `emitCall` applies the same rule to a free function's arguments;
+  the only thing this adds is that the receiver counts as one of the
+  borrows."* **`emitCall` does not apply the same rule.** The check is
+  duplicated at FOUR non-mutability-aware sites -- `:3140` (direct call),
+  `:3157` (heap arm), `:7314` (FR-93 multi-base dispatch), `:7466`
+  (CallIndirect) -- against two aware ones (`:3633`, `:3745`).
+  THE INCREMENT: make `:3140` and `:3157` mutability-aware, mirroring `:3633`
+  verbatim -- `borrowRoots` carries `{root, path, mut}`, `borrowBackings`
+  carries `{value, mut}`, and the collision is skipped when neither borrow is
+  mutable. **~20 lines, no new ops, no new types, no dialect change.**
+  MEASURED on an evidence patch that was then reverted: **full gate
+  1035/1035**, TRACTOR **41 -> 41 with `newly PASS: []`, `lost PASS: []` and
+  ZERO per-case outcome or detail changes** -- FR-201's additivity signature
+  exactly. The shape battery is byte-unchanged except the one shape that now
+  emits.
+  **THIS IS AN EMIT-STAGE CORRECTNESS WIN WORTH +0 PASS, and it is filed with
+  that label so nobody mistakes it for yield.** It is worth landing anyway: it
+  removes a refusal of a correct program, and it removes a disagreement
+  between two copies of one rule where one copy's comment claims they agree.
+  It is also the prerequisite for any const-shared or MOD/REF widening.
+  The heap arm (`:3157`) is DEAD in the TRACTOR corpus (reason split: 83
+  root-object, 0 heap), so it is fixed for consistency rather than yield.
+  `:7314` and `:7466` were NOT patched or measured -- a follow-on should
+  decide whether the rule belongs in one shared helper rather than four
+  copies, which is the actual root cause of the disagreement.
+
 
 - [x] FR-219 (opened and LANDED 2026-09-09; implements FR-209, found by the
   FR-178 re-measurement spike): **THE REFUSAL NOW NAMES THE DELEGATION -- AND
