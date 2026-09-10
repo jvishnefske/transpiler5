@@ -172,10 +172,15 @@ byte-diff as proof of soundness for these classes:
   documented BREAKS the cmake configure step: all 202 EMIT_FAIL cases then
   report one `cmake configure failed` instead of their real blocker,
   destroying the census while leaving PASS unchanged.
-- `scripts/tractor-census.py` gives per-case FULL blocker sets and set-cover.
-  Use it to rank work; use `tractor-eval.py` to score it. Its depth is a
-  LOWER BOUND and its sole-blocker table is split CONFIRMED / PARTIAL — rank
-  only on CONFIRMED.
+- `scripts/tractor-census.py` gives per-case blocker sets and set-cover. Use
+  it to rank work; use `tractor-eval.py` to score it. **Every set it reports
+  is a LOWER BOUND and every yield an UPPER BOUND, with no exceptions** — the
+  importer bails at the first error inside any item it rejects, and every
+  non-passing case has at least one rejected item. It once printed a
+  "CONFIRMED" column claiming otherwise; that column was ~92% wrong and has
+  been removed. **Its one calibration point: it predicted +14 EMIT for the
+  system-header fix and FR-224 delivered +7.** Halve its figures until there
+  are more data points.
 - **A corpus-runner early exit silently degrades PASS while leaving EMIT
   intact.** One run reported `NOT_DISCOVERED 47 / PASS 6` under machine
   contention while its `emitted 57/252` line was correct. Before trusting any
