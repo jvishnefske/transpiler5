@@ -13628,6 +13628,37 @@ piece and becomes FR-45.
   FR-225): the "48 need 5" are SPHINCS+ **lib** extractions, while the "48
   openssl" are SPHINCS+ **exec** KAT drivers. Same 28 source files, different
   TARGET CLOSURE.
+  **THE DEFINITIVE SET-COVER, 2026-09-09, after three corrections to the
+  instrument.** The census was ranking on the progress JSON's COARSE `blocker`
+  tag, which collapsed 124 of 211 non-passing cases into a single `other`
+  bucket -- an instrument reporting "fix `other` for +36" has said nothing.
+  It now ranks on the item's full `diagnostic` sentence (both fields are
+  present on every item; `normalize` folds `object 'buffer'` and `object 'p'`
+  into one class, so this does not re-inflate the way a raw histogram would).
+  Two exclusions were added and **both changed the answer materially**:
+  `unreached-by-import` is a MARKER, not a fixable blocker, and leaving it in
+  the candidate pool let the optimiser spend a fix on it and report a 4-fix
+  set of +34 that no engineering could deliver; and PARTIAL cases (a dropped
+  item hiding an unknown remainder) are excluded, so every number below is a
+  case that really would clear EMIT. 154 of 211 non-passing cases qualify.
+      1 fix  -> +14 EMIT  (exec  4, lib 10)   system-header call  [FR-224]
+      2      -> +21       (exec  6, lib 15)   + pointer assigned a non-address value
+      3      -> +34       (exec  0, lib 34)   aliasing mut ptr args
+                                              + non-constant array size
+                                              + string fn argument must designate a char array
+      4      -> +48       (exec  4, lib 44)   that set + system-header call
+      5      -> +82       (exec  0, lib 82)   + address of a scalar as a slice parameter
+                                              + pointer cast (ArrayToPointerDecay)
+  **THE 5-FIX SET IS EXACTLY THE SPHINCS+ PACKAGE FR-226 MEASURED**, and it
+  clears **82 lib EMIT** -- which reproduces this entry's original "+82, all
+  lib" from a completely different code path, so that figure is now confirmed
+  twice. Its composition, priced against FR-227's export wall: 20 are
+  `initialize_hash_function` (12 blake exportable via the unaccessed-pointer
+  class, 8 sha2 not), **60 are the walled multi-reference symbols**, 2 are
+  other. So five importer fixes plus one export class is **+12 PASS**, and 60
+  of the 82 stay SYMBOL_MISSING no matter how good the importer gets.
+  **THE CHEAPEST REAL YIELD IS STILL THE 1- AND 2-FIX ROWS**, and they are the
+  only rows with `exec` cases in them -- the cases that need no export at all.
   **AND THE 5-FIX SET CLEARS +82 EMIT -- BUT ALL 82 ARE `lib`, ZERO ARE
   `exec`.** Clearing emit is not PASS: a lib case must then export a
   dlsym-able symbol. That is FR-178's finding, and the three-stage check
