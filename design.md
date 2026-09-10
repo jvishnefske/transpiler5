@@ -13686,6 +13686,29 @@ piece and becomes FR-45.
   second blocker behind the stub and one was refused on policy. **Discount
   this table by about a factor of two until there are more data points**, and
   read the 5-fix row's +82 as "at most 82", not as a plan.
+  **THE NEW REJECTED-ITEMS HISTOGRAM RECALIBRATES THE SPHINCS+ ESTIMATE
+  DOWNWARD, AND SHARPLY.** Re-measured at 45/252 with the fixed tool:
+      60 cases  0 rejected items      1 case    3 items
+      43        1                     4         4
+      19        2                    16         7      16    8
+                                     16        14      32   15
+  The 60 with zero are the cases that never emitted a crate at all (the
+  openssl parse failures). **The 7/8/14/15 groups are 80 cases -- the SPHINCS+
+  `lib` cohort -- and each hides SEVEN TO FIFTEEN stubbed functions.** For the
+  5-fix set to clear them, those five blocker CLASSES would have to be the
+  complete blocker set of all 7-15 stubbed functions in every one of those
+  cases, and nothing measured says they are. **So "+82 EMIT for 5 fixes" is a
+  very loose upper bound, and FR-226's "+12 PASS" inherits that looseness.**
+  The 12 blake cases each hide 14 stubs across the 5 classes; that is
+  consistent with the classes covering them, but it is not evidence for it.
+  Re-cost FR-226 by fixing one class and re-measuring the stub count before
+  committing to the package -- **the stub count per case is now the cheap
+  progress signal that did not exist before**, and it moves after each fix
+  without needing the whole set.
+  **BY CONTRAST THE SHALLOW COHORT IS NOW TRUSTWORTHY-ISH**: 43 cases have
+  exactly ONE rejected item, so at most one function's interior is hidden.
+  That is where FR-229's family lives, and it is why the spike could
+  hand-verify its residue as zero for 10 of 12 programs.
   **AND THE 5-FIX SET CLEARS +82 EMIT -- BUT ALL 82 ARE `lib`, ZERO ARE
   `exec`.** Clearing emit is not PASS: a lib case must then export a
   dlsym-able symbol. That is FR-178's finding, and the three-stage check
@@ -14160,8 +14183,19 @@ piece and becomes FR-45.
   TUs. **A follow-on should decide whether this class must additionally
   require a name the C program actually declares.** No case moved and nothing
   regressed, so it is recorded rather than special-cased.
+  **THE IMPORT HALF IS NOW COSTED MUCH HIGHER THAN THIS ENTRY ASSUMED, by
+  FR-223's rejected-items histogram.** Each of the 12 blake cases hides
+  **FOURTEEN stubbed functions** across those five blocker classes. That the
+  classes cover all fourteen is consistent with the data but is NOT evidenced
+  by it -- the interior of every stub past its first error is unimported.
+  **So "5 fixes -> +12 PASS" is an UPPER BOUND, and the work may be
+  substantially larger.** The cheap way to find out, which did not exist
+  before the histogram: **fix ONE class and re-measure the stub count per
+  case.** It moves after each fix without needing the whole set, so the
+  package can be costed incrementally instead of all-or-nothing.
   STILL OPEN: acceptance clauses 1, 3 and 4 -- the five importer fixes, the
-  measured 41 -> 53, and the located refusal of the 8 sha2 cases.
+  measured 45 -> 57 (rebased from 41 -> 53 now that FR-224 has landed), and
+  the located refusal of the 8 sha2 cases.
 
 - [ ] FR-229 (opened and SPIKED 2026-09-09): **THE CHAR-POINTER BYTE-VIEW
   FAMILY -- GO WITH CONSTRAINTS, 12 PROGRAMS NOT 4, AND THE SPIKE FOUND A
