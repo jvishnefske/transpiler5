@@ -5153,6 +5153,38 @@ private:
   /// (7.20.1p1), refined to deterministic i32 wrapping.
   FailureOr<Value> emitAtoiCall(const clang::CallExpr *call);
 
+  /// FR-224: lowers a definition-less `atof(s)` to the
+  /// `__emitrust_atof` helper over the argument's char region. The
+  /// helper implements C's `strtod` PREFIX grammar itself (leading
+  /// whitespace, one sign, digits with an optional fraction and
+  /// exponent, stopping at the first byte that cannot extend the number)
+  /// and then hands that prefix to Rust's correctly-rounded
+  /// `f64::from_str`, which agrees with glibc's correctly-rounded
+  /// `strtod` bit for bit on every prefix both accept.
+  FailureOr<Value> emitAtofCall(const clang::CallExpr *call);
+
+  /// FR-224: lowers a definition-less `strcspn`/`strspn` to the matching
+  /// byte-scan helper over two shared string regions, converting the
+  /// i64 count to the call's declared size_t result type.
+  FailureOr<Value> emitStrSpanCall(const clang::CallExpr *call,
+                                   llvm::StringRef name);
+
+  /// FR-224: lowers a definition-less `div`/`ldiv`/`lldiv` to a value
+  /// of the (already importable) `div_t`-family struct whose `quot` and
+  /// `rem` are the same `arith.divsi`/`arith.remsi` C's own `/` and `%`
+  /// produce. Both arguments are read once, so a call with side-effecting
+  /// operands evaluates each exactly once.
+  FailureOr<Value> emitDivCall(const clang::CallExpr *call,
+                               llvm::StringRef name);
+
+  /// FR-224 NO-GO: `abort` REFUSES, located. `std::process::abort()`
+  /// matches C's abort on signal and on exit status, but not on stdout:
+  /// C's stdout is fully buffered to a file and abort does not flush it,
+  /// while the emitted crate's line-buffered stdout has already written
+  /// every completed line. Measured by byte-diff; see the comment on the
+  /// definition for why nothing local to the call can repair it.
+  LogicalResult emitAbortCall(const clang::CallExpr *call);
+
   /// Lowers a value-position call to a definition-less `abs` (i32) or
   /// `labs` (i64, `isLong`) to `iN::wrapping_abs`. C leaves
   /// abs(INT_MIN)/labs(LONG_MIN) undefined (7.20.6.1p2); wrapping_abs
@@ -5617,6 +5649,19 @@ private:
   /// (FR-194). Only called when `putchar` has no user definition.
   LogicalResult emitPutchar(const clang::CallExpr *call);
 
+  /// FR-224: lowers a statement-position `fputs(s, stdout)` to the same
+  /// buffered-stdout write `puts` uses, WITHOUT the newline. The stream
+  /// slot accepts only the literal `stdout` (the devirtualized-fprintf
+  /// frontier); C's int result has no representation here, so a value
+  /// use keeps its system-header rejection.
+  LogicalResult emitFputs(const clang::CallExpr *call);
+
+  /// FR-224: elides a statement-position `setlocale(cat, "C")`. "C" is
+  /// the startup locale (7.11.1.1p4), so selecting it changes nothing
+  /// observable; every other locale -- including `""`, the
+  /// implementation-defined native one -- refuses located.
+  LogicalResult emitSetlocale(const clang::CallExpr *call);
+
   /// Maps a hosted `<math.h>` function name to the safe Rust callable it
   /// lowers to (design.md C99-48): the IEEE-exact fabs/sqrt/floor/ceil
   /// onto the matching f64 methods, plus the differentially pinned
@@ -5624,8 +5669,10 @@ private:
   /// which keeps the located rejections in `emitCall` (a curated
   /// non-bit-exact diagnostic for exp/log/pow, the system-header
   /// rejection otherwise).
+  /// FR-224 widens this to the `f`-suffixed binary32 forms
+  /// (`isFloat`): the same exact operations at f32.
   static std::optional<llvm::StringRef>
-  hostedMathCallee(llvm::StringRef name);
+  hostedMathCallee(llvm::StringRef name, bool isFloat = false);
 
   /// Lowers a call to a definition-less hosted `<math.h>` function with
   /// C's standard `double f(double)` prototype to
@@ -5635,7 +5682,8 @@ private:
   /// inserted the usual argument conversion to double, so the operand is
   /// f64 by construction (checked defensively).
   FailureOr<Value> emitHostedMathCall(const clang::CallExpr *call,
-                                      llvm::StringRef rustCallee);
+                                      llvm::StringRef rustCallee,
+                                      bool isFloat = false);
 
   //===--------------------------------------------------------------------===//
   // Hosted <stdio.h> FILE* streams (design.md C99-48, CTS-T1.3, 00187)

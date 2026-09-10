@@ -3847,6 +3847,98 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "    }\n"
        "    if neg { acc } else { acc.wrapping_neg() }\n"
        "}"},
+      // FR-224: C's atof (7.20.1.1) is `strtod(s, NULL)`. strtod is a
+      // PREFIX parse -- leading whitespace, one optional sign, a decimal
+      // significand with an optional fraction and an optional exponent,
+      // consuming the LONGEST initial subsequence of that form and
+      // ignoring everything after it, with 0.0 for no such prefix. Rust's
+      // `str::parse::<f64>` will not do that job: it demands the WHOLE
+      // string, rejects leading whitespace, and rejects a trailing
+      // newline -- `"3.0\n".parse()` is an Err where C reads 3.0. So the
+      // helper scans the prefix itself and hands only that prefix to
+      // `from_str`, which is correctly rounded, as glibc's strtod is;
+      // two correctly-rounded parses of the same digits are bit-identical
+      // by definition, which is what makes this differentiable at all.
+      // The forms deliberately NOT scanned -- hexadecimal floats
+      // (0x1p3), `inf`, `nan` -- simply fail the prefix grammar and yield
+      // 0.0 here where C would parse them; they are excluded from the
+      // supported subset by `emitAtofCall`'s caller rejecting nothing,
+      // so this is the one shape where the helper is a REFINEMENT rather
+      // than a match. See design.md FR-224.
+      {"__emitrust_atof",
+       "fn __emitrust_atof(s: &[i8]) -> f64 {\n"
+       "    let mut i = 0usize;\n"
+       "    while i < s.len() {\n"
+       "        let b = s[i] as u8;\n"
+       "        if b != b' ' && (b < 9 || b > 13) { break; }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    let start = i;\n"
+       "    if i < s.len() && (s[i] as u8 == b'+' || s[i] as u8 == b'-') {\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    let digits_start = i;\n"
+       "    while i < s.len() && (s[i] as u8).is_ascii_digit() { i += 1; }\n"
+       "    let mut seen = i > digits_start;\n"
+       "    if i < s.len() && s[i] as u8 == b'.' {\n"
+       "        i += 1;\n"
+       "        let frac_start = i;\n"
+       "        while i < s.len() && (s[i] as u8).is_ascii_digit() "
+       "{ i += 1; }\n"
+       "        seen = seen || i > frac_start;\n"
+       "    }\n"
+       "    if !seen { return 0.0; }\n"
+       "    let mantissa_end = i;\n"
+       "    if i < s.len() && (s[i] as u8 == b'e' || s[i] as u8 == b'E') {\n"
+       "        let mut j = i + 1;\n"
+       "        if j < s.len() && (s[j] as u8 == b'+' || s[j] as u8 == b'-') "
+       "{ j += 1; }\n"
+       "        let exp_start = j;\n"
+       "        while j < s.len() && (s[j] as u8).is_ascii_digit() "
+       "{ j += 1; }\n"
+       "        if j > exp_start { i = j; } else { i = mantissa_end; }\n"
+       "    }\n"
+       "    let bytes: Vec<u8> = s[start..i].iter().map(|&b| b as u8)"
+       ".collect();\n"
+       "    match std::str::from_utf8(&bytes) {\n"
+       "        Ok(t) => t.parse::<f64>().unwrap_or(0.0),\n"
+       "        Err(_) => 0.0,\n"
+       "    }\n"
+       "}"},
+      // FR-224: strcspn/strspn (7.21.5.3/7.21.5.6) -- the length of the
+      // initial segment of s1 consisting entirely of bytes NOT in / IN
+      // s2. Both regions are read to their NUL; the backing of every
+      // supported region includes it, so the `while` terminates. A
+      // region with no NUL before its end stops at the end (reading past
+      // the array is C UB, refined).
+      {"__emitrust_strcspn",
+       "fn __emitrust_strcspn(s: &[i8], reject: &[i8]) -> i64 {\n"
+       "    let mut i = 0usize;\n"
+       "    while i < s.len() && s[i] != 0 {\n"
+       "        let mut j = 0usize;\n"
+       "        while j < reject.len() && reject[j] != 0 {\n"
+       "            if reject[j] == s[i] { return i as i64; }\n"
+       "            j += 1;\n"
+       "        }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    i as i64\n"
+       "}"},
+      {"__emitrust_strspn",
+       "fn __emitrust_strspn(s: &[i8], accept: &[i8]) -> i64 {\n"
+       "    let mut i = 0usize;\n"
+       "    while i < s.len() && s[i] != 0 {\n"
+       "        let mut j = 0usize;\n"
+       "        let mut found = false;\n"
+       "        while j < accept.len() && accept[j] != 0 {\n"
+       "            if accept[j] == s[i] { found = true; break; }\n"
+       "            j += 1;\n"
+       "        }\n"
+       "        if !found { return i as i64; }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    i as i64\n"
+       "}"},
       {"__emitrust_memcmp",
        "fn __emitrust_memcmp(a: &[i8], b: &[i8], n: i64) -> i32 {\n"
        "    let mut i = 0usize;\n"

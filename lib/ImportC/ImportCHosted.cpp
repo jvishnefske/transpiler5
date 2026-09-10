@@ -1579,6 +1579,223 @@ CImporter::emitStringCompareCall(const clang::CallExpr *call,
   return castToIntType(loc, result, intType);
 }
 
+FailureOr<Value> CImporter::emitStrSpanCall(const clang::CallExpr *call,
+                                            llvm::StringRef name) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 2)
+    return emitError(loc) << "unsupported: " << name
+                          << " requires exactly 2 arguments";
+  // FR-224: strcspn/strspn are pure byte SCANS over two NUL-terminated
+  // string regions -- exactly emitStringCompareCall's shape (two shared
+  // borrows, so the two arguments may name the same object) with a
+  // size_t result instead of an int. They keep the i8-only region rule
+  // that strcmp/strncmp keep: these are <string.h> string functions, not
+  // the sign-agnostic byte family, so there is no u8 helper image and an
+  // unsigned char region rejects rather than silently taking one.
+  FailureOr<CharRegionArg> lhs = emitByteRegionArg(
+      call->getArg(0), /*isMut=*/false, /*interceptMember=*/false);
+  if (failed(lhs))
+    return failure();
+  FailureOr<CharRegionArg> rhs = emitByteRegionArg(
+      call->getArg(1), /*isMut=*/false, /*interceptMember=*/false);
+  if (failed(rhs))
+    return failure();
+  FailureOr<Value> lhsSlice = emitByteRegionSlice(
+      loc, *lhs, /*isMut=*/false, /*allowUnsignedByte=*/false);
+  if (failed(lhsSlice))
+    return failure();
+  FailureOr<Value> rhsSlice = emitByteRegionSlice(
+      loc, *rhs, /*isMut=*/false, /*allowUnsignedByte=*/false);
+  if (failed(rhsSlice))
+    return failure();
+  std::string helper = ("__emitrust_" + name).str();
+  requestStringHelper(helper);
+  Value count = builder
+                    .create<emitrust::CallOpaqueOp>(
+                        loc, TypeRange{builder.getIntegerType(64)},
+                        builder.getStringAttr(helper),
+                        /*args=*/ArrayAttr(),
+                        ValueRange{*lhsSlice, *rhsSlice})
+                    .getResult(0);
+  // Convert the i64 count to the call's declared result type (size_t for
+  // the standard prototype), matching emitStrlenCall.
+  FailureOr<Type> resultType = mapType(call->getType(), loc);
+  if (failed(resultType))
+    return failure();
+  auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+  if (!intType)
+    return emitError(loc) << "unsupported: " << name << " result type";
+  return castToIntType(loc, count, intType);
+}
+
+FailureOr<Value> CImporter::emitAtofCall(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: atof requires exactly one argument";
+  FailureOr<PtrExprValue> pointer = emitCharRegionArg(call->getArg(0));
+  if (failed(pointer))
+    return failure();
+  FailureOr<Value> slice =
+      emitCharRegionSlice(loc, *pointer, /*isMut=*/false);
+  if (failed(slice))
+    return failure();
+  requestStringHelper("__emitrust_atof");
+  Value parsed =
+      builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{builder.getF64Type()},
+              builder.getStringAttr("__emitrust_atof"),
+              /*args=*/ArrayAttr(), ValueRange{*slice})
+          .getResult(0);
+  // atof returns double; the standard prototype's result type IS double,
+  // but convert defensively for a K&R-style declaration (matching
+  // emitAtoiCall / emitStrlenCall).
+  FailureOr<Type> resultType = mapType(call->getType(), loc);
+  if (failed(resultType))
+    return failure();
+  if (*resultType == parsed.getType())
+    return parsed;
+  if (llvm::isa<Float32Type>(*resultType))
+    return builder.create<arith::TruncFOp>(loc, *resultType, parsed)
+        .getResult();
+  return emitError(loc) << "unsupported: atof result type";
+}
+
+FailureOr<Value> CImporter::emitDivCall(const clang::CallExpr *call,
+                                        llvm::StringRef name) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 2)
+    return emitError(loc) << "unsupported: " << name
+                          << " requires exactly 2 arguments";
+  // FR-224: THE SURPRISE HERE IS THAT THERE IS NO TYPE PROBLEM. `div_t`
+  // is a system-header STRUCT, but the importer has no system-header
+  // type rejection at all -- a `div_t` local, a `div_t` return and
+  // `.quot`/`.rem` member reads already import today (measured: a
+  // hand-written `static div_t mydiv(int,int)` renders a `struct DivT`
+  // and both member reads with no patch). Only the CALL was rejected.
+  // So this is an ordinary shim, not "system-header type admission".
+  //
+  // C99 7.20.6.2: quot is numer/denom and rem is numer%denom, with the
+  // identity quot*denom+rem == numer -- i.e. C's own truncating-toward-
+  // zero `/` and `%`, which are exactly what Rust's `/` and `%` compute
+  // on the same signed types and exactly what the importer already emits
+  // for a written `a / b`. div(INT_MIN, -1) is UB in both spellings and
+  // is refined identically (it is the same `arith.divsi`).
+  const clang::FunctionDecl *callee = call->getDirectCallee();
+  const auto *record = callee->getReturnType()->getAsRecordDecl();
+  if (!record)
+    return emitError(loc) << "unsupported: " << name
+                          << " does not return a struct";
+  const clang::FieldDecl *quotField = nullptr;
+  const clang::FieldDecl *remField = nullptr;
+  for (const clang::FieldDecl *field : record->fields()) {
+    if (field->getName() == "quot")
+      quotField = field;
+    else if (field->getName() == "rem")
+      remField = field;
+  }
+  // A libc whose div_t spells its members differently, or carries a
+  // third one, is not the ISO shape this lowering claims to reproduce.
+  if (!quotField || !remField ||
+      std::distance(record->field_begin(), record->field_end()) != 2)
+    return emitError(loc)
+           << "unsupported: " << name
+           << " result struct is not the ISO { quot, rem } shape";
+  FailureOr<Type> resultType = mapType(callee->getReturnType(), loc);
+  if (failed(resultType))
+    return failure();
+  FailureOr<Type> fieldType = mapType(quotField->getType(), loc);
+  if (failed(fieldType))
+    return failure();
+  auto fieldIntType = llvm::dyn_cast<IntegerType>(*fieldType);
+  if (!fieldIntType || fieldIntType.isUnsigned())
+    return emitError(loc) << "unsupported: " << name
+                          << " result fields must be signed integers";
+  FailureOr<Value> numer = emitRValue(call->getArg(0));
+  if (failed(numer))
+    return failure();
+  FailureOr<Value> denom = emitRValue(call->getArg(1));
+  if (failed(denom))
+    return failure();
+  if (!llvm::isa<IntegerType>((*numer).getType()) ||
+      !llvm::isa<IntegerType>((*denom).getType()))
+    return emitError(loc) << "unsupported: " << name
+                          << " arguments must be integers";
+  // The prototype has already converted both arguments; normalize the
+  // width anyway so a K&R-style declaration cannot produce a mixed
+  // divide. BOTH operands are read ONCE into SSA values here and reused
+  // by the quotient and the remainder -- `div(f(), g())` must call each
+  // exactly once, which a naive `(a/b, a%b)` textual expansion would
+  // violate.
+  Value n = castToIntType(loc, *numer, fieldIntType);
+  Value d = castToIntType(loc, *denom, fieldIntType);
+  // No struct-VALUE op exists in the dialect: an aggregate is built as a
+  // place plus member assignments, then loaded -- exactly what the
+  // importer's own compound-literal path emits, and what the Rust
+  // renderer folds back into a `DivT { quot: .., rem: .. }` literal.
+  Value place = builder
+                    .create<emitrust::VariableOp>(
+                        loc, emitrust::LValueType::get(*resultType))
+                    .getResult();
+  auto assignField = [&](llvm::StringRef fieldName, Value value) {
+    Value fieldPlace = builder
+                           .create<emitrust::MemberOp>(
+                               loc, emitrust::LValueType::get(fieldIntType),
+                               place, builder.getStringAttr(fieldName))
+                           .getResult();
+    builder.create<emitrust::AssignOp>(loc, fieldPlace, value);
+  };
+  // Both arithmetic ops are materialized up front, in a FIXED order: the
+  // alternative (creating each inside its own `assignField` argument)
+  // interleaves them with the member ops in whatever order the C++
+  // argument evaluation happens to pick, which is not a stable shape to
+  // pin a golden against.
+  Value quotient = builder.create<arith::DivSIOp>(loc, n, d).getResult();
+  Value remainder = builder.create<arith::RemSIOp>(loc, n, d).getResult();
+  assignField("quot", quotient);
+  assignField("rem", remainder);
+  return builder.create<emitrust::LoadOp>(loc, *resultType, place)
+      .getResult();
+}
+
+LogicalResult CImporter::emitAbortCall(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  // FR-224 NO-GO, MEASURED. `std::process::abort()` looked like an exact
+  // match for C's abort -- same SIGABRT, same absence of destructors,
+  // same absence of a stdout flush -- and the exit status does agree
+  // (134 on both sides). The byte-diff oracle refuted it anyway, and the
+  // reason is NOT abort:
+  //
+  //     printf("before abort\n");
+  //     abort();
+  //
+  // clang+glibc, stdout redirected to a FILE, writes NOTHING: C's stdout
+  // is FULLY buffered when it is not a terminal, and abort does not
+  // flush it (C11 7.22.4.1p2 leaves that implementation-defined and
+  // glibc declines). The emitted crate writes `before abort`, because
+  // Rust's `Stdout` is a LineWriter and had already flushed on the
+  // newline. Measured diff, test/EndToEnd/libc-shim-abort.c as first
+  // written: `0a1 > before abort`.
+  //
+  // So the divergence is the BUFFERING MODEL of every emitted crate, and
+  // abort is merely the only construct that makes it observable -- a
+  // normal `return`/`exit` flushes on both sides and agrees byte for
+  // byte, including for a partial line with no newline (measured).
+  // Nothing local to this call can fix it: flushing here writes MORE
+  // than glibc, not less. The real remedy is a fully-buffered stdout
+  // writer for the whole crate, flushed at normal exit only -- a
+  // crate-wide output-model change that shifts every emitted byte and
+  // belongs to its own FR. Until then this refuses, because emitting a
+  // program that prints bytes the reference build does not print is the
+  // silently-wrong direction.
+  (void)call;
+  return emitError(loc)
+         << "unsupported: 'abort' terminates without flushing C's fully "
+            "buffered stdout, but the emitted crate's line-buffered "
+            "stdout has already written every completed line";
+}
+
 const clang::CallExpr *
 CImporter::asHostedStrchrCall(const clang::Expr *expr, bool &reverse) const {
   const auto *call =
@@ -1664,7 +1881,7 @@ LogicalResult CImporter::emitPutchar(const clang::CallExpr *call) {
 }
 
 std::optional<llvm::StringRef>
-CImporter::hostedMathCallee(llvm::StringRef name) {
+CImporter::hostedMathCallee(llvm::StringRef name, bool isFloat) {
   // fabs/sqrt/floor/ceil are IEEE-754-exact (fabs/floor/ceil are exact
   // operations, sqrt is correctly rounded), so every conforming
   // implementation — glibc, Rust's f64 methods, LLVM's constant folder —
@@ -1672,6 +1889,24 @@ CImporter::hostedMathCallee(llvm::StringRef name) {
   // the weaker "both sides resolve to the platform libm" argument,
   // pinned differentially (design.md C99-48). exp/log/pow stay rejected
   // (see emitCall) rather than widening that exception.
+  //
+  // FR-224: the `f`-suffixed forms are the SAME argument at f32. The
+  // exactness claim is a property of the OPERATION, not of the width --
+  // IEEE-754 mandates fabsf/floorf/ceilf exactly and sqrtf correctly
+  // rounded in binary32 by the same clauses that mandate the binary64
+  // forms -- so admitting them widens the existing dispatch rather than
+  // opening a new exception. `sinf` rides the same platform-libm
+  // argument as `sin` and no more. `expf`/`logf`/`powf` stay rejected
+  // with `exp`/`log`/`pow`: the suffix changes nothing about libm
+  // disagreement (see emitCall).
+  if (isFloat)
+    return llvm::StringSwitch<std::optional<llvm::StringRef>>(name)
+        .Case("sinf", "f32::sin")
+        .Case("fabsf", "f32::abs")
+        .Case("sqrtf", "f32::sqrt")
+        .Case("floorf", "f32::floor")
+        .Case("ceilf", "f32::ceil")
+        .Default(std::nullopt);
   return llvm::StringSwitch<std::optional<llvm::StringRef>>(name)
       .Case("sin", "f64::sin")
       .Case("fabs", "f64::abs")
@@ -1682,22 +1917,27 @@ CImporter::hostedMathCallee(llvm::StringRef name) {
 }
 
 FailureOr<Value> CImporter::emitHostedMathCall(const clang::CallExpr *call,
-                                               llvm::StringRef rustCallee) {
+                                               llvm::StringRef rustCallee,
+                                               bool isFloat) {
   Location loc = translateLoc(call->getBeginLoc());
   FailureOr<Value> argument = emitRValue(call->getArg(0));
   if (failed(argument))
     return failure();
-  // The callee's prototype is `double f(double)` (checked at the call
-  // site), so clang has already converted the argument to double; anything
-  // else indicates an importer bug rather than an unsupported program.
-  if (!llvm::isa<Float64Type>((*argument).getType()))
+  // The callee's prototype is `double f(double)` -- or, for the
+  // `f`-suffixed forms, `float f(float)` -- checked at the call site, so
+  // clang has already converted the argument; anything else indicates an
+  // importer bug rather than an unsupported program.
+  Type floatType =
+      isFloat ? Type(builder.getF32Type()) : Type(builder.getF64Type());
+  if ((*argument).getType() != floatType)
     return emitError(loc) << "unsupported: " << rustCallee
-                          << " argument is not a double";
+                          << " argument is not a "
+                          << (isFloat ? "float" : "double");
   return builder
-      .create<emitrust::CallOpaqueOp>(
-          loc, TypeRange{builder.getF64Type()},
-          builder.getStringAttr(rustCallee),
-          /*args=*/ArrayAttr(), ValueRange{*argument})
+      .create<emitrust::CallOpaqueOp>(loc, TypeRange{floatType},
+                                      builder.getStringAttr(rustCallee),
+                                      /*args=*/ArrayAttr(),
+                                      ValueRange{*argument})
       .getResult(0);
 }
 

@@ -7836,6 +7836,20 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
       // C's exit-status semantics (design.md C99-48).
       if (name == "exit")
         return emitExitCall(call);
+      // FR-224: a statement-position `abort()` raises SIGABRT and does
+      // not return, exactly as `std::process::abort()` does.
+      if (name == "abort")
+        return emitAbortCall(call);
+      // FR-224: `fputs(s, stdout)` is `puts` minus the newline, on the
+      // literal `stdout` -- the SAME devirtualized-stdout frontier the
+      // fprintf swallow draws. Any other stream refuses located.
+      if (name == "fputs")
+        return emitFputs(call);
+      // FR-224: `setlocale(category, "C" | "")` is observationally a
+      // no-op for this model and is elided; every other locale, and
+      // every use of the returned pointer, refuses located.
+      if (name == "setlocale")
+        return emitSetlocale(call);
       // A statement-position `free(p)` whose argument roots in a recognized
       // local heap allocation (W4.2e Part A) is a no-op: the synthesized
       // backing array drops at function scope end, and a defined program
@@ -9616,6 +9630,83 @@ LogicalResult CImporter::emitPuts(const clang::CallExpr *call) {
       builder.getArrayAttr(
           {builder.getStringAttr("{}"), builder.getIndexAttr(0)}),
       ValueRange{*text});
+  return success();
+}
+
+LogicalResult CImporter::emitFputs(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 2)
+    return emitError(loc)
+           << "unsupported: fputs requires exactly two arguments";
+  // FR-224: the stream slot is the same devirtualized-stdout frontier
+  // `fprintf` draws (emitAliasedPrintf) -- the ONLY position where a
+  // FILE* value is accepted, and only as the literal `stdout`. `stderr`
+  // is a DIFFERENT stream whose bytes the differential oracle does not
+  // compare against stdout's, and a stream variable would need a
+  // formatted writer over the handle; both refuse located.
+  const auto *stream = llvm::dyn_cast<clang::DeclRefExpr>(
+      call->getArg(1)->IgnoreParenImpCasts());
+  const clang::NamedDecl *streamDecl =
+      stream ? llvm::dyn_cast<clang::NamedDecl>(stream->getDecl()) : nullptr;
+  if (!streamDecl || !streamDecl->getDeclName().isIdentifier() ||
+      canonicalStreamName(streamDecl->getName()) != "stdout")
+    return emitError(translateLoc(call->getArg(1)->getBeginLoc()))
+           << "unsupported: fputs to a FILE* stream (only the literal "
+              "'stdout' is supported)";
+  // C's fputs writes the string's bytes and NO newline (contrast puts,
+  // 7.21.7.4 vs 7.21.7.10). FR-191: a char region must write its RAW
+  // bytes -- routing it through the Latin-1 `__emitrust_cstr` Display
+  // funnel prints two UTF-8 bytes for every byte >= 0x80 where C writes
+  // one, which is precisely the defect FR-191 measured for puts. The
+  // shapes that never reached the funnel (a string literal, an FR-64
+  // lifted String) keep the single `print!("{}", s)`.
+  bool rawByteSlice = false;
+  FailureOr<Value> text =
+      emitPrintfStringArg(call->getArg(0), std::nullopt, &rawByteSlice);
+  if (failed(text))
+    return failure();
+  if (rawByteSlice) {
+    needsCStrOutHelper = true;
+    builder.create<emitrust::CallOpaqueOp>(
+        loc, TypeRange(), builder.getStringAttr("__emitrust_cstr_out"),
+        /*args=*/ArrayAttr(), ValueRange{*text});
+    return success();
+  }
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("print!"),
+      builder.getArrayAttr(
+          {builder.getStringAttr("{}"), builder.getIndexAttr(0)}),
+      ValueRange{*text});
+  return success();
+}
+
+LogicalResult CImporter::emitSetlocale(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 2)
+    return emitError(loc)
+           << "unsupported: setlocale requires exactly two arguments";
+  // FR-224: `setlocale` is global C state with no Rust equivalent, so
+  // the ONLY admitted call is the one that changes nothing observable.
+  // The C startup locale is "C" (7.11.1.1p4: the program behaves as if
+  // `setlocale(LC_ALL, "C")` ran before main), so selecting "C" is a
+  // no-op; `""` selects the IMPLEMENTATION-DEFINED native environment
+  // locale, which is not a no-op in general -- it is what makes
+  // `isalpha` accept accented bytes under a UTF-8 or Latin-1 locale --
+  // so it is NOT admitted here. Every other argument, including a
+  // non-literal one, refuses located, and so does any use of the
+  // returned `char *` (the call is statement-position only; a value use
+  // never reaches this function).
+  const auto *locale = llvm::dyn_cast<clang::StringLiteral>(
+      call->getArg(1)->IgnoreParenImpCasts());
+  if (!locale || !locale->isOrdinary() || locale->getString() != "C")
+    return emitError(translateLoc(call->getArg(1)->getBeginLoc()))
+           << "unsupported: setlocale to a locale other than the literal "
+              "\"C\" (the C locale is the startup state, so selecting it "
+              "is the only observationally empty call)";
+  // The category argument is not inspected: with "C" as the locale,
+  // every category is already in that state, so the call is a no-op for
+  // LC_ALL and for any single category alike. C's return value (the
+  // resulting locale name) is discarded here by construction.
   return success();
 }
 
