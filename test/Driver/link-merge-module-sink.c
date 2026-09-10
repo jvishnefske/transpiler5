@@ -64,7 +64,14 @@
 // the root can still construct it (a private field is rustc E0616).
 // RUN: emitrust-cc --link %t/sink-a.o %t/sink-b.o %t/sink-main.o --emit=rust -o %t.sink.rs
 // RUN: FileCheck %s --check-prefix=SINK --strict-whitespace < %t.sink.rs
-//      SINK: #[derive(Clone, Copy, Default)]
+// FR-220 put a targeted `#[allow(dead_code)]` on every emitted record in place
+// of the crate root's retired blanket allow, and this file is where the SINK's
+// indentation contract is pinned: the attribute must be written INSIDE the
+// `mod` at the module's own indentation, exactly like the derive it precedes.
+// Attribute POSITION only -- both `Buf` definitions, the repathing and the
+// two-definition count below are unchanged.
+//      SINK: #[allow(dead_code)]
+// SINK-NEXT: #[derive(Clone, Copy, Default)]
 // SINK-NEXT: struct Buf {
 // SINK-NEXT:     a: i32,
 // SINK-NEXT: }
@@ -74,6 +81,7 @@
 //      SINK: fn tu1_local_use(v0: crate::sink_b::Buf) -> i32 {
 //      SINK: let b: crate::sink_b::Buf = crate::sink_b::Buf { a:
 //      SINK: mod sink_b {
+// SINK-NEXT:     #[allow(dead_code)]
 // SINK-NEXT:     #[derive(Clone, Copy, Default)]
 // SINK-NEXT:     pub(crate) struct Buf {
 // SINK-NEXT:         pub(crate) a: i32,

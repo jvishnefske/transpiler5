@@ -72,16 +72,23 @@ int main(int argc, char **argv) {
   return 0;
 }
 
-// CHECK:#![allow(dead_code)]
-// CHECK-EMPTY:
+// FR-220: the crate root's blanket `#![allow(dead_code)]` and its trailing
+// blank line are gone; each of the three `struct_def`s now leads with its own
+// targeted `#[allow(dead_code)]`. That is the ONLY movement in this file --
+// every function body, every prelude spelling and the BARE sweep below are
+// untouched, and because the whole root is pinned full-width under
+// --strict-whitespace the unbroken CHECK-NEXT chain is the proof.
+// CHECK:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct MyOption {
 // CHECK-NEXT:    id: i32,
 // CHECK-NEXT:}
+// CHECK-NEXT:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct MyString {
 // CHECK-NEXT:    n: i32,
 // CHECK-NEXT:}
+// CHECK-NEXT:#[allow(dead_code)]
 // CHECK-NEXT:#[derive(Clone, Copy, Default)]
 // CHECK-NEXT:struct Ops {
 // CHECK-NEXT:    apply: Option<fn(i32) -> i32>,

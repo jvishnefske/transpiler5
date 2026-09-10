@@ -1,7 +1,18 @@
 // FR-20: emitrust-cc --emit=rust prints the exact text of the crate's
-// src/main.rs when the input defines main: allow-header, translated
-// functions (C main renamed to c_main), and the process-exit wrapper.
+// src/main.rs when the input defines main: the translated functions (C main
+// renamed to c_main) and the process-exit wrapper.
+//
+// FR-220 moved what used to be the file's first line. `dead_code` was the last
+// lint still allowed crate-wide, and a crate-root allow is a blindfold: it hid
+// every kind of dead item at once, including the ONE kind that signals an
+// emitter defect (a dead emitted `fn`). The allow now rides on the individual
+// records, enums and inherent impls the emitter knows it is writing, so this
+// input -- which declares no type at all -- gets NO attribute header, and the
+// crate root's first byte is its first emitted item. The NOALLOW run below
+// states that as a sweep over the whole output rather than only the prefix,
+// so reinstating a blanket `#![allow(..)]` anywhere fails this test.
 // RUN: emitrust-cc --emit=rust %s -o - | FileCheck %s
+// RUN: emitrust-cc --emit=rust %s -o - | FileCheck %s --check-prefix=NOALLOW
 
 int printf(const char *, ...);
 
@@ -16,11 +27,12 @@ int main(void) {
   return 0;
 }
 
-// The allow-header comes first: only dead_code remains allowed (intrinsic to a
-// faithful transpile); every other lint is denied in Cargo.toml.
-// CHECK: #![allow(dead_code)]
+// There is no attribute header at all: not one crate-level allow survives, and
+// every lint the old blanket header silenced is denied in Cargo.toml.
+// NOALLOW-NOT: #![allow
 
-// The helper function keeps its name; C main is renamed to c_main.
+// The helper function keeps its name; C main is renamed to c_main. It is the
+// FIRST line of the file now that the header is gone.
 // CHECK: fn twice(x: i32) -> i32 {
 // CHECK: fn c_main() -> i32 {
 

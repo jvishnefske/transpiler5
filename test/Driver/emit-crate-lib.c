@@ -7,6 +7,7 @@
 // RUN: cat %t.lib/Cargo.toml | FileCheck %s --check-prefix=LIBTOML
 // RUN: ls %t.lib/src | FileCheck %s --check-prefix=LIBLAYOUT
 // RUN: cat %t.lib/src/lib.rs | FileCheck %s --check-prefix=LIB
+// RUN: cat %t.lib/src/lib.rs | FileCheck %s --check-prefix=NOALLOW
 //
 // --emit=rust prints exactly that crate root (FR-51 makes the invariant
 // total; before it, a no-`main` input printed a bare, header-less
@@ -68,14 +69,24 @@ int axis_of(int which) { return which == 0 ? AXIS_X : AXIS_Y; }
 // LIBTOML-NEXT: non_snake_case = "deny"
 // LIBTOML-NEXT: non_upper_case_globals = "deny"
 // LIBTOML-NEXT: non_camel_case_types = "deny"
+// `dead_code` is NOT in the table: FR-220 measured `dead_code = "deny"` as
+// unlandable (it regresses c-testsuite by 10 and breaks FR-44's recovery
+// guarantee), so the tripwire is the clippy-eval ratchet, not a hard error.
+// LIBTOML-NOT:  dead_code
 
 // The crate root is src/lib.rs, and there is no src/main.rs at all.
 // LIBLAYOUT-NOT: main.rs
 // LIBLAYOUT: lib.rs
 // LIBLAYOUT-NOT: main.rs
 
-// The allow-header is emitted for a library exactly as for a binary.
-// LIB: #![allow(dead_code)]
+// FR-220: there is no crate-level attribute header, for a library exactly as
+// for a binary. `dead_code` was the last blanket allow and it moved onto the
+// items -- here the `struct Point`, the transparent `struct Axis` and its
+// associated-constant `impl` each carry their own -- so the crate root's first
+// byte is that first attribute rather than a `#![..]` inner attribute. The
+// exports below are unchanged; what moved is attribute POSITION only.
+// LIB:      #[allow(dead_code)]
+// NOALLOW-NOT: #![allow
 
 // Types are exported unconditionally, with their fields and variant
 // constants: Rust's private-in-public rule (E0446) means a type named in an

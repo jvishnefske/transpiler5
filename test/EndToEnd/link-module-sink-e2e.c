@@ -31,8 +31,13 @@
 //
 // The sink actually happened -- otherwise this file would be pinning the
 // dedup path and nothing else:
+// (FR-220 inserted a targeted `#[allow(dead_code)]` ahead of the derive, the
+// per-item replacement for the crate root's retired blanket allow. Attribute
+// POSITION only -- the sink itself, and the byte-diff oracle below, are
+// untouched.)
 // RUN: FileCheck %s --check-prefix=SUNK < %t.crate/src/main.rs
 // SUNK: mod b {
+// SUNK-NEXT: #[allow(dead_code)]
 // SUNK-NEXT: #[derive(Clone, Copy, Default)]
 // SUNK-NEXT: pub(crate) struct Buf {
 //
