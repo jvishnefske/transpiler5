@@ -172,6 +172,75 @@ static constexpr llvm::StringLiteral kMainArgvWrapperAsync =
     "&__emitrust_argv)));\n"
     "}\n";
 
+/// FR-228: whether `module` carries the FULLY BUFFERED stdout runtime, so the
+/// entry wrapper has to install it and flush it.
+///
+/// The importer emits that runtime for every module that writes to stdout
+/// (`CImporter::emitStdoutRuntime`) -- one text, deliberately, so a `--link`
+/// merge's textual dedup cannot end up with two shapes -- and it is a
+/// VERBATIM item, not a symbol, so the question has to be asked of the text.
+/// Deriving the answer here instead (from `hasCMain` plus a guess at whether
+/// anything prints) would be a second spelling of the same rule, and the two
+/// disagreeing would either fail to compile or, worse, build a crate that
+/// buffers and never flushes.
+///
+/// A module WITHOUT the runtime prints nothing, so its entry wrapper stays
+/// byte-identical to the historical one.
+static bool hasBufferedStdout(mlir::ModuleOp module) {
+  for (auto verbatim : module.getOps<mlir::emitrust::VerbatimOp>())
+    if (verbatim.getValue().contains("fn __emitrust_stdout_init()"))
+      return true;
+  return false;
+}
+
+/// FR-228: the entry wrapper for a crate that carries the buffered stdout
+/// runtime.
+///
+/// C flushes `stdout` at NORMAL termination and at nothing else, so the three
+/// things this adds are exactly the three normal exits the wrapper owns:
+/// installing the buffering (and the panic hook that flushes it, so a crate
+/// that panics still shows what it printed), and flushing after `c_main`
+/// returns -- BEFORE `std::process::exit`, which runs no destructors and
+/// would otherwise discard the buffer. C's own `exit(status)` calls get the
+/// same flush spliced in at import. `abort` gets none, deliberately.
+///
+/// `arity` and `asyncMain` select the same four bodies the unbuffered
+/// wrappers spell; the argv collection is character-for-character the one in
+/// `kMainArgvWrapper` so the two flavors cannot drift.
+static std::string renderBufferedMainWrapper(unsigned arity, bool asyncMain) {
+  std::string call = "c_main(";
+  if (arity == 1)
+    call += "std::env::args_os().len() as i32";
+  else if (arity == 2)
+    call += "__emitrust_argv.len() as i32, &__emitrust_argv";
+  call += ")";
+  std::string body;
+  body += "fn main() {\n";
+  body += "    __emitrust_stdout_init();\n";
+  if (arity == 2) {
+    body += "    use std::os::unix::ffi::OsStrExt;\n";
+    body += "    let __emitrust_argv: Vec<Vec<i8>> = std::env::args_os()\n";
+    body += "        .map(|a| {\n";
+    body += "            a.as_bytes().iter().map(|&b| b as i8)"
+            ".chain(std::iter::once(0i8)).collect()\n";
+    body += "        })\n";
+    body += "        .collect();\n";
+  }
+  if (asyncMain) {
+    body += "    let __emitrust_status = "
+            "tokio::runtime::Builder::new_current_thread()\n";
+    body += "        .enable_all().build()"
+            ".expect(\"tokio runtime build failed\")\n";
+    body += "        .block_on(" + call + ");\n";
+  } else {
+    body += "    let __emitrust_status = " + call + ";\n";
+  }
+  body += "    __emitrust_out_flush();\n";
+  body += "    std::process::exit(__emitrust_status);\n";
+  body += "}\n";
+  return body;
+}
+
 CrateType selectCrateType(CrateTypeRequest request, mlir::ModuleOp module) {
   switch (request) {
   case CrateTypeRequest::Bin:
@@ -380,17 +449,28 @@ renderCrateRoot(mlir::ModuleOp module, CrateType type,
     // C99-43 C3: 3-way select on `c_main`'s arity. Arity 0/1 stay
     // byte-identical to the pre-C3 emitter; arity 2 carries the admitted
     // argv table and gets the raw-bytes `args_os` collection wrapper.
+    const unsigned arity = cMainInputCount(module);
+    // FR-228: a crate carrying the buffered stdout runtime gets the wrapper
+    // that installs and flushes it. A crate without the runtime keeps the
+    // historical wrapper byte for byte -- nothing it emits can print, so
+    // there is nothing to buffer and nothing to flush.
+    std::string bufferedWrapper;
     llvm::StringRef wrapper;
-    switch (cMainInputCount(module)) {
-    case 2:
-      wrapper = asyncMain ? kMainArgvWrapperAsync : kMainArgvWrapper;
-      break;
-    case 1:
-      wrapper = asyncMain ? kMainArgcWrapperAsync : kMainArgcWrapper;
-      break;
-    default:
-      wrapper = asyncMain ? kMainWrapperAsync : kMainWrapper;
-      break;
+    if (hasBufferedStdout(module)) {
+      bufferedWrapper = renderBufferedMainWrapper(arity, asyncMain);
+      wrapper = bufferedWrapper;
+    } else {
+      switch (arity) {
+      case 2:
+        wrapper = asyncMain ? kMainArgvWrapperAsync : kMainArgvWrapper;
+        break;
+      case 1:
+        wrapper = asyncMain ? kMainArgcWrapperAsync : kMainArgcWrapper;
+        break;
+      default:
+        wrapper = asyncMain ? kMainWrapperAsync : kMainWrapper;
+        break;
+      }
     }
     // FR-150: the wrapper text is rendered HERE, outside the emitter, and the
     // argv flavor spells `let __emitrust_argv: Vec<Vec<i8>>`. A crate whose

@@ -162,6 +162,24 @@ inline constexpr llvm::StringLiteral kExternalRequirementAttrName =
 inline constexpr llvm::StringLiteral kExternDeclAttrName =
     "emitrust.extern_decl";
 
+/// FR-228: name of the discardable unit attribute marking the crate-wide
+/// stdout runtime's verbatim items (the `print!`/`println!` shadows and the
+/// buffered writer they call).
+///
+/// It exists for ONE reason: `macro_rules!` scoping is TEXTUAL, so those
+/// items must be rendered before every use of the macros they define, and IR
+/// order alone does not guarantee that. A `--link` merge concatenates shards
+/// in link-line order, and the runtime rides in whichever shard happened to
+/// print, so a joint import and a shard link of the same program produced the
+/// same items in DIFFERENT positions (measured on
+/// test/Driver/link-partition.c, whose whole point is that the two agree byte
+/// for byte). The Rust emitter therefore hoists every marked root item to the
+/// top of the crate root, which makes the placement a property of RENDERING
+/// rather than of import order. `emitrust.verbatim`'s assembly format ends in
+/// `attr-dict`, so the mark survives the shard's MLIR round trip.
+inline constexpr llvm::StringLiteral kStdoutRuntimeAttrName =
+    "emitrust.stdout_runtime";
+
 /// FR-78: name of the discardable unit attribute marking a struct_def that
 /// models a differing-aggregate-arm C union as OPAQUE STORAGE — a single
 /// sizeof-sized byte-blob field. The type and every whole-value use are

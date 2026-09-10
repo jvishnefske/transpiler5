@@ -219,12 +219,13 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
     // too.
     {llvm::StringLiteral("has no bit-exact Rust mapping"),
      llvm::StringLiteral("libm-not-bit-exact")},
-    // FR-224: `abort`, for the same reason and with the same history --
-    // it was `libc:abort` until this wave gave it a wording that says
-    // WHY. The tag records that the blocker is the emitted crate's
-    // stdout buffering model, not the abort call.
-    {llvm::StringLiteral("terminates without flushing"),
-     llvm::StringLiteral("abort-stdout-flush")},
+    // FR-224's `abort-stdout-flush` tag lived here and is GONE. It keyed
+    // on the wording of a refusal FR-228 removed -- `abort` lowers now,
+    // because the crate carries C's stdout buffering model -- and a
+    // substring nothing can raise is worse than no entry at all: it leaves
+    // a census reader believing a frontier is still there. The entry is
+    // deleted in the same change that deletes its rejection, which is the
+    // only way the two cannot drift.
 };
 
 /// The C++-input table (`_CXX_BLOCKER_SUBSTRINGS`), consulted after the table

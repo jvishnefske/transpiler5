@@ -66,7 +66,14 @@ int main(void) {
 // BIN: fn tu0_helper(x: i32) -> i32 {
 // BIN: fn doubled(x: i32) -> i32 {
 // BIN: fn c_main() -> i32 {
-// BIN: fn main() { std::process::exit(c_main()); }
+// FR-228: a crate that prints carries the buffered stdout writer, so its
+// entry wrapper installs it and flushes it before exiting.
+// BIN: fn main() {
+// BIN-NEXT:     __emitrust_stdout_init();
+// BIN-NEXT:     let __emitrust_status = c_main();
+// BIN-NEXT:     __emitrust_out_flush();
+// BIN-NEXT:     std::process::exit(__emitrust_status);
+// BIN-NEXT: }
 
 // The forced library keeps the same visibility rule: the file-static stays
 // private, and everything with external linkage -- `c_main` included, since

@@ -44,5 +44,13 @@ int main(void) {
 // CHECK: println!("total={}
 // CHECK: 0i32
 
-// The verbatim wrapper forwards c_main's result as the exit code.
-// CHECK: fn main() { std::process::exit(c_main()); }
+// The verbatim wrapper forwards c_main's result as the exit code. FR-228:
+// this crate prints, so it carries the buffered stdout writer, and the
+// wrapper installs it and flushes it -- `std::process::exit` runs no
+// destructors, so the flush cannot be left to one.
+// CHECK: fn main() {
+// CHECK-NEXT:     __emitrust_stdout_init();
+// CHECK-NEXT:     let __emitrust_status = c_main();
+// CHECK-NEXT:     __emitrust_out_flush();
+// CHECK-NEXT:     std::process::exit(__emitrust_status);
+// CHECK-NEXT: }

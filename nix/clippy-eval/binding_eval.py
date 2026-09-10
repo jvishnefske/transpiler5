@@ -89,8 +89,13 @@ PROBE_DIR = os.path.join(HERE, "binding-probe")
 PROBE_BIN = os.environ.get(
     "BINDING_PROBE", os.path.join(PROBE_DIR, "target", "release", "binding-probe"))
 
-# Pinned to epoch-6, the same document clippy-baseline-epoch6.json names.
-DEFAULT_BASELINE = os.path.join(HERE, "binding-baseline-epoch6.json")
+# CLAUDE.md's epoch discipline: THREE consumers name the baseline document,
+# and if they diverge the controller commits a file the ratchet never reads.
+# This one was the odd consumer out -- it stayed pinned to epoch-6 after that
+# epoch CLOSED, so a bare invocation exited 2 with "refusing to measure" and
+# every caller had to pass --baseline by hand. Found 2026-09-10 by the FR-228
+# implementation, which had to work around it.
+DEFAULT_BASELINE = os.path.join(HERE, "binding-baseline-epoch7.json")
 
 # The buckets the probe reports for candidates it refused to count. Named
 # here so the report and the baseline agree on the vocabulary.
@@ -461,6 +466,17 @@ def main():
               "The axes are Pareto -- an improvement on the other one does "
               "NOT pay for this. Fix, or --update deliberately.")
         return 1
+    # FR-228 inflated the DENOMINATOR, and a reader must not mistake that for
+    # progress. Its stdout runtime is ~44 counted statements emitted into
+    # EVERY crate, so `statements` jumped 19695 -> 32481 and this ratio fell
+    # 11.71 -> 7.10 with no emitter change behind it. CLAUDE.md warns that a
+    # per-100-statements ratio is gameable by REMOVING good statements; this
+    # is the mirror image, gameable by ADDING neutral ones. Both ratchet axes
+    # are absolute and were unaffected. Excluding runtime items from the count
+    # needs a change to the syn-based probe and is not done.
+    print("(NOTE: `statements` includes FR-228's per-crate stdout runtime, so "
+          "the ratio below\n moved without an emitter change -- compare the "
+          "ABSOLUTE axes above, not this.)")
     print(f"(free/100 stmts {baseline['free_per_100_stmts']:.4f} -> "
           f"{report['free_per_100_stmts']:.4f}; statements "
           f"{baseline['statements']} -> {report['statements']}; "

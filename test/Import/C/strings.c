@@ -80,4 +80,7 @@ int main(void) {
 // CHECK: emitrust.verbatim "fn __emitrust_cstr_out(s: &[i8]) {
 // CHECK-SAME: position(|&b| b == 0)
 // CHECK: emitrust.verbatim "fn __emitrust_byte_out(b: i8) {
-// CHECK-SAME: write_all(&[b as u8])
+// FR-228 routed the raw byte through the crate-wide stdout writer:
+// sharing `print!`'s LOCK was never enough once the two had to share
+// its BUFFERING MODEL as well.
+// CHECK-SAME: __emitrust_out_write(&[b as u8])

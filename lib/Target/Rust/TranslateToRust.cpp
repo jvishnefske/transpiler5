@@ -4457,16 +4457,17 @@ LogicalResult RustEmitter::emitLetPrologue(Value result, bool isMut) {
 /// Returns whether `op` renders as a diverging (`!`-typed) Rust expression,
 /// after which the rest of its block is unreachable. Emitting that tail would
 /// produce dead code that trips `unreachable_code` (and cascading `unused_*`),
-/// so block emission stops here. `panic!` and `std::process::exit` are the
-/// importer's diverging opaque calls; the structured terminators never have
-/// successors within their block but are covered for completeness.
+/// so block emission stops here. `panic!`, `std::process::exit` and
+/// `std::process::abort` (FR-228) are the importer's diverging opaque calls;
+/// the structured terminators never have successors within their block but
+/// are covered for completeness.
 static bool opDiverges(Operation *op) {
   if (auto call = dyn_cast<emitrust::CallOpaqueOp>(op)) {
     llvm::StringRef callee = call.getCallee();
     // `unimplemented!` (emitted by `--recover` for unsupported constructs)
     // diverges even though it yields a value into a `let`.
     return callee == "panic!" || callee == "std::process::exit" ||
-           callee == "unimplemented!";
+           callee == "std::process::abort" || callee == "unimplemented!";
   }
   return isa<emitrust::ReturnOp, emitrust::BreakOp, emitrust::ContinueOp>(op);
 }
@@ -5662,9 +5663,21 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   // already spell the whole path, so nothing else in the emitter changes. A
   // module whose symbols carry no path leaves both containers empty and
   // takes the historical flat path, byte for byte.
+  // FR-228: the crate-wide stdout runtime is rendered FIRST, whatever its IR
+  // position. `macro_rules!` scoping is textual, so the `print!`/`println!`
+  // shadows only cover uses that FOLLOW them -- and a use that misses the
+  // shadow silently falls back to std's macro, whose LineWriter would
+  // interleave with the buffered writer and reorder the program's output.
+  // Import puts these at block begin, but a `--link` merge re-seats them
+  // behind every earlier shard's items, so the guarantee is made here.
+  for (Operation &op : *moduleOp.getBody())
+    if (op.hasAttr(emitrust::kStdoutRuntimeAttrName) && failed(emitOperation(op)))
+      return failure();
   llvm::SmallVector<StringRef> modulePaths;
   llvm::StringMap<llvm::SmallVector<Operation *>> moduleItems;
   for (Operation &op : *moduleOp.getBody()) {
+    if (op.hasAttr(emitrust::kStdoutRuntimeAttrName))
+      continue;
     if (!isa<emitrust::UseOp, emitrust::VerbatimOp, emitrust::FuncOp,
              emitrust::ImplOp, emitrust::StructDefOp, emitrust::EnumDefOp,
              emitrust::DataEnumDefOp, emitrust::GlobalOp,

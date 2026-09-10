@@ -1777,39 +1777,30 @@ FailureOr<Value> CImporter::emitDivCall(const clang::CallExpr *call,
 
 LogicalResult CImporter::emitAbortCall(const clang::CallExpr *call) {
   Location loc = translateLoc(call->getBeginLoc());
-  // FR-224 NO-GO, MEASURED. `std::process::abort()` looked like an exact
-  // match for C's abort -- same SIGABRT, same absence of destructors,
-  // same absence of a stdout flush -- and the exit status does agree
-  // (134 on both sides). The byte-diff oracle refuted it anyway, and the
-  // reason is NOT abort:
+  if (call->getNumArgs() != 0)
+    return emitError(loc) << "unsupported: abort takes no arguments";
+  // FR-228. `std::process::abort()` is an exact match for C's abort -- same
+  // SIGABRT, same 134 exit status, no destructors, and NO stdout flush --
+  // and the last of those is what FR-224 could not admit. Its byte-diff
+  // measured:
   //
   //     printf("before abort\n");
   //     abort();
   //
-  // clang+glibc, stdout redirected to a FILE, writes NOTHING: C's stdout
-  // is FULLY buffered when it is not a terminal, and abort does not
-  // flush it (C11 7.22.4.1p2 leaves that implementation-defined and
-  // glibc declines). The emitted crate writes `before abort`, because
-  // Rust's `Stdout` is a LineWriter and had already flushed on the
-  // newline. Measured diff, test/EndToEnd/libc-shim-abort.c as first
-  // written: `0a1 > before abort`.
-  //
-  // So the divergence is the BUFFERING MODEL of every emitted crate, and
-  // abort is merely the only construct that makes it observable -- a
-  // normal `return`/`exit` flushes on both sides and agrees byte for
-  // byte, including for a partial line with no newline (measured).
-  // Nothing local to this call can fix it: flushing here writes MORE
-  // than glibc, not less. The real remedy is a fully-buffered stdout
-  // writer for the whole crate, flushed at normal exit only -- a
-  // crate-wide output-model change that shifts every emitted byte and
-  // belongs to its own FR. Until then this refuses, because emitting a
-  // program that prints bytes the reference build does not print is the
-  // silently-wrong direction.
-  (void)call;
-  return emitError(loc)
-         << "unsupported: 'abort' terminates without flushing C's fully "
-            "buffered stdout, but the emitted crate's line-buffered "
-            "stdout has already written every completed line";
+  // clang+glibc with stdout redirected to a FILE writes NOTHING (C11
+  // 7.22.4.1p2 leaves the flush implementation-defined and glibc declines);
+  // the emitted crate wrote `before abort`, because Rust's `Stdout` is a
+  // LineWriter that had already flushed on the newline. The defect was never
+  // abort -- it was the BUFFERING MODEL of every emitted crate, and nothing
+  // local to this call could fix it (flushing here writes MORE than glibc,
+  // not less). FR-228 gave the crate C's model (`emitStdoutRuntime`), so the
+  // two now agree: `abort` flushes nothing on either side, and the shape is
+  // pinned by test/EndToEnd/stdout-buffering-abort.c against the clang
+  // native with stdout redirected to a file.
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("std::process::abort"),
+      /*args=*/ArrayAttr(), ValueRange{});
+  return success();
 }
 
 const clang::CallExpr *
