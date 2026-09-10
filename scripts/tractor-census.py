@@ -163,7 +163,7 @@ def recover_blockers(case, cc: Path, out_dir: Path, extra_cflags: str):
         got = set()
         for line in (proc.stderr or "").splitlines():
             if "unsupported:" in line:
-                got.add(line.split("unsupported:", 1)[1].strip()[:90])
+                got.add(line.split("unsupported:", 1)[1].strip()[:110])
         return got, (note or "no-progress-json"), dropped
 
     try:
@@ -178,9 +178,19 @@ def recover_blockers(case, cc: Path, out_dir: Path, extra_cflags: str):
             continue
         if (it.get("status") or "") in ("ported", "ok", "clean"):
             continue
-        b = it.get("blocker") or it.get("reason") or it.get("detail") or ""
+        # PREFER THE FULL DIAGNOSTIC OVER THE COARSE TAG. Each item carries
+        # both: `blocker` is a short bucket ("other", "libc:sqrtf",
+        # "unreached-by-import") and `diagnostic` is the sentence the user
+        # sees. Ranking on the tag collapsed 124 of 211 non-passing cases into
+        # a single "other" bucket, which makes the set-cover below meaningless
+        # for exactly the cases that matter most -- an instrument that reports
+        # "fix `other` for +36" has told you nothing. `normalize` then folds
+        # `object 'buffer'` and `object 'p'` into one class, so preferring the
+        # sentence does not re-inflate the count the way a raw histogram would.
+        b = (it.get("diagnostic") or it.get("blocker") or it.get("reason")
+             or it.get("detail") or "")
         if b:
-            blockers.add(str(b).strip()[:90])
+            blockers.add(str(b).strip()[:110])
     return blockers, note, dropped
 
 
@@ -233,6 +243,7 @@ def main() -> int:
     scored = {r.get("case"): (r.get("outcome"), r.get("detail") or "")
               for r in rows}
     passing = {k for k, (o, _) in scored.items() if o == TE.PASS}
+    kinds = {r.get("case"): r.get("kind") for r in rows}
     print(f"  scored: PASS {len(passing)} / {len(scored)}", flush=True)
 
     # --- stage 2: the COMPLETE blocker set, recover mode -------------------
@@ -316,21 +327,43 @@ def main() -> int:
           "`kind` in the\nrubric's results.json before quoting any of these "
           "as a yield.")
 
-    # set cover over the top candidates
-    cands = [b for b, _ in freq.most_common(24)]
-    print(f"\nSET COVER over the top {len(cands)} blockers "
-          f"(combinations up to {args.max_combo}):")
+    # SET COVER. Two exclusions, both of which changed the answer materially
+    # when they were added, so neither is cosmetic:
+    #
+    #   * NON-ACTIONABLE MARKERS. `unreached-by-import` is not a blocker
+    #     anybody can fix -- it means clang never parsed the case. Leaving it
+    #     in the candidate pool let the optimiser "spend" a fix on it and
+    #     report a 4-fix set of +34, which no amount of engineering could
+    #     deliver.
+    #   * PARTIAL CASES. A case with a dropped item hides an unknown
+    #     remainder, so counting it as CLEARED asserts something the
+    #     instrument cannot see. Excluding them makes every number below a
+    #     case that really would clear the EMIT stage.
+    #
+    # The result is still EMIT-only: a `lib` case that clears emit must then
+    # export a dlsym-able symbol, which is why the exec/lib split is printed.
+    NON_ACTIONABLE = {"unreached-by-import", ""}
+    solid = {k: v - NON_ACTIONABLE for k, v in todo.items()}
+    solid = {k: v for k, v in solid.items() if v and not dropped.get(k)}
+    cands = [b for b, _ in collections.Counter(
+        b for v in solid.values() for b in v).most_common(20)]
+    print(f"\nSET COVER over the top {len(cands)} ACTIONABLE blockers, "
+          f"partial cases excluded\n(combinations up to {args.max_combo}); "
+          f"{len(solid)} of {len(todo)} non-passing cases qualify:")
     best_by_size = {}
     for k in range(1, args.max_combo + 1):
         best = (0, None)
         for combo in itertools.combinations(cands, k):
             s = set(combo)
-            cleared = sum(1 for v in todo.values() if v and v <= s)
+            cleared = sum(1 for v in solid.values() if v <= s)
             if cleared > best[0]:
                 best = (cleared, combo)
         best_by_size[k] = best
         if best[1]:
-            print(f"  {k} fix(es) -> +{best[0]} cases")
+            got = [c for c, v in solid.items() if v <= set(best[1])]
+            nexec = sum(1 for c in got if kinds.get(c) == "exec")
+            print(f"  {k} fix(es) -> +{best[0]} EMIT   "
+                  f"(exec {nexec}, lib {len(got) - nexec})")
             for b in best[1]:
                 print(f"        {b[:72]}")
         else:
