@@ -23,6 +23,27 @@ every one of those cases also needs four other fixes. Conversely a blocker in
 6 cases is worth 6 if it is the ONLY thing those 6 need. Marginal yield is a
 property of the SET, not of the histogram, and no histogram can show it.
 
+EVERY DEPTH THIS TOOL REPORTS IS A LOWER BOUND, and the instrument cannot be
+made exact. `--recover` drops whole TOP-LEVEL ITEMS, so every blocker INSIDE a
+rejected function is invisible: the importer bails at the first error in a
+body, recovery discards the whole function, and nothing further in it is ever
+attempted. Measured instance -- B01_synthetic/004_nineality_sieve reports
+depth 1 (`argv`) and actually needs at least four (argv, the strtol family
+with an `endptr` out-parameter, `fprintf` to stderr, and a pointer-identity
+test of `endptr` against `argv[1]`), none of which can surface while `main` is
+dropped. Cases with a non-zero `dropped_items` count are therefore ranked on
+partial information and are flagged as such in the report.
+
+TWO CLASSES OF CASE YIELD NO INFORMATION AT ALL, and they are distinguished in
+`notes` because the remedies differ:
+  * `dropped-main`  -- recovery dropped `c_main`, so a BIN crate cannot be
+    emitted ("the input does not define a 'main' function") and no progress
+    JSON is written. Retried automatically as `--crate-type=lib`, which does
+    produce one; the depth is still a lower bound per the paragraph above.
+  * `no-progress-json` -- the case never reached the importer, because clang
+    failed to PARSE it (a missing header, an unset build-system macro). No
+    importer-side remedy exists; the dependency has to be present first.
+
 Usage:
     nix develop -c python3 scripts/tractor-census.py <corpus> \
         --emitrust-cc build/tools/emitrust-cc --out <dir> [-j N]
@@ -39,6 +60,7 @@ import importlib.util
 import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -94,27 +116,60 @@ def recover_blockers(case, cc: Path, out_dir: Path, extra_cflags: str):
             cmd += ["-I", inc]
         cmd += list(case.glob_sources)
 
-    try:
-        proc = subprocess.run(cmd, cwd=str(case.root), capture_output=True,
-                              text=True, timeout=RECOVER_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return set(), "recover timed out"
+    def run(argv):
+        try:
+            return subprocess.run(argv, cwd=str(case.root), capture_output=True,
+                                  text=True, timeout=RECOVER_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return None
+
+    proc = run(cmd)
+    if proc is None:
+        return set(), "recover timed out", 0
 
     prog = crate / "emitrust-progress.json"
+    note = ""
+    if not prog.exists() and "does not define a 'main' function" in (
+            proc.stderr or ""):
+        # THE DROPPED-MAIN BLIND SPOT. Recovery dropped `c_main`, so the bin
+        # crate cannot be emitted and NOTHING is written -- not even the
+        # progress JSON this tool reads. The census then scored the case
+        # depth 0, i.e. reported no information for exactly the cases whose
+        # single function failed. emitrust-cc's own diagnostic names the
+        # remedy ("Drop --crate-type=bin to emit a library crate instead"),
+        # so take it: a lib crate emits the surviving items and their
+        # progress record. The depth stays a LOWER BOUND -- whatever `main`
+        # needed beyond its first blocker is still unreachable -- but a lower
+        # bound of 1 with a dropped item flagged beats a silent 0.
+        shutil.rmtree(crate, ignore_errors=True)
+        retry = [("--crate-type=lib" if a.startswith("--crate-type=") else a)
+                 for a in cmd]
+        retry = [a for a in retry if a != "--c-abi-exports"]
+        proc = run(retry) or proc
+        note = "dropped-main"
+
+    # How many top-level items recovery discarded. Any non-zero count means
+    # this case's blocker set is PARTIAL by construction: the interior of a
+    # dropped item is never imported, so its remaining blockers cannot appear.
+    dropped = len(re.findall(r"^\s*\S+:\d+:\d+: dropped ",
+                             proc.stderr or "", re.M))
+
     if not prog.exists():
-        # Recovery could not produce a crate at all: fall back to the
-        # diagnostics, deduped by wording. Recorded as a distinct note so a
-        # reader never mistakes it for a progress-derived set.
+        # The case never reached the importer at all -- clang failed to parse
+        # it (missing header, unset build-system macro). Fall back to the
+        # diagnostics, deduped by wording, and record a DISTINCT note so a
+        # reader never mistakes it for a progress-derived set nor for the
+        # dropped-main class above, which has a different remedy.
         got = set()
         for line in (proc.stderr or "").splitlines():
             if "unsupported:" in line:
                 got.add(line.split("unsupported:", 1)[1].strip()[:90])
-        return got, "no-progress-json"
+        return got, (note or "no-progress-json"), dropped
 
     try:
         data = json.loads(prog.read_text())
     except (OSError, json.JSONDecodeError):
-        return set(), "progress unreadable"
+        return set(), "progress unreadable", dropped
 
     blockers = set()
     items = data.get("items") or data.get("entries") or []
@@ -126,7 +181,7 @@ def recover_blockers(case, cc: Path, out_dir: Path, extra_cflags: str):
         b = it.get("blocker") or it.get("reason") or it.get("detail") or ""
         if b:
             blockers.add(str(b).strip()[:90])
-    return blockers, ""
+    return blockers, note, dropped
 
 
 def normalize(b: str) -> str:
@@ -137,7 +192,6 @@ def normalize(b: str) -> str:
     counting them apart would re-inflate exactly the way a first-failure
     histogram does.
     """
-    import re
     b = re.sub(r"'[^']*'", "'X'", b)
     b = re.sub(r"\b\d+\b", "N", b)
     return b.strip()
@@ -192,10 +246,13 @@ def main() -> int:
 
     sets = {}
     notes = {}
-    for name, blockers, note in recs:
+    dropped = {}
+    for name, blockers, note, ndropped in recs:
         sets[name] = {normalize(b) for b in blockers}
         if note:
             notes[name] = note
+        if ndropped:
+            dropped[name] = ndropped
 
     # --- stage 3: the analysis that the histograms could not give ----------
     todo = {k: v for k, v in sets.items() if k not in passing}
@@ -206,9 +263,20 @@ def main() -> int:
     print(f"\nnon-passing cases: {len(todo)}", flush=True)
 
     depth = collections.Counter(len(v) for v in todo.values())
-    print("\nBLOCKER-SET DEPTH (how many distinct fixes a case needs):")
+    print("\nBLOCKER-SET DEPTH -- A LOWER BOUND, NOT A COUNT.")
+    print("  (--recover drops whole top-level items, so blockers INSIDE a")
+    print("   rejected function never surface; see the module docstring.)")
     for d in sorted(depth):
-        print(f"  {depth[d]:4} cases need {d} fix(es)")
+        print(f"  {depth[d]:4} cases need AT LEAST {d} fix(es)")
+    partial = sum(1 for k in todo if dropped.get(k))
+    blind = sum(1 for k in todo if notes.get(k) == "no-progress-json")
+    dm = sum(1 for k in todo if notes.get(k) == "dropped-main")
+    print(f"\n  {partial} of {len(todo)} non-passing cases had >=1 DROPPED item,")
+    print("  so their depth is partial by construction and they are ranked")
+    print("  on incomplete information.")
+    print(f"  {dm} recovered only as a lib crate (main was dropped).")
+    print(f"  {blind} never reached the importer at all (clang could not parse")
+    print("  them); no importer-side fix applies until the dependency exists.")
 
     freq = collections.Counter()
     for v in todo.values():
@@ -217,16 +285,36 @@ def main() -> int:
     for b, n in freq.most_common(12):
         print(f"  {n:4}  {b[:76]}")
 
+    # THE NUMBER PEOPLE RANK ON, so it is split by how much it can be
+    # trusted. A depth-1 case with NO dropped item genuinely needs one fix:
+    # every other item imported, and this was the only complaint. A depth-1
+    # case WITH a dropped item needs one fix TO GET FURTHER -- the dropped
+    # item's interior was never imported, so its remaining blockers cannot
+    # have been counted. Ranking work on the second group as though it were
+    # the first is the first-failure error wearing a set-cover costume.
     solo = collections.Counter()
-    for v in todo.values():
-        if len(v) == 1:
-            solo.update(v)
-    print("\nSOLE BLOCKER (fixing this ALONE clears the case) -- the real "
-          "marginal yield:")
+    solo_partial = collections.Counter()
+    for name, v in todo.items():
+        if len(v) != 1:
+            continue
+        (solo_partial if dropped.get(name) else solo).update(v)
+    print("\nSOLE BLOCKER, CONFIRMED (no dropped items, so fixing this ALONE "
+          "clears\nthe case at the EMIT stage) -- the real marginal yield:")
     if not solo:
-        print("  (none: every non-passing case needs two or more fixes)")
+        print("  (none)")
     for b, n in solo.most_common(12):
         print(f"  +{n:3}  {b[:76]}")
+    if solo_partial:
+        print("\nSOLE BLOCKER, PARTIAL (this case ALSO dropped an item whose "
+              "interior was\nnever imported -- fixing this reveals the next "
+              "blocker, it does not clear\nthe case). DO NOT ADD THESE TO THE "
+              "CONFIRMED COLUMN:")
+        for b, n in solo_partial.most_common(12):
+            print(f"  ?{n:3}  {b[:76]}")
+    print("\nAND AT THE EMIT STAGE ONLY. A `lib` case that clears emit must "
+          "still\nexport a dlsym-able symbol before it counts as PASS; check "
+          "`kind` in the\nrubric's results.json before quoting any of these "
+          "as a yield.")
 
     # set cover over the top candidates
     cands = [b for b, _ in freq.most_common(24)]
@@ -253,9 +341,12 @@ def main() -> int:
         "pass": sorted(passing),
         "blocker_sets": {k: sorted(v) for k, v in sets.items()},
         "notes": notes,
+        "dropped_items": dropped,
+        "depth_is_lower_bound": True,
         "depth": {str(k): v for k, v in depth.items()},
         "frequency": dict(freq.most_common()),
-        "sole_blocker": dict(solo.most_common()),
+        "sole_blocker_confirmed": dict(solo.most_common()),
+        "sole_blocker_partial": dict(solo_partial.most_common()),
         "set_cover": {str(k): {"cleared": v[0], "fixes": list(v[1] or [])}
                       for k, v in best_by_size.items()},
     }
