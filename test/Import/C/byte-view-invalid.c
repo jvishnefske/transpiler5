@@ -33,9 +33,14 @@
 //     free -- this pin exists so a change to the byte view cannot quietly
 //     remove it.
 //
-// (5) `(unsigned char *)&arr` (FR-229 capability E, Wave 2) keeps its
-//     existing refusal verbatim: it is out of this wave's scope and must
-//     not be admitted by accident through the aggregate path.
+// (5) `(unsigned char *)&arr` OVER A NON-BYTE ELEMENT TYPE. Wave 2's
+//     capability E admits the `&arr` spelling for a BYTE array (see
+//     byte-view-array.c), and `array-base.c` below is the rejecting side
+//     of that pin: `int a[3]` is the object representation of an ARRAY,
+//     which is a different piece of work from a byte array's domain
+//     crossing, and it must keep its refusal verbatim. Widening an
+//     admitted `char[]` to a non-byte element type has to make the shape
+//     STOP qualifying, and this is where that is checked.
 //
 // (6) A MUTABLE view on a call path with NO post-call write-back point.
 //     The C++ method-call path is that path -- it builds its call op

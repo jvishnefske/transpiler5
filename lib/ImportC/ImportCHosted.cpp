@@ -1189,6 +1189,22 @@ LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call,
               ? nullptr
               : asMultiBasePointerRead(call->getArg(1)))
     return emitMultiBaseMemcpy(call, name, *dst, multiSrc, loc);
+  // FR-229 Wave 2 (capability C): `memcpy(dst, &obj, sizeof obj)` — the
+  // source is the OBJECT REPRESENTATION of a local scalar or padding-free
+  // aggregate, which the typed model never materializes, so there is no
+  // source region for `emitByteRegionArg` below to resolve at all (it
+  // rejects with `the address of a scalar object is not a string region`,
+  // which is where the corpus 037/038/039 family dies today). The
+  // representation is scattered directly into `dst` instead. Every shape
+  // this declines falls straight through to that unchanged rejection.
+  {
+    FailureOr<bool> handled =
+        tryEmitObjectRepresentationMemcpy(call, name, *dst, loc);
+    if (failed(handled))
+      return failure();
+    if (*handled)
+      return success();
+  }
   FailureOr<CharRegionArg> src = emitByteRegionArg(
       call->getArg(1), /*isMut=*/false, /*interceptMember=*/true);
   if (failed(src))

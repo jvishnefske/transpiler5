@@ -95,8 +95,13 @@ roughly that factor wrong.
 ## 4. Subagent TDD
 
 Dispatch to subagents with a precise, fact-grounded spec (file:line anchors
-you verified yourself — **re-verify them, they move**; one spec's anchor had
-shifted 300 lines). Tests are written first, in the house style: every test
+**you ran the tool to confirm, not ones you copied from a spike or an FR
+entry**). This is the single most repeated mistake in this repo's specs: one
+anchor had shifted 300 lines, and FR-229's two waves BOTH carried a wrong one
+— in each case the named line existed but the case never reached it, because
+an earlier rejection fired first. A plausible anchor that is never executed
+costs the agent an hour. Confirm by running `emitrust-cc` on the actual input
+and reading which diagnostic fires. Tests are written first, in the house style: every test
 file opens with an intent comment saying what invariant it pins and why.
 
 Tell the agent: **implement first, sweep the corpus afterwards.** Six agents
