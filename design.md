@@ -14725,6 +14725,79 @@ piece and becomes FR-45.
   in an fn-ptr table payload -- so shortening it needs a position-aware rule,
   not a blanket change.
 
+- [x] FR-232 DEFECT (opened and LANDED 2026-09-10, found while landing FR-231
+  and reproduced before filing): **AN ENUM INSIDE A NAMESPACE TOOK NO
+  NAMESPACE PREFIX AT ALL, AND THE ITEM GRAPH WAS SILENTLY COLLAPSING NODES
+  BECAUSE OF IT.**
+  **WORTH +0 TRACTOR** -- C has no namespaces. A correctness fix for legal C++
+  that was being refused, filed as one.
+  THE REPRO, two defects in one line:
+      namespace lib { enum Color { Red, Green }; }
+      enum Color { Blue, Black };
+      -> error: conflicting definition of enum 'Color' with a different shape
+         in another translation unit
+  Those are distinct enums in different namespaces, so **nothing conflicts**;
+  and they are in the SAME translation unit, so **"in another translation
+  unit" is factually false**. Isolated, a namespaced enum emitted a bare
+  `struct Color(u32)` while a namespaced RECORD under identical conditions
+  emitted `NsLibS`.
+  **ONE ROOT CAUSE.** `namespacePrefix` was applied at exactly three sites --
+  records, functions, globals -- and **there was no enum site**; the dedup map
+  `importedEnumShapes` was keyed on the BARE C spelling, so two enums in
+  different namespaces shared a key. `enumRustName` now mirrors
+  `recordRustName` (prefix before the camel fold, `namespaceModulePath` under
+  FR-231's flag), the dedup key is the EMITTED symbol, and the five other
+  `enumTypeRustName` call sites move with it.
+  **THE FR-40 ITEM GRAPH WAS SILENTLY COLLAPSING NODES, which is the finding
+  that outranks the diagnostic.** On the new test the pre-fix graph emits
+  **5 enum nodes for 7 enums** -- `ns::Color` onto `Color`, `q::E` onto
+  `p::E`. `CSymbolNaming.h`'s own header says the graph's node keys must BE
+  the emitted item names byte for byte precisely so the two cannot drift; the
+  enum path had drifted, and `ItemGraph.h`'s doc explicitly (and wrongly) said
+  enums keep a bare spelling. Both corrected, pinned with a `GRAPH-DAG` leg.
+  **FIVE OF MY SIX ANCHORS HAD MOVED, AND I CAUSED IT.** `namespacePrefix` is
+  at `:279` not `:265`, `recordRustName` at `:177`, the call sites at
+  `:225`/`:808`/`:861` not `:211`/`:725`/`:768` -- because **FR-231 shifted
+  them an hour earlier and I reused pre-FR-231 line numbers.** Self-inflicted
+  staleness of exactly the kind the protocol's anchor rule exists for. There
+  are also three parallel `namespaceModulePath` sites the spec never
+  mentioned; `enumRustName` covers both shapes.
+  **A CORRECTION TO MY SPEC: `std::` ENUMS DO TAKE THE PREFIX NOW.** I told
+  the implementer that `std::` types never reach this path, which is true for
+  RECORDS only -- `mapType` diverts a `RecordType` in `std` to
+  `mapStdLibraryType` before `importRecord`, and **there is no such arm for
+  `EnumType`**. So `std::float_round_style` becomes `NsStdFloatRoundStyle`.
+  Kept deliberately: it is the safe direction, since it is what stops a user
+  `enum float_round_style` composing onto libstdc++'s. Zero goldens moved,
+  because nothing in the tree emitted a `std::` enum -- and the pre-fix
+  binary in fact REJECTED such a program from inside `<limits>`, a false
+  clause pointing at a system header.
+  Enum VARIANTS need no prefix, confirmed by `p::E{A}` beside `q::E{A}`
+  emitting `NsPE::A` and `NsQE::A` and printing different values at runtime.
+  **TWO RESIDUAL SAME-TU COLLISIONS PINNED AS REJECTIONS RATHER THAN FIXED**,
+  each now telling the truth about which TU it is in: an enum nested in a
+  RECORD (`namespacePrefix` walks `NamespaceDecl` only -- the same posture
+  `recordRustName` takes for a nested class) and a BLOCK-SCOPE enum (records
+  get a `<function>_<tag>` mangle; enums have none). Giving enums a
+  record-owner prefix or a block-scope mangle is separate work.
+  Same-TU SAME-shape collisions still dedup silently, unchanged and
+  deliberately: unlike a record an enum has no methods, so two identical
+  shapes emit literally the same item and the dedup cannot miscompile.
+  New wording, with mirrored `RejectionLedger`/`classify_blocker` rows
+  verified by CALLING `classify_blocker`: `unsupported: enum 'X' collides with
+  the emitted name of a different enum in this translation unit`
+  (`enum-name-clash`). The cross-TU wording is retained where it is true and
+  now names the emitted symbol, which is the key that actually collided.
+  Gate 1070/1070 (1066 + 4 new). Golden movement over 1341 files x
+  {plain, `--namespace-modules`}: **0 bytes shifted under an already-emitting
+  test, 0 emit->reject, 2 reject->emit** (both the new tests, the intended
+  flip). Clippy 57 (+0), binding both axes flat with statements unmoved,
+  CTestSuite 220/220, Cpp17Suite 35/35, TRACTOR 57/252 (+0 as predicted). All
+  re-verified independently in the main tree.
+  MINOR, UNRELATED, NOT FIXED: `?:` on enum operands is refused
+  (`conditional operator on a non-scalar operand`), a pre-existing gap the
+  EndToEnd test had to work around with an `if`.
+
 - [ ] FR-228 (opened 2026-09-09, found by the FR-224 implementation's own
   byte-diff oracle while trying to admit `abort`): **EVERY EMITTED CRATE HAS
   THE WRONG STDOUT BUFFERING MODEL, AND EXACTLY ONE CONSTRUCT MAKES IT

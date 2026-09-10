@@ -191,6 +191,15 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
      llvm::StringLiteral("enum-def-rejected")},
     {llvm::StringLiteral("conflicting definition of enum"),
      llvm::StringLiteral("enum-def-rejected")},
+    // FR-108 enum arm: the SAME-TU half of the enum dedup guard, split out
+    // of the cross-TU wording above because it is a different blocker --
+    // two enums of one unit composing one emitted symbol, which no amount
+    // of shard merging can resolve. Language-agnostic (a plain C program
+    // reaches it through a block-scope `enum E` beside a file-scope one),
+    // so the tag carries no `cxx-` prefix, exactly like `record-name-clash`.
+    // Mirrored into test/RealWorld/run_realworld.py.
+    {llvm::StringLiteral("collides with the emitted name of a different enum"),
+     llvm::StringLiteral("enum-name-clash")},
     // FR-122: the cross-TU record dedup key now folds in the ODR hash of
     // the member surface, so a name reused with divergent members (dtor
     // presence/body, method bodies) rejects under the same wording the

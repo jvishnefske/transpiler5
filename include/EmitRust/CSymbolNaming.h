@@ -227,6 +227,57 @@ static inline std::string recordRustName(const clang::RecordDecl *record) {
   return idiomaticRenameEnabled() ? toUpperCamelCase(spelled) : spelled;
 }
 
+/// The emitted symbol of a NAMED enum definition: `enumTypeRustName`'s
+/// casing fold layered on the same namespace qualification
+/// `recordRustName` applies, and the ONE spelling every consumer must use
+/// (the `emitrust.enum_def` symbol, every `!emitrust.enum` type reference,
+/// the `Type::VARIANT` constant path, the FR-40 item-graph node key, and
+/// the cross-TU dedup key in `importEnumUncached`). Returns the empty
+/// string for an anonymous enum, which has no Rust counterpart at all --
+/// its enumerators import as plain `i32` constants at their use sites.
+///
+/// FR-108 applied the namespace prefix to records, functions and globals
+/// and left the enum out, which broke BOTH directions at once. Legal C++
+/// was refused: `namespace lib { enum Color { .. }; }` emitted a bare
+/// `Color`, so an unrelated top-level `enum Color` collided with it inside
+/// ONE translation unit and the dedup rejected the program with a message
+/// that blamed "another translation unit" -- there was only one. And when
+/// the two shapes happened to AGREE the dedup merged them silently into a
+/// single Rust type, the exact channel FR-108 closed on the record side.
+///
+/// Composition mirrors `recordRustName` deliberately rather than being
+/// reinvented, so the two cannot drift: the prefix goes on BEFORE the
+/// idiomatic camel fold (`ns::Color` -> `NsNsColor`, never an
+/// `ns_ns_Color` that rustc's denied `non_camel_case_types` refuses), and
+/// under `--namespace-modules` the flattening prefix is replaced by the
+/// ABSOLUTE module path with the fold applied to the LEAF alone, so a
+/// namespaced enum lands inside its `mod` exactly as a namespaced struct
+/// does (the emitter's FR-159 bucketing already accepts
+/// `emitrust.enum_def`). Being a pure function of the AST it composes for
+/// free at the sites that recompute a symbol without importer state
+/// (`ItemGraphBuilder::enumSymbolFor`, `CImporter::graphItemSymbol`).
+///
+/// ENUMERATORS take no prefix: an enumerator lowers to an associated const
+/// of the tuple struct (`NsPE::A`), so the already-qualified TYPE is what
+/// separates two namespaces' identical enumerator spellings.
+///
+/// Unlike records there is no `std::` diversion upstream of this
+/// (`mapType` sends a `RecordType` in namespace `std` to
+/// `mapStdLibraryType` before `importRecord` ever runs; an `EnumType` has
+/// no such arm), so a `std::` enum DOES take an `ns_std_` prefix. That is
+/// the consistent answer, not an exception: it is what keeps a
+/// `std::`-scoped enum from composing onto a user enum of the same name.
+static inline std::string enumRustName(const clang::EnumDecl *enumDecl) {
+  llvm::StringRef name = enumDecl->getName();
+  if (name.empty())
+    return {};
+  if (namespaceModulesEnabled())
+    return namespaceModulePath(enumDecl->getDeclContext()) +
+           enumTypeRustName(name);
+  return enumTypeRustName(
+      joinSymbolPrefix(namespacePrefix(enumDecl->getDeclContext()), name));
+}
+
 /// FR-73: joins a structural symbol prefix (the per-TU statics tag
 /// `tu<i>_`, the namespace chain `ns_a_`) onto a mangled base name without
 /// manufacturing consecutive underscores. Every non-empty prefix ends in

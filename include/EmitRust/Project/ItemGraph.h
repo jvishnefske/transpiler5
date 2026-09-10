@@ -75,10 +75,13 @@
 ///    block-scope mangle. Consequently only NAMED, FILE-SCOPE records and
 ///    enums become nodes; an anonymous or block-scope one is skipped
 ///    entirely rather than given a name that might not match the emitted
-///    item. Enums keep their bare `enumTypeRustName` spelling: the importer
-///    has no enum rename, and an enum whose name an ordinary identifier
-///    claims is a program the importer rejects ("collides with an existing
-///    symbol"), so no emitted name exists to match.
+///    item. Enums key on `enumRustName` -- the same namespace-qualified
+///    spelling the importer emits (FR-108's enum arm), recomputed from the
+///    AST alone exactly as `recordSymbolFor` recomputes a record's. The
+///    importer has no enum tag-versus-ordinary rename to reproduce: an enum
+///    whose name an ordinary identifier claims is a program the importer
+///    rejects ("collides with an existing symbol"), so no emitted name
+///    exists to match.
 ///  - C++ member functions are not nodes. `importDeclsIn` never reaches them
 ///    (they are declared inside a `CXXRecordDecl`, not at item scope), and
 ///    their emitted name comes from `CImporter::cxxMethodMangledName`, which

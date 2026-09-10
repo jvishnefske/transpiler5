@@ -405,7 +405,8 @@ CImporter::recoverPlannerRejection(const clang::Decl *attribution,
 //   (the rejection is still located and counted, just not joined to its
 //   node) rather than joining under a wrong key.
 // - Enums: the graph key is `ItemGraphBuilder::enumSymbolFor` =
-//   `enumTypeRustName(name)` (UpperCamel under the idiomatic rename).
+//   `enumRustName(decl)` (the namespace-qualified symbol, UpperCamel-folded
+//   under the idiomatic rename).
 //   frontierExcludedSymbol's pre-FR-115 arm used the raw `getName()`, a
 //   latent case mismatch: the FR-43 excluded set holds graph keys, so a
 //   raw spelling could only ever match a name that was already UpperCamel.
@@ -429,7 +430,7 @@ std::string CImporter::graphItemSymbol(const clang::Decl *decl) const {
     const clang::EnumDecl *definition = enumDecl->getDefinition();
     if (!definition)
       return {};
-    symbol = enumTypeRustName(definition->getName());
+    symbol = enumRustName(definition);
   } else if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
     symbol = cGlobalSymbolName(var, currentTuTag);
   } else {

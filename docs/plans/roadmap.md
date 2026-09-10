@@ -100,9 +100,10 @@ byte of every crate that prints.** Fund it for correctness, not for the case.
 
 ## Open, non-yield
 
-- **FR-231 residue** — an `enum` inside a namespace takes **no namespace
-  prefix at all**, in both flag modes, so `namespace lib { enum Color … }`
-  emits a root-level `Color`. A pre-existing collision hazard, unfiled.
+- ~~FR-231 residue — the namespaced `enum` prefix~~ — **FIXED, FR-232.** It
+  was worse than reported: the FR-40 item graph was silently collapsing nodes
+  (5 for 7 enums) because the enum path had drifted from the emitted-symbol
+  contract `CSymbolNaming.h` exists to enforce.
 - **FR-230's rounding looseness** — `int *p = malloc(10)` now backs
   `[i32; 3]`, so writing `p[2]` (UB in C) succeeds *silently* rather than
   trapping. No defined program changes behaviour, but the emitted crate can

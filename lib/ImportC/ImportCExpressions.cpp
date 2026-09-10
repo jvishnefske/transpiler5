@@ -8140,11 +8140,16 @@ FailureOr<Value> CImporter::emitEnumConstant(
   // even when the enum type itself is never named.
   if (failed(importEnum(definition, loc)))
     return failure();
-  std::string path = (llvm::Twine(enumTypeRustName(definition->getName())) +
+  // FR-108 enum arm: the type half of the path is the NAMESPACE-QUALIFIED
+  // symbol (`NsNsColor::RED`, and under `--namespace-modules` the absolute
+  // `crate::ns::Color::RED`); the enumerator half takes no prefix of its
+  // own, because the qualified type is already what separates two
+  // namespaces' identical enumerator spellings.
+  std::string enumSymbol = enumRustName(definition);
+  std::string path = (llvm::Twine(enumSymbol) +
                       "::" + enumVariantRustName(enumerator->getName()))
                          .str();
-  auto type = emitrust::EnumType::get(
-      builder.getContext(), enumTypeRustName(definition->getName()));
+  auto type = emitrust::EnumType::get(builder.getContext(), enumSymbol);
   auto value = emitrust::OpaqueAttr::get(builder.getContext(), path);
   return builder.create<emitrust::ConstantOp>(loc, type, value).getResult();
 }
