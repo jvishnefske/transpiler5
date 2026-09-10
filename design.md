@@ -13577,6 +13577,92 @@ piece and becomes FR-45.
   storage, conversion, passing and printing. A real 80-bit type is not
   available -- Rust has no `f80`.
 
+- [ ] FR-220 (opened 2026-09-09 from an owner question -- "is there a way to
+  not emit dead code and remove the override"): **THE ANSWER IS NOT TO STOP
+  EMITTING IT. THE `#![allow(dead_code)]` HIDES 56 WARNINGS ACROSS 294 CRATES,
+  ZERO OF THEM THE ONE KIND THAT WOULD SIGNAL AN EMITTER DEFECT.**
+  MEASURED at HEAD over the whole epoch-7 population, blanket allow stripped
+  and every crate built: **only 33 of 294 crates warn at all, 56 warnings
+  total -- 89% of emitted crates are already clean.** By kind:
+      21  associated constants -- C ENUMERATORS the TU never mentions
+      15  fields never read
+      10  structs never constructed
+       6  methods never used (C++ methods and FR-62 actor arms)
+       4  variants never constructed
+  **ZERO `function X is never used`.** Not one, across 294 crates. That is the
+  decisive datum: a dead emitted `fn` is the case that would indicate an
+  EMITTER DEFECT, and it never fires -- while every warning that DOES fire is
+  faithful translation of a declaration the C program made and did not use.
+  `enum Code { ..., C_LAST_UNUSED = 99 }` emits
+  `impl Code { const C_LAST_UNUSED: Code = Code(99); }`, and C compilers do
+  not complain about an unmentioned enumerator either.
+  **DROPPING THE ITEMS IS THE WRONG LEVER, and the FR-40 item graph cannot
+  support it anyway.** Its own scope note disqualifies it three ways: "C++
+  member functions are not nodes" (yet 6 of the 56 are exactly those), "only
+  NAMED, FILE-SCOPE records and enums become nodes", and "the graph is CLOSED
+  -- an edge is emitted only when BOTH endpoints are nodes". A closed graph
+  with skipped node classes **systematically UNDER-reports reachability**, so
+  it will call live items dead. That is safe for placing an `#[allow]` and
+  unsafe for deleting anything. Dropping declarations is also a fidelity loss
+  under `--link`, where another shard may reference them.
+  **THE REPO ALREADY HAS THE PATTERN, one line above the allow in question:**
+  `unused_assignments` was moved out of the blanket header onto the individual
+  `fn` that needs it -- "measured: 4 of 3475 emitted functions across 472
+  rustc-clean crates. Moving the allow back into this header would delete the
+  tripwire on the other 3471." Every other lint the old blanket header
+  silenced is now DENIED in `Cargo.toml`'s `[lints.rust]`; `dead_code` is the
+  last survivor.
+  PLAN: put `#[allow(dead_code)]` on the emitted ENUM impl block, the STRUCT
+  (which covers its fields), and the C++ IMPL block -- all of which the
+  emitter knows it is writing, with no analysis required -- leave plain `fn`
+  uncovered, and add `dead_code = "deny"` to the lints table so a future dead
+  function is a HARD BUILD ERROR. Costs nothing today because it fires zero
+  times.
+  COSTS TO WEIGH, both real: this shifts emitted bytes on EVERY crate, so it
+  is a full byte-diff wave with substantial golden movement, not a tidy-up.
+  And one producer is deliberate -- `rollbackTo`
+  (`CImporterInternal.h:1985-1996`) leaves unused definitions rather than
+  unwinding a dozen registries, because a missed one is "a dangling symbol
+  rather than a dead one"; its comment cites the blanket allow as cover and
+  would need the targeted attribute instead. `--preserve-c-names` carries its
+  own allow header with three naming lints and needs the same treatment.
+
+- [ ] FR-221 (opened 2026-09-09; **THE LARGEST MEASURED LEVER IN THE TRACTOR
+  CORPUS AND IT HAS NEVER BEEN SPIKED**): **`aliasing mutable pointer
+  arguments` IS 83 OF 202 EMIT_FAIL CASES -- 41% OF ALL FAILURES AND 33% OF
+  THE WHOLE 252-CASE CORPUS.**
+  Surfaced by the FR-215 spike as an aside while it was measuring something
+  else, and re-derived at HEAD: the next genuine reason is 8. The 48
+  `missing header (openssl/conf.h)` above it are SPHINCS+ variants where that
+  is only the FIRST failure, worth +0 (FR-178, measured twice) -- so this is
+  roughly a TEN-FOLD lead over anything else on the board.
+  THE CHECK: `ImportCExpressions.cpp:3140-3160` refuses a call when two
+  arguments borrow the same root object, or the same heap allocation:
+  `unsupported: aliasing mutable pointer arguments (two arguments borrow
+  object 'X')`.
+  THE ARCHETYPE is `B01_organic/merge_sort_lib` -- `merge(arr, lo, mid, hi)`,
+  two slices of ONE array. That is not an aliasing hazard a human would
+  recognise; it is the single most ordinary shape in C.
+  **THE LEAD, and it is a strong one: FR-201 ALREADY SOLVED A SIBLING OF
+  THIS.** FR-201 established that the `mem*`/`str*` two-cursor unbuildable was
+  **BORROW GRANULARITY in the Phase-4 owner lift, not aliasing** -- the tell
+  being that DISJOINT ranges failed too. Its fix routed same-region cursors
+  through `__emitrust_memcpy_within`. FR-181 separately noted
+  `__emitrust_split_mut_u8` was "not needed" for FR-201's shape. Two slices of
+  one array is exactly what `split_at_mut` exists for in Rust, so the question
+  a spike must answer is whether the 83 are the same granularity problem
+  generalised, or genuine aliasing that no representation fixes.
+  CONSTRAINTS THAT DO **NOT** APPLY, so a spike does not mis-scope itself:
+  FR-181's HARD NO-GO is about the multi-reference C-ABI EXPORT boundary
+  (`noalias` on two `&mut` built from two C pointers a caller may legally
+  alias) -- these are INTERNAL calls, a different question. And FR-136's
+  points-to NO-GO stands: do not re-attempt points-to without a new idea.
+  FR-203 (2026-09-07) is recent adjacent context -- it fixed the
+  receiver/argument arm of this same family, where `placeExprRoot` never
+  peeled `UO_AddrOf`.
+  **NOT SPIKED.** Rank it first on measured yield: nothing else in the corpus
+  is within an order of magnitude.
+
 - [x] FR-219 (opened and LANDED 2026-09-09; implements FR-209, found by the
   FR-178 re-measurement spike): **THE REFUSAL NOW NAMES THE DELEGATION -- AND
   THE PAIRED SWEEP CAUGHT TWO WAYS THE FIRST VERSION WOULD HAVE LIED.**
