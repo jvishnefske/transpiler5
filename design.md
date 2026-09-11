@@ -15238,6 +15238,101 @@ piece and becomes FR-45.
   Each recover crate now also writes `export-warnings.txt`, so verdicts can be
   re-derived without a second six-minute corpus pass.
 
+- [ ] FR-237 (opened 2026-09-10 from FR-236's export-aware cover, and PROBED
+  BEFORE FILING because the previous entry's forecast had to be retired for
+  being unmeasured): **THE OWNER-LIFT THAT 024/025 NEED ALREADY EMITS THE
+  EXACT TARGET SHAPE. THE ONLY GAP IS THE ADDRESS-OF-GLOBAL CALL FORM.**
+  Ranked by the export-aware set-cover as one leg of an 11-payable trio.
+  4 cases: `024_struct_and_static` and `025_struct_and_errno_and_static`,
+  each exec + lib.
+  **THE C IS WELL-DEFINED -- no UB, checked first.** A `static house_t
+  the_house = {...}` with mutators taking `house_t *`, and readers touching the
+  global directly. This matters because the sibling leg (FR-238, 011/012) looks
+  like the same kind of work and is not: its C is undefined.
+  MEASURED, two probes at `d7028c0`:
+  * `add_floor(&the_house)` -- the corpus form -- is refused:
+    `unsupported: taking the address of a global variable` (`ImportC.cpp`, the
+    `asGlobalDataPointerRef` arm of the `UO_AddrOf` handling).
+  * **The same global, accessed DIRECTLY by its functions, already lifts.** The
+    emitted Rust is
+    `struct Tu0TheHouseActor { tu0_the_house: HouseT }` with
+    `impl Tu0TheHouseActor { fn ...(&mut self) { self.tu0_the_house.floors += 1 } }`
+    -- FR-62's C-owner-method form, `&mut self`, no `unsafe`, no `static mut`.
+  So the representation this work needs is **not hypothetical and does not have
+  to be designed**: it is what the tree emits today for the neighbouring shape.
+  THE INCREMENT IS THEREFORE NARROW: when a global that is ALREADY owner-lifted
+  has its address taken and passed to a function whose parameter is a pointer
+  to that global's struct type, lower the call as a METHOD on the owner
+  (`add_floor(&the_house)` -> the owner's `add_floor`) instead of refusing it.
+  Everything else about `&global` stays refused.
+  **DO NOT COST 025 FROM THE CENSUS.** It is deeper than its blocker set shows:
+  025 ALSO needs `errno` (which is not modelled at all -- see FR-239) and a
+  `strtoX` endptr (FR-234 rung 2). 024 is the clean one; 025 is a three-fix
+  case wearing a one-fix label, which is the set-cover's marginal-yield trap in
+  miniature.
+  ACCEPTANCE: `024_struct_and_static` emits and byte-diffs against the clang
+  native, with zero `unsafe` and no `static mut`. Report EMIT and PASS
+  separately. Do NOT forecast 025 until `errno` and rung 2 are settled.
+
+- [ ] FR-238 (opened 2026-09-10 from FR-236's export-aware cover; **READ THE
+  VECTORS BEFORE TOUCHING THIS**): **THE C IS UNDEFINED AND THE REFUSAL IS
+  CORRECT. THE CASE IS STILL WINNABLE, BUT ONLY BY REFINING THE UB INTO A
+  DETERMINISTIC PANIC -- NEVER BY INVENTING A POINTER VALUE.**
+  4 cases: `011_uninit_char_ptr`, `012_uninit_int_ptr`, each exec + lib.
+  Refused today with `unsupported: pointer variable 'data' has no known target
+  object`, at depth 1.
+  THE C, measured: `void bad() { char *data; printLine(data); }` -- an
+  UNINITIALIZED pointer read and passed. That is undefined behaviour, so
+  `emitrust-cc` refusing it is right, and "model an indeterminate pointer" is
+  not a coherent request.
+  **WHY IT IS NEVERTHELESS WINNABLE, and this is the part a blocker name cannot
+  tell you:** the corpus ships two vectors and **tags the UB one**.
+  `bad.json` carries `"has_ub": "Program is killed after segmentation fault"`
+  and the harness SKIPS it; `good.json` (stdin `1`) takes the initialized path
+  and expects `string\n`. So only the well-defined path is ever scored.
+  THE LEGAL MOVE: since the `bad()` path is undefined, ANY behaviour is
+  conforming, including a **deterministic panic** -- the refinement this tree
+  already applies elsewhere ("C undefined behavior refined into a deterministic
+  panic"). Emitting `bad()` as a panic lets the crate emit, build and run the
+  scored path. What is NOT legal is choosing a value for `data` and carrying
+  on.
+  CAUTION: a case whose only vector is `has_ub` scores `VACUOUS_PASS`, not
+  PASS (`update_md5_lib` is the live example). 011/012 each keep one real
+  vector, so they can score properly -- but verify that before costing any
+  sibling by the same argument.
+  ACCEPTANCE: 011 and 012 emit, and the `good` vector byte-diffs against the
+  clang native. The UB path must abort loudly; it must never produce a value.
+
+- [ ] FR-239 (opened 2026-09-10, verified by CALLING both mirrors): **`errno`
+  IS NOT MODELLED AT ALL, AND ITS REFUSAL IS INVISIBLE TO THE INSTRUMENT THAT
+  RANKS ALL WORK.** A `RejectionLedger` gap first, a feature second.
+  MEASURED: `errno = 0;` expands to `*__errno_location() = 0` and is refused
+  with `unsupported pointer expression: CallExpr`. I called
+  `classify_blocker` directly on that string: it returns **`other`**, the junk
+  bucket. So `errno` never appears as a lever in any census ranking.
+  **FOUR CORPUS PROGRAMS ARE NAMED FOR IT** -- `007_errno_pow`,
+  `023_struct_and_errno`, `025_struct_and_errno_and_static`, and the hidden
+  `014_errno-pow-subfunction` -- and a reader ranking work from the census
+  would never learn that. This is exactly the hazard CLAUDE.md's "a refusal's
+  wording is part of the ranking instrument" rule names, and it is the second
+  instance this session (FR-230's missing needle was the first, and it did
+  worse than hide a case -- it manufactured a lever that did not exist).
+  THE CHEAP HALF IS THE VALUABLE HALF: give the `__errno_location` shape its
+  OWN located diagnostic and a matching `RejectionLedger` needle, with the
+  `run_realworld.py` mirror in the SAME commit, verified by CALLING
+  `classify_blocker` rather than reading it. That is worth doing **even if
+  `errno` is never modelled**, because it makes the size of the errno question
+  visible to whoever ranks next.
+  THE EXPENSIVE HALF -- actually modelling `errno` -- is NOT scoped here and
+  should not be started from this entry. C's `errno` is a thread-local
+  lvalue that libc writes as a side effect; the supported subset has no image
+  of it, and FR-234 rung 1 already scoped the `ERANGE` half of `strtol`'s
+  contract out explicitly for this reason.
+  ACCEPTANCE: `errno = 0` and a read of `errno` each produce a located
+  diagnostic naming `errno`, both mirrors agree under a direct
+  `classify_blocker` call, and the census shows an `errno` tag instead of
+  `other`. +0 TRACTOR expected and that is the point.
+
 - [x] FR-228 (opened 2026-09-09 and LANDED 2026-09-10, found by the FR-224 implementation's own
   byte-diff oracle while trying to admit `abort`): **EVERY EMITTED CRATE HAS
   THE WRONG STDOUT BUFFERING MODEL, AND EXACTLY ONE CONSTRUCT MAKES IT
