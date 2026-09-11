@@ -141,8 +141,16 @@ The new top lever, and the roadmap never ranked it. `exec` cases never meet the
 export wall, so EMIT here can become PASS. **Upper bound, and the reason is
 nameable**: all six have `main` dropped by recovery, so blockers inside `main`
 are invisible — the census docstring names `004_nineality_sieve` as depth 1,
-actually ≥4. Honest ceiling ≈ **+3**: 007 also needs `pow` (a deliberate
-bit-exactness refusal), 006 a returned pointer, 008 an unreached item.
+actually ≥4. **007 is permanently out** — it needs argv, `fprintf`-to-stderr, `errno`
+(unmodelled), *and* `pow`, a deliberate bit-exactness refusal that should stay
+one. Strike it from every "five programs" count.
+
+Enumerating the forms rather than the tags: the six programs use **six**
+distinct argv forms, and the clean rung-3 target is just two of them —
+`strtoX(argv[i], &end, base)` and `end == argv[i]` — which is **three
+programs (004, 005, 006), the ones that use nothing else**. 003 additionally
+needs `strlen(argv[i])`, `argv[i] + k`, and `%.*s` (a separate live refusal);
+008 needs `%s` to stderr via `fprintf`.
 
 **Neither rung can be scored alone, measured 2026-09-10.** `--recover` on all
 five argv programs drops `c_main` WHOLE — 1 rejected item, **0 stubs** — and in
