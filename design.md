@@ -15520,8 +15520,14 @@ piece and becomes FR-45.
   sites emit that family and **only one spells it "with"**
   (`ImportCStatements.cpp`); the other four say **"has"** -- `ImportC.cpp`
   three times and `ImportCGlobals.cpp` once. So every "has" site classified as
-  `other`, which is the bucket nobody ranks work out of. Confirmed live: a
-  `--recover` run on `011_uninit_char_ptr` tagged its stub `[other]`.
+  `other`. Confirmed live: a `--recover` run on `011_uninit_char_ptr` tagged
+  its stub `[other]`.
+  **FRAMING CORRECTED BY FR-241 THE SAME DAY: `other` is NOT "the bucket
+  nobody ranks work out of", which is what this entry first said.**
+  `tractor-census.py` deliberately ranks on the full DIAGNOSTIC, not the tag,
+  and records why in a comment. The tag's real consumers are
+  `RatchetReport.cpp`, **`RatchetManifest.tags` (a GATE)**, `FrontierSearch`
+  and `ShardMetadata`. The defect is real; my stated blast radius was not.
   **THE NEEDLE WAS ALSO DEAD CODE.** Across the whole 252-case corpus,
   **zero** cases carried the "with" spelling and **four** carried "has" -- so
   the tag it was written to produce had never once fired on this corpus, while
@@ -15552,6 +15558,94 @@ piece and becomes FR-45.
   artifact with no lit consumer (checked), so it is not a gate input; the
   `test/Driver` rejection-report tests generate their own and DO exercise the
   classifier, which is the right place for a tag shift to surface.
+
+- [ ] FR-241 (opened 2026-09-10, a MECHANICAL AUDIT commissioned after four
+  `other`-bucket blind spots were found by accident in one session):
+  **THE DRIFT IS SYSTEMATIC, IT FOUND SIX MORE DEFECTS, AND IT REFUTED THE
+  PREMISE I COMMISSIONED IT ON.** Worth **+0 TRACTOR** -- instrument work.
+  **THE PREMISE WAS WRONG, AND I HAD REPEATED IT IN FR-239 AND FR-240: the
+  census does NOT rank by tag.** `scripts/tractor-census.py:231-239` prefers
+  the full `diagnostic` over the coarse `blocker`, with a comment recording
+  exactly why -- "Ranking on the tag collapsed 124 of 211 non-passing cases
+  into a single `other` bucket". Reproduced on the live export census: of 133
+  cases with a non-empty blocker set, **111 would present as exactly
+  `('other',)`** under the tag view; 13 distinct tag-sets against 39 distinct
+  wording-sets. So "invisible to the ranking instrument" was FALSE for the
+  census specifically. It remains TRUE for the consumers that do read the tag:
+  `RatchetReport.cpp:74`, **`RatchetManifest.tags` at `:165`, which is a
+  GATE**, `FrontierSearch.cpp:561`, `ShardMetadata.h:123`, and the ledger's own
+  blocker tabulation. Correct the target, keep the concern.
+  METHOD, with its blind spots measured rather than asserted: anchored on
+  `emitError` plus the deferred builders (`markInvalid`,
+  `markSecondOrderInvalid`, `markMemberInvalid`, `recoveryStubReason`,
+  `PlannerRejection`), merging adjacent literals -- **1283 statements, 901
+  literal fragments, 802 assembled messages**; `classify_blocker` IMPORTED AND
+  EXECUTED, not re-implemented. **Needles spanning an interpolation are
+  invisible to the method, and the cost was measured: 1 of 3 dead-needle
+  candidates was a false positive from exactly that cause**
+  (`unsupported cast (UserDefinedConversion)` is built around
+  `getCastKindName()`), so the two reported dead are grep-confirmed, not
+  inferred.
+  **SIX NEW DEFECTS, none of which anyone had noticed:**
+  1. **TWO NODE-NAMED FAMILIES HAVE NO PREFIX ROW.** `kNodeNamedPrefixes`
+     carries `unsupported assignable expression: `, `unsupported expression: `
+     and `unsupported statement: ` but NOT the POINTER variants, so
+     `unsupported pointer expression: <Node>` and `unsupported pointer cast
+     (<Kind>)` lose their node class -- **55 distinct corpus cases**. FR-239's
+     `errno` finding IS this bug, and the general fix subsumes it.
+  2. **DEAD NEEDLE `written with a null pointer`** (`ptr-to-ptr-null-write`),
+     in BOTH mirrors, with no emitter anywhere in the repo. Verified by grep:
+     it appears only in the two tables.
+  3. **DEAD NEEDLE `explicit class template specialization`**
+     (`cxx-class-template-explicit-spec`): W2.28 admitted explicit full
+     specializations and deleted the rejection, keeping only the PARTIAL one.
+     The row survived in both mirrors.
+  4. **MIRROR GAP, AND IT IS LIVE**: `has no bit-exact Rust mapping` ->
+     `libm-not-bit-exact` exists at `RejectionLedger.cpp:234` and is **absent
+     from `run_realworld.py`**. Verified by grep. FR-224 minted that tag
+     precisely to stop `expf` falling into `other`, and the RealWorld survey
+     has been reporting `other` for it ever since. 3 corpus cases.
+  5. **MIRROR GAP**: `was not reached: sibling specialization` ->
+     `template-sibling-not-reached`, C++ only, same shape.
+  6. **A MIS-CLASSIFICATION THAT IS WORSE THAN AN `other`.** The deliberately
+     widened `global address` needle (`RejectionLedger.cpp:106`,
+     `ptr-to-ptr-global-target`) sits at row 5, ABOVE the returned-pointer
+     rows, so it swallows `return sites mix a global address and NULL` and
+     `returned pointer value (a bare return cannot carry the global address)`.
+     A reader ranking the FR-62 cursor-parameter front would count
+     returned-pointer work as cursor-parameter work. **This is FR-230's
+     "manufactured lever" shape, and it is more dangerous than `other`,
+     because `other` at least advertises that it knows nothing.**
+  **`other` IS NOT THE DEFECT CLASS I THOUGHT.** 607 of 802 assembled messages
+  classify `other` and MOST ARE FINE: `global initializer does not match its
+  type` (21 sites), `call argument count mismatch` (14) and friends are
+  INTERNAL CONSISTENCY CHECKS with zero corpus hits -- a tag for them is a
+  bucket nobody can act on. Site count is the wrong instrument here, exactly
+  as §3 of CLAUDE.md says. Only the 22 wordings that appear in a REAL case's
+  blocker set are candidates, and realistically only the top six plus the two
+  node-named families are worth a needle.
+  **THE RECOMMENDED TEST IS A NEEDLE-LIVENESS TEST, NOT AN `other`
+  ALLOWLIST**, and the reasoning is the valuable part: an allowlist would need
+  a line per new diagnostic, review pressure would push people to add the line
+  rather than think, and the census -- the thing I was worried about -- does
+  not read tags anyway. The liveness half is nearly tax-free and would have
+  caught THREE of the four accidental finds plus both dead needles and both
+  mirror gaps: (a) every needle must be a substring of some enumerated
+  literal, with a `# LIVE-VIA:` waiver for interpolated ones (exactly one
+  today); (b) the two mirrors must be table-identical modulo documented
+  C++-only rows -- a pure equality assertion, zero cost; (c) no needle may
+  shadow a later row with a different tag. And `other` becomes a REPORT, not a
+  gate: print the wordings that classify `other` AND appear in the newest
+  census blocker sets. Empty most of the time, and exactly the signal that was
+  missing.
+  **ROOT CAUSE, measured: 54 of 89 tags are asserted NOWHERE in `test/` except
+  inside the Python mirror itself.** That is why needles rot.
+  ACCEPTANCE: the six defects above fixed (two rows added to the Python
+  mirror, two dead rows deleted from both, the two pointer prefixes added to
+  `kNodeNamedPrefixes`, the `global address` row moved below the
+  returned-pointer rows), then the liveness test. **`RatchetManifest.tags` is
+  a GATE, so the prefix change WILL move it** -- expect and record that
+  movement rather than being surprised by it.
 
 - [x] FR-228 (opened 2026-09-09 and LANDED 2026-09-10, found by the FR-224 implementation's own
   byte-diff oracle while trying to admit `abort`): **EVERY EMITTED CRATE HAS
