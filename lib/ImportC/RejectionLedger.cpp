@@ -737,8 +737,15 @@ std::string mlir::emitrust::classifyBlocker(llvm::StringRef diagnostic,
   // a `malloc` result, a `strchr` result, and a genuinely unanalyzable
   // pointer all reach them), so they are refined by what the cited source
   // line actually does (`_AMBIGUOUS_POINTER`).
+  //
+  // FR-240: the needle is the SUFFIX, not `with no known target object`.
+  // Five sites emit this family and only ONE spells it "with" --
+  // `ImportCStatements.cpp`. The other four say "has" (`ImportC.cpp` x3 and
+  // `ImportCGlobals.cpp`), so a `with`-anchored needle silently dropped every
+  // one of them into the `other` junk bucket. Keep this matching the shared
+  // suffix, and keep `run_realworld.py`'s `_AMBIGUOUS_POINTER` identical.
   if (diagnostic.contains("pointer assigned a non-address value") ||
-      diagnostic.contains("with no known target object")) {
+      diagnostic.contains("no known target object")) {
     std::string source = citedSourceLine(loc);
     if (citedLineAllocates(source))
       return "dynamic-memory";

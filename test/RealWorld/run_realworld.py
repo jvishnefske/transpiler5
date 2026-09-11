@@ -394,7 +394,11 @@ _BLOCKER_SUBSTRINGS = [
     ("was rejected, so a type naming it", "rejected-type-cascade"),
 ]
 # Wordings shared across blockers; refined by the cited source line's content.
-_AMBIGUOUS_POINTER = ("pointer assigned a non-address value", "with no known target object")
+# FR-240: the needle is the SUFFIX. Five sites emit this family and only ONE
+# spells it "with" (ImportCStatements.cpp); the other four say "has", so a
+# "with"-anchored needle dropped all four into `other`. Mirrors
+# lib/ImportC/RejectionLedger.cpp.
+_AMBIGUOUS_POINTER = ("pointer assigned a non-address value", "no known target object")
 
 # C++-input blocker tags (FR-46). Every wording below is emitted only from a
 # C++-only code path in lib/ImportC (a CXXRecordDecl walk, mapType's reference
