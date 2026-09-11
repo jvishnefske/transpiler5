@@ -1206,6 +1206,23 @@ peelDerivedToBaseCasts(const clang::Expr *expr,
 /// importer admits Red. Defined in ImportCAggregates.cpp.
 bool admitsSingleBaseAsField(const clang::CXXRecordDecl *record);
 
+/// FR-234 rung 2: the co-argument index of a HOSTED `strto*` endptr
+/// out-parameter, or -1 when `index` is not one.
+///
+/// This is the Shape-P paired-out-cursor contract (`&e` at `index` hands
+/// back a cursor into the region argument `coIndex` roots) supplied BY THE
+/// LIBRARY instead of proven from a body, exactly as `strchr`'s
+/// index-into-argument-0 plan is. The distinction is load-bearing and it
+/// is why this is not `pairedArgQuery`: that query opens with
+/// `callee->getDefinition()`, and a hosted `strtol` is a system-header
+/// declaration with no definition at all, so it can never answer. Callers
+/// answers only for a DEFINITION-LESS callee -- a project that supplies its
+/// OWN `strtol` keeps its own lowering (the shim table is a fallback, never
+/// an override), and `&e` there keeps the older refusal. Defined in
+/// ImportC.cpp.
+int hostedEndptrCoIndex(const clang::FunctionDecl *callee, unsigned index,
+                        unsigned numArgs);
+
 class PointerRegionAnalysis {
 public:
   /// Analyzes `body`, replacing any previous analysis state. `context` is
@@ -5183,17 +5200,38 @@ private:
   /// ULONG_MAX for the other, so the same input string has two different
   /// answers.
   ///
-  /// A NON-NULL `endptr` is a LOCATED REJECTION here (rung 2), not a
-  /// silent drop: the out-parameter is the caller's cursor and a
+  /// An `endptr` the model cannot write is a LOCATED REJECTION here, not
+  /// a silent drop: the out-parameter is the caller's cursor and a
   /// lowering that ignored it would leave the caller reading a stale
-  /// pointer. The refusal carries its own `RejectionLedger` needle
-  /// (`strtox-endptr`) so the census can still see it after the name
-  /// left the system-header bucket.
-  /// FR-234 rung 1: succeeds only when argument `index` of `call` is a
-  /// null pointer constant, and otherwise raises the rung-2 refusal at
-  /// that argument's location.
-  LogicalResult requireNullEndptr(const clang::CallExpr *call,
-                                  llvm::StringRef name, unsigned index);
+  /// pointer. Both refusals carry the `strtox-endptr` `RejectionLedger`
+  /// needle so the census can still see them after the name left the
+  /// system-header bucket.
+  ///
+  /// FR-234 rung 2: classifies argument `index` of `call`. Answers null
+  /// for a NULL pointer constant (rung 1's admission, lowered exactly as
+  /// before) and the pointed-to local for `&end` over a DECOMPOSED
+  /// pointer local -- the shape `hostedEndptrCoIndex` joined into argument
+  /// 0's region during the region analysis. Every other spelling (a member
+  /// address, a cast, a global, a `char **` parameter) fails with
+  /// `<name> with a non-null endptr argument` at that argument's location.
+  FailureOr<const clang::VarDecl *>
+  classifyStrtoEndptr(const clang::CallExpr *call, llvm::StringRef name,
+                      unsigned index);
+
+  /// FR-234 rung 2: stores C's `*endptr` answer into `endptr`'s decomposed
+  /// cursor cell. `region` is argument 0's own decomposition and `offset`
+  /// is the helper's answer RELATIVE TO IT (the helper was handed
+  /// `&base[cursor..]`), so the absolute cursor is the sum -- which is what
+  /// makes `strtol(p + 2, &end, 10)` land `end` at the right place.
+  ///
+  /// An `endptr` whose region is not argument 0's is REFUSED here rather
+  /// than approximated: a cursor stored into a pointer over a different
+  /// object would silently designate the wrong bytes. C 7.22.1.4p7 stores
+  /// a pointer INTO the subject string and never a null one, so a nullable
+  /// `endptr` takes a definite `true` discriminant.
+  LogicalResult emitStrtoEndptrWrite(Location loc, llvm::StringRef name,
+                                     const clang::VarDecl *endptr,
+                                     const PtrExprValue &region, Value offset);
 
   FailureOr<Value> emitStrtoIntCall(const clang::CallExpr *call,
                                     llvm::StringRef name, bool isUnsigned);

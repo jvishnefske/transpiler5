@@ -216,6 +216,13 @@ legs look like one kind of work and are not.
   is structural**: the only admitted pointer-struct-member model represents
   the field as an index into an owner array proven inside the unit, and every
   affected case is a `lib` entry point whose caller supplies a real address.
+  **`020_stack_linked_list_lib` is the trap here, and it caught me.** It is
+  depth 1, it has four real vectors, and it **exports** (`smallestValue`) — so
+  by the two axes this document tells you to cross, blocker-count × `kind`
+  × export, it reads as the best ratio on the board. It is worth zero, because
+  this entry's `+0` is about whether the FIX IS POSSIBLE, which is a **third
+  axis the census cannot see at all**. Cross all three before ranking
+  anything.
 - **FR-227 — the export wall.** 67 cases, 27% of the corpus — **and per FR-233
   it also gates the whole SPHINCS+ subtree, which is 128 of 252.** It is the
   single largest structural item on the board and the reason EMIT and PASS have

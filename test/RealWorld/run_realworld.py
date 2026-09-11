@@ -344,6 +344,11 @@ _BLOCKER_SUBSTRINGS = [
     # its own rather than falling into `other` once the name has left the
     # `libc:<name>` bucket. Mirrors lib/ImportC/RejectionLedger.cpp.
     ("with a non-null endptr argument", "strtox-endptr"),
+    # FR-234 rung 2 admitted `&end` over a decomposed pointer local, so the
+    # remaining endptr refusal is a REGION mismatch (an `end` that walks
+    # some other object, a multi-base or member-rooted one). Same work,
+    # same tag. Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("endptr must walk the parsed string's region", "strtox-endptr"),
     ("returned pointer value", "returned-pointer"),
     ("pointer return type", "returned-pointer"),
     ("return sites disagree", "returned-pointer"),

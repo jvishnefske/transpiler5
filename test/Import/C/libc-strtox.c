@@ -62,10 +62,14 @@ int main(void) {
   return 0;
 }
 
-// The four helpers reach the emitted crate as plain safe functions, in
-// the shim table's own order (atof predates the strto* block, which was
-// appended after it).
+// The helpers reach the emitted crate as plain safe functions, in the
+// shim table's own order (atof predates the strto* block, which was
+// appended after it). FR-234 rung 2 made `__emitrust_atof` a PROJECTION
+// of `__emitrust_atof_end`, so the two travel together even where -- as
+// here -- only the NULL-endptr forms are called: an emitted projection
+// without its scan would not compile, which is the loud direction.
 // RUST: fn __emitrust_atof(s: &[i8]) -> f64
+// RUST: fn __emitrust_atof_end(s: &[i8]) -> (f64, i64)
 // RUST: fn __emitrust_strto_scan(
 // RUST: fn __emitrust_strtol(s: &[i8], base: i32) -> i64
 // RUST: __emitrust_strto_scan(s, base, i64::MAX as u64, 1u64 << 63)

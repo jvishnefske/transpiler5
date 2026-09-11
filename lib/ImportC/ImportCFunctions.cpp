@@ -3886,8 +3886,26 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
       // conservative is `0x0`, which C reads as 0.0 and which panics here
       // rather than growing a second hex grammar to prove it is a zero.
       // See design.md FR-224 and FR-229.
+      // FR-234 rung 2: ONE copy of the float grammar, TWO answers. C
+      // 7.22.1.1p2 defines `atof(s)` as `strtod(s, NULL)`, and
+      // `strtod(s, &e)` needs the same scan's CONSUMED LENGTH, so the
+      // grammar lives in `__emitrust_atof_end` and `__emitrust_atof` is a
+      // projection of its first component. A second copy would be a second
+      // place for FR-235's classification to drift.
+      //
+      // THE CONSUMED LENGTH IS C's, and C 7.22.1.4p7 pins its awkward
+      // case: when the subject sequence is EMPTY the stored pointer is
+      // `nptr` ITSELF, not the position after the whitespace the scan
+      // already ate -- so every no-conversion exit answers 0, never
+      // `start`. `inf`/`infinity`/`nan` consume 3 or 8 bytes past the
+      // sign, and the exponent BACKTRACK (`1e` is just `1`) rewinds the
+      // length with the value.
       {"__emitrust_atof",
        "fn __emitrust_atof(s: &[i8]) -> f64 {\n"
+       "    __emitrust_atof_end(s).0\n"
+       "}"},
+      {"__emitrust_atof_end",
+       "fn __emitrust_atof_end(s: &[i8]) -> (f64, i64) {\n"
        "    let mut i = 0usize;\n"
        "    while i < s.len() {\n"
        "        let b = s[i] as u8;\n"
@@ -3905,17 +3923,13 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "        let mut j = i + 2;\n"
        "        if s[j] as u8 == b'.' { j += 1; }\n"
        "        if j < s.len() && (s[j] as u8).is_ascii_hexdigit() {\n"
-       "            panic!(\n"
-       "                \"atof: hexadecimal floating-point input is not "
-       "supported\"\n"
-       "            );\n"
+       "            panic!(\"atof: hexadecimal floating-point input is not supported\");\n"
        "        }\n"
        "    }\n"
        "    let head = if i < s.len() { (s[i] as u8) | 32 } else { 0 };\n"
        "    if head == b'i' || head == b'n' {\n"
        "        let is_nan = head == b'n';\n"
-       "        let word: &[u8] = if is_nan { b\"nan\" } else "
-       "{ b\"infinity\" };\n"
+       "        let word: &[u8] = if is_nan { b\"nan\" } else { b\"infinity\" };\n"
        "        let mut m = 0usize;\n"
        "        while m < word.len() && i + m < s.len()\n"
        "            && ((s[i + m] as u8) | 32) == word[m] {\n"
@@ -3923,18 +3937,16 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "        }\n"
        "        if is_nan && m == 3 {\n"
        "            if i + 3 < s.len() && s[i + 3] as u8 == b'(' {\n"
-       "                panic!(\n"
-       "                    \"atof: a NaN payload, nan(...), is not "
-       "supported\"\n"
-       "                );\n"
+       "                panic!(\"atof: a NaN payload, nan(...), is not supported\");\n"
        "            }\n"
-       "            return if neg { -f64::NAN } else { f64::NAN };\n"
+       "            let v = if neg { -f64::NAN } else { f64::NAN };\n"
+       "            return (v, (i + 3) as i64);\n"
        "        }\n"
        "        if !is_nan && m >= 3 {\n"
-       "            return if neg { f64::NEG_INFINITY } else "
-       "{ f64::INFINITY };\n"
+       "            let v = if neg { f64::NEG_INFINITY } else { f64::INFINITY };\n"
+       "            return (v, (i + if m >= 8 { 8 } else { 3 }) as i64);\n"
        "        }\n"
-       "        return 0.0;\n"
+       "        return (0.0, 0);\n"
        "    }\n"
        "    let digits_start = i;\n"
        "    while i < s.len() && (s[i] as u8).is_ascii_digit() { i += 1; }\n"
@@ -3942,27 +3954,24 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "    if i < s.len() && s[i] as u8 == b'.' {\n"
        "        i += 1;\n"
        "        let frac_start = i;\n"
-       "        while i < s.len() && (s[i] as u8).is_ascii_digit() "
-       "{ i += 1; }\n"
+       "        while i < s.len() && (s[i] as u8).is_ascii_digit() { i += 1; }\n"
        "        seen = seen || i > frac_start;\n"
        "    }\n"
-       "    if !seen { return 0.0; }\n"
+       "    if !seen { return (0.0, 0); }\n"
        "    let mantissa_end = i;\n"
        "    if i < s.len() && (s[i] as u8 == b'e' || s[i] as u8 == b'E') {\n"
        "        let mut j = i + 1;\n"
-       "        if j < s.len() && (s[j] as u8 == b'+' || s[j] as u8 == b'-') "
-       "{ j += 1; }\n"
+       "        if j < s.len() && (s[j] as u8 == b'+' || s[j] as u8 == b'-') { j += 1; }\n"
        "        let exp_start = j;\n"
-       "        while j < s.len() && (s[j] as u8).is_ascii_digit() "
-       "{ j += 1; }\n"
+       "        while j < s.len() && (s[j] as u8).is_ascii_digit() { j += 1; }\n"
        "        if j > exp_start { i = j; } else { i = mantissa_end; }\n"
        "    }\n"
-       "    let bytes: Vec<u8> = s[start..i].iter().map(|&b| b as u8)"
-       ".collect();\n"
-       "    match std::str::from_utf8(&bytes) {\n"
+       "    let bytes: Vec<u8> = s[start..i].iter().map(|&b| b as u8).collect();\n"
+       "    let v = match std::str::from_utf8(&bytes) {\n"
        "        Ok(t) => t.parse::<f64>().unwrap_or(0.0),\n"
        "        Err(_) => 0.0,\n"
-       "    }\n"
+       "    };\n"
+       "    (v, i as i64)\n"
        "}"},
       // FR-234 rung 1: C's strtol/strtoul (7.22.1.4) with a NULL endptr.
       // ONE grammar, two thin wrappers, deliberately: the scan is
@@ -4020,9 +4029,9 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "    base: i32,\n"
        "    lim_pos: u64,\n"
        "    lim_neg: u64,\n"
-       ") -> (u64, bool, bool) {\n"
+       ") -> (u64, bool, bool, i64) {\n"
        "    if base < 0 || base == 1 || base > 36 {\n"
-       "        return (0, false, false);\n"
+       "        return (0, false, false, 0);\n"
        "    }\n"
        "    let mut i = 0usize;\n"
        "    while i < s.len() {\n"
@@ -4082,13 +4091,24 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "        i += 1;\n"
        "    }\n"
        "    if !any {\n"
-       "        return (0, false, false);\n"
+       "        return (0, false, false, 0);\n"
        "    }\n"
-       "    (acc, neg, ovf)\n"
+       "    (acc, neg, ovf, i as i64)\n"
+       "}"},
+      // FR-234 rung 2: the ENDPTR entry point, its own function rather
+      // than a wider result on the two wrappers. The cursor does not
+      // depend on the saturation limit -- C's subject sequence is the
+      // whole run of digits however the accumulator overflows -- so
+      // `strtol` and `strtoul` of one string agree on it and rung 1's
+      // pinned wrapper lowerings do not move. The limits passed here are
+      // therefore arbitrary; the fourth component ignores them.
+      {"__emitrust_strto_end",
+       "fn __emitrust_strto_end(s: &[i8], base: i32) -> i64 {\n"
+       "    __emitrust_strto_scan(s, base, u64::MAX, u64::MAX).3\n"
        "}"},
       {"__emitrust_strtol",
        "fn __emitrust_strtol(s: &[i8], base: i32) -> i64 {\n"
-       "    let (acc, neg, ovf) =\n"
+       "    let (acc, neg, ovf, _) =\n"
        "        __emitrust_strto_scan(s, base, i64::MAX as u64, 1u64 << 63);\n"
        "    if ovf {\n"
        "        return if neg { i64::MIN } else { i64::MAX };\n"
@@ -4101,7 +4121,7 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "}"},
       {"__emitrust_strtoul",
        "fn __emitrust_strtoul(s: &[i8], base: i32) -> u64 {\n"
-       "    let (acc, neg, ovf) =\n"
+       "    let (acc, neg, ovf, _) =\n"
        "        __emitrust_strto_scan(s, base, u64::MAX, u64::MAX);\n"
        "    if ovf {\n"
        "        return u64::MAX;\n"

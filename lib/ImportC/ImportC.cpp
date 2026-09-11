@@ -1532,6 +1532,27 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
               "unsupported: pointer assigned a non-address value");
 }
 
+// FR-234 rung 2: see the declaration in CImporterInternal.h. Argument 1 of
+// `strtol`/`strtoul`/`strtod` is C's `endptr`, and 7.22.1.4p7 says the
+// stored pointer is always INTO argument 0's string -- so the co-argument
+// is 0, and the library supplies the plan the Shape-P analysis would
+// otherwise have to prove from a body.
+int hostedEndptrCoIndex(const clang::FunctionDecl *callee, unsigned index,
+                        unsigned numArgs) {
+  // Definition-less ONLY, mirroring `emitCall`'s hosted dispatch guard: a
+  // project that supplies its own `strtol` gets an ordinary call to its
+  // own code, and `&e` there keeps the older refusal.
+  if (index != 1 || !callee || callee->getDefinition() ||
+      !callee->getDeclName().isIdentifier())
+    return -1;
+  llvm::StringRef name = callee->getName();
+  if ((name == "strtol" || name == "strtoul") && numArgs == 3)
+    return 0;
+  if (name == "strtod" && numArgs == 2)
+    return 0;
+  return -1;
+}
+
 void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
   if (!stmt)
     return;
@@ -1764,6 +1785,37 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
         int coIndex = pairedArgQuery(callee, index);
         if (coIndex < 0 ||
             static_cast<unsigned>(coIndex) >= call->getNumArgs())
+          continue;
+        const clang::Expr *argument = stripTrivia(call->getArg(index));
+        while (const auto *cast =
+                   llvm::dyn_cast<clang::ImplicitCastExpr>(argument))
+          argument = stripTrivia(cast->getSubExpr());
+        const auto *addrOf = llvm::dyn_cast<clang::UnaryOperator>(argument);
+        if (!addrOf || addrOf->getOpcode() != clang::UO_AddrOf)
+          continue;
+        const clang::VarDecl *pointer = asLocalVarRef(addrOf->getSubExpr());
+        if (!pointer || !tracks(pointer))
+          continue;
+        consumedAddrOf.insert(addrOf);
+        recordPointerWrite(pointer, call->getArg(coIndex));
+        recordArithmetic(pointer, addrOf->getOperatorLoc());
+      }
+    }
+    // FR-234 rung 2: a `&end` argument at a HOSTED `strto*` endptr
+    // position is the SAME join, with the pairing supplied by the library
+    // instead of proven from a body. C 7.22.1.4p7 stores a pointer into
+    // argument 0's own string -- always, including the no-conversion case,
+    // where the stored pointer is `nptr` itself -- so `end` joins argument
+    // 0's region exactly as `end = <arg0>` followed by arithmetic would.
+    // The join is what lets a possibly-uninitialized `char *end;` classify
+    // at all; without it the generic address-of handler above sinks the
+    // region at `taking the address of a pointer variable`, which is where
+    // every corpus site died before this rung.
+    {
+      unsigned numArgs = call->getNumArgs();
+      for (unsigned index = 0; index < numArgs; ++index) {
+        int coIndex = hostedEndptrCoIndex(callee, index, numArgs);
+        if (coIndex < 0 || static_cast<unsigned>(coIndex) >= numArgs)
           continue;
         const clang::Expr *argument = stripTrivia(call->getArg(index));
         while (const auto *cast =
