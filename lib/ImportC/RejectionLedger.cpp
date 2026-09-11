@@ -15,7 +15,7 @@
 /// The heuristic is a direct port of `classify_blocker` in
 /// `test/RealWorld/run_realworld.py`, table for table and in the same order:
 /// the system-header symbol, `_BLOCKER_SUBSTRINGS`, `_CXX_BLOCKER_SUBSTRINGS`,
-/// `_NODE_NAMED_RE`, `_AMBIGUOUS_POINTER`, then `other`.
+/// `_NODE_NAMED_PREFIXES`, `_AMBIGUOUS_POINTER`, then `other`.
 /// Two tags sit OUTSIDE that shared sequence and are tested before it,
 /// because both name wordings the Python twin can never observe (it reads a
 /// non-recovering whole-program run's stderr): `search-excluded` (FR-43's
@@ -28,6 +28,17 @@
 /// change to the table below must be mirrored there, and vice versa; the
 /// comments name the Python counterpart of each rule so the pairing is
 /// discoverable from either side.
+///
+/// FR-241: that promise is no longer honour-system. `scripts/check-rejection-
+/// ledger.py`, run by `test/Driver/rejection-ledger-needles.c` in the fast
+/// lit tier, asserts (a) every needle below is a substring of a real
+/// diagnostic literal in lib/ImportC (with an audited waiver for the one
+/// wording built around an interpolation), (b) the three tables are
+/// row-for-row identical across the two mirrors, and (c) no row is
+/// unreachable -- neither by needle nesting nor because an earlier row
+/// claims every wording it occurs in. The audit that prompted it found
+/// SEVEN defects: two dead needles, two mirror gaps, two missing
+/// node-named families, and one row that had never been reachable at all.
 ///
 /// Rejected alternative: classifying on structured data (a diagnostic ID or
 /// an enum threaded through every `emitError` call site) instead of on the
@@ -107,15 +118,6 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
      llvm::StringLiteral("ptr-to-ptr-shape-escape")},
     {llvm::StringLiteral("write through a cursor parameter"),
      llvm::StringLiteral("ptr-to-ptr-shape-escape")},
-    {llvm::StringLiteral("written with a null pointer"),
-     llvm::StringLiteral("ptr-to-ptr-null-write")},
-    // C99-43 C1 narrowed this family: single-global-or-NULL writes are
-    // admitted (the Option-cell mapping), so the needle widened from
-    // "written with a global address" to catch the residual wordings —
-    // "more than one global address" and "a global address outside the
-    // single-global-or-NULL shape" — which stay the FR-62 front.
-    {llvm::StringLiteral("global address"),
-     llvm::StringLiteral("ptr-to-ptr-global-target")},
     {llvm::StringLiteral("write sites disagree on the source region"),
      llvm::StringLiteral("ptr-to-ptr-shape-escape")},
     {llvm::StringLiteral("write must execute unconditionally"),
@@ -169,6 +171,34 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
      llvm::StringLiteral("returned-pointer")},
     {llvm::StringLiteral("return sites disagree"),
      llvm::StringLiteral("returned-pointer")},
+    // FR-241 defect 6, half (a): `return sites mix a global address and
+    // NULL` (ImportCTypes.cpp) is a RETURNED-pointer refusal that happens
+    // to name a global address. It matched none of the three rows above
+    // (it says "mix", not "disagree") and fell through to the widened
+    // `global address` needle, which used to sit at row 5 -- so the census
+    // filed returned-pointer work under the FR-62 cursor-parameter tag.
+    // Moving the `global address` row down is necessary but NOT
+    // sufficient; this row is the other half. Mirrors
+    // test/RealWorld/run_realworld.py.
+    {llvm::StringLiteral("return sites mix a global address"),
+     llvm::StringLiteral("returned-pointer")},
+    // C99-43 C1 narrowed this family: single-global-or-NULL writes are
+    // admitted (the Option-cell mapping), so the needle widened from
+    // "written with a global address" to catch the residual wordings —
+    // "more than one global address" and "a global address outside the
+    // single-global-or-NULL shape" — which stay the FR-62 front.
+    //
+    // FR-241 defect 6, half (b): the row USED TO SIT AT POSITION 5, above
+    // every returned-pointer row, and a two-word needle that broad
+    // swallowed both returned-global-address refusals in
+    // ImportCTypes.cpp -- `returned pointer value (a bare return cannot
+    // carry the global address)` and the `mix` wording above. It is
+    // deliberately kept broad (that is what catches the residual cursor
+    // wordings) and is therefore pinned BELOW everything it could shadow.
+    // Its three live emitters are ImportCPlanning.cpp's `cursor parameter
+    // written with ...` refusals. Mirrors test/RealWorld/run_realworld.py.
+    {llvm::StringLiteral("global address"),
+     llvm::StringLiteral("ptr-to-ptr-global-target")},
     {llvm::StringLiteral("global pointer bound to a string literal"),
      llvm::StringLiteral("global-string-cursor")},
     {llvm::StringLiteral("unsupported: allocation"),
@@ -531,19 +561,32 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
     // splitting them would split one backlog item's ranking signal in two.
     {llvm::StringLiteral("mutable reference argument borrowed from a std::unique_ptr"),
      llvm::StringLiteral("stl-unique-ptr-ref-argument")},
+    // FR-241 defect 7 (found by the reachability half of the new
+    // scripts/check-rejection-ledger.py, NOT in the audit's list of six):
+    // the receiver row USED TO SIT LAST and was therefore DEAD. Every
+    // wording it exists for ends "... receiver is not a recognized STL
+    // type" (ImportC.cpp's operator*/operator[] dispatch,
+    // ImportCExpressions.cpp's find()/member-call/operator-call
+    // dispatch -- five sites, all spelled "type"), so the generic
+    // `is not a recognized STL type` row matched first and
+    // `stl-unrecognized-receiver` could never be produced at all. Nothing
+    // pins either tag (no golden, no manifest, no CHECK line), so hoisting
+    // the row simply makes it do what W2.20 minted it to do: separate "the
+    // RECEIVER is not an STL object" from "this TYPE is not one we model".
+    // Mirrors test/RealWorld/run_realworld.py.
+    {llvm::StringLiteral("receiver is not a recognized STL"),
+     llvm::StringLiteral("stl-unrecognized-receiver")},
     {llvm::StringLiteral("is not a recognized STL type"),
      llvm::StringLiteral("stl-unrecognized-type")},
     {llvm::StringLiteral("is not a recognized STL method"),
      llvm::StringLiteral("stl-unrecognized-method")},
-    {llvm::StringLiteral("receiver is not a recognized STL"),
-     llvm::StringLiteral("stl-unrecognized-receiver")},
     // W2.16 class-template frontier. Every wording below is emitted only
     // from `CImporter::importRecordUncached`'s specialization checks or
     // its same-TU name-clash guard, so a C program can never match one;
-    // without these entries all five tabulate as `other` and the backlog
-    // cannot rank the class-template front at all.
-    {llvm::StringLiteral("explicit class template specialization"),
-     llvm::StringLiteral("cxx-class-template-explicit-spec")},
+    // without these entries all four tabulate as `other` and the backlog
+    // cannot rank the class-template front at all. (W2.28 admitted explicit
+    // FULL specializations and deleted that rejection; FR-241 found the row
+    // had outlived it by four months and removed it from both mirrors.)
     {llvm::StringLiteral("partial class template specialization"),
      llvm::StringLiteral("cxx-class-template-partial-spec")},
     {llvm::StringLiteral("non-type template argument in class template instantiation"),
@@ -594,16 +637,39 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
 };
 
 /// The generic dispatch fallbacks that NAME the offending clang AST node
-/// class (`_NODE_NAMED_RE`). These are language-agnostic — a C input reaches
-/// them too — and refining them from the catch-all `other` into a node-named
-/// tag is what makes the tabulation a directly actionable backlog rather than
-/// one giant bucket. The survey uses `(\w+)` after each prefix; the same
-/// character class is spelled out here.
+/// class (`_NODE_NAMED_PREFIXES`). These are language-agnostic — a C input
+/// reaches them too — and refining them from the catch-all `other` into a
+/// node-named tag is what makes the tabulation a directly actionable backlog
+/// rather than one giant bucket. The survey compiles `re.escape(needle) + r"(\w+)"` from
+/// the SAME (needle, tag-prefix) rows, so the `\w` character class spelled
+/// out below is the only copy of that rule.
+///
+/// A prefix's node class is the run of word characters that follows the
+/// needle, whatever terminates it -- which is why the `unsupported pointer
+/// cast (` row needs no special handling despite opening with `(` rather
+/// than ending in `: `: `)` is not a word character, so it bounds
+/// `ArrayToPointerDecay` exactly as a space bounds `CallExpr`.
 struct NodeNamedPrefix {
   llvm::StringLiteral needle;
   llvm::StringLiteral tagPrefix;
 };
 constexpr NodeNamedPrefix kNodeNamedPrefixes[] = {
+    // FR-241 defect 1: the two POINTER families had no row at all, so
+    // every `unsupported pointer expression: <Node>` (ImportC.cpp, the
+    // `emitPointerRValue` dispatch fallback) and every `unsupported
+    // pointer cast (<CastKind>)` (ImportC.cpp's pointer-cast fallback)
+    // lost its node class into `other` -- 55 distinct corpus cases.
+    // The CAST form's delimiter is `(`, not `: `, and it needs no special
+    // handling: the node class is still the run of word characters that
+    // follows the needle, and the closing `)` terminates it exactly as a
+    // space does for the `: ` forms. Listed first for readability only --
+    // neither pointer needle contains, nor is contained by, any of the
+    // three rows below, so first-match-wins is order-insensitive here.
+    // Mirrors test/RealWorld/run_realworld.py.
+    {llvm::StringLiteral("unsupported pointer expression: "),
+     llvm::StringLiteral("unsupported-ptr-expr:")},
+    {llvm::StringLiteral("unsupported pointer cast ("),
+     llvm::StringLiteral("unsupported-ptr-cast:")},
     {llvm::StringLiteral("unsupported assignable expression: "),
      llvm::StringLiteral("unsupported-assign-expr:")},
     {llvm::StringLiteral("unsupported expression: "),

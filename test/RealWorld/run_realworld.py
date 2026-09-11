@@ -294,6 +294,16 @@ def output_diff_snippet(expected, actual, limit=12):
 # The generic "pointer assigned a non-address value" / "no known target object"
 # wordings are shared by local-malloc AND strchr-result binds, so those are
 # refined by reading the cited source line (the diagnostic carries file:line).
+#
+# FR-241: the three tables below are a HAND-WRITTEN MIRROR of
+# lib/ImportC/RejectionLedger.cpp, and the pairing is now checked rather than
+# trusted -- scripts/check-rejection-ledger.py (run by
+# test/Driver/rejection-ledger-needles.c in the fast lit tier) asserts that
+# every needle is a substring of a real diagnostic literal in lib/ImportC,
+# that the two mirrors are row-for-row identical, and that no row is
+# unreachable. Seven defects had accumulated before it existed, including two
+# rows present in the C++ mirror and missing here, and two needles no
+# `emitError` in the repo could raise.
 _SYS_HEADER_RE = re.compile(r"call to '([^']+)' declared in a system header")
 _LOC_RE = re.compile(r"^(.+?):(\d+):\d+: error:")
 _DYNMEM_NAMES = {"malloc", "calloc", "realloc", "free", "aligned_alloc"}
@@ -318,13 +328,6 @@ _BLOCKER_SUBSTRINGS = [
     # "cursor parameter").
     ("escapes the cursor-parameter shape", "ptr-to-ptr-shape-escape"),
     ("write through a cursor parameter", "ptr-to-ptr-shape-escape"),
-    ("written with a null pointer", "ptr-to-ptr-null-write"),
-    # C99-43 C1 narrowed this family: single-global-or-NULL writes are
-    # admitted (the Option-cell mapping), so the needle widened from
-    # "written with a global address" to catch the residual wordings --
-    # "more than one global address" and "a global address outside the
-    # single-global-or-NULL shape" -- which stay the FR-62 front.
-    ("global address", "ptr-to-ptr-global-target"),
     ("write sites disagree on the source region", "ptr-to-ptr-shape-escape"),
     ("write must execute unconditionally", "ptr-to-ptr-shape-escape"),
     ("does not root in a sibling slice parameter", "ptr-to-ptr-shape-escape"),
@@ -360,6 +363,27 @@ _BLOCKER_SUBSTRINGS = [
     ("returned pointer value", "returned-pointer"),
     ("pointer return type", "returned-pointer"),
     ("return sites disagree", "returned-pointer"),
+    # FR-241 defect 6, half (a): `return sites mix a global address and
+    # NULL` (ImportCTypes.cpp) is a RETURNED-pointer refusal that merely
+    # names a global address. It matches none of the three rows above (it
+    # says "mix", not "disagree") and used to fall through to the widened
+    # `global address` needle at row 5, filing returned-pointer work under
+    # the FR-62 cursor-parameter tag. Mirrors
+    # lib/ImportC/RejectionLedger.cpp.
+    ("return sites mix a global address", "returned-pointer"),
+    # C99-43 C1 narrowed this family: single-global-or-NULL writes are
+    # admitted (the Option-cell mapping), so the needle widened from
+    # "written with a global address" to catch the residual wordings --
+    # "more than one global address" and "a global address outside the
+    # single-global-or-NULL shape" -- which stay the FR-62 front.
+    #
+    # FR-241 defect 6, half (b): this row USED TO SIT AT POSITION 5, above
+    # every returned-pointer row, where a two-word needle swallowed both of
+    # ImportCTypes.cpp's returned-global-address refusals. It stays broad
+    # (that is what catches the residual cursor wordings) and is therefore
+    # pinned BELOW everything it could shadow. Mirrors
+    # lib/ImportC/RejectionLedger.cpp.
+    ("global address", "ptr-to-ptr-global-target"),
     ("global pointer bound to a string literal", "global-string-cursor"),
     ("unsupported: allocation", "dynamic-memory"),
     ("pointer struct member of an externally", "pointer-member-cross-tu"),
@@ -400,6 +424,13 @@ _BLOCKER_SUBSTRINGS = [
     # item's rejection removed. FR-49's root-blocker table credits the real
     # cause; this tag only keeps the cascade out of the "other" bucket.
     ("was rejected, so a type naming it", "rejected-type-cascade"),
+    # FR-224: the curated <math.h> POLICY rejections (pow/exp/log and their
+    # `f` forms). FR-224 minted this tag precisely so `expf` would not fall
+    # back into `other` once the generic system-header wording stopped
+    # giving it `libc:expf` -- and then FR-241 found the row had never been
+    # mirrored here, so every RealWorld survey since has reported `other`
+    # for it. Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("has no bit-exact Rust mapping", "libm-not-bit-exact"),
 ]
 # Wordings shared across blockers; refined by the cited source line's content.
 # FR-240: the needle is the SUFFIX. Five sites emit this family and only ONE
@@ -413,6 +444,12 @@ _AMBIGUOUS_POINTER = ("pointer assigned a non-address value", "no known target o
 # case, or the STL recognition table), so a C program can never match any of
 # them -- the C corpus's tabulation is unchanged by this table's existence.
 _CXX_BLOCKER_SUBSTRINGS = [
+    # FR-241 defect 5: the head row of the C++ table in
+    # lib/ImportC/RejectionLedger.cpp, never mirrored here. A C++-only path
+    # (ImportCFunctions.cpp's specialization walk), so no corpus effect --
+    # but the two tables must stay row-for-row identical or the next
+    # mechanical audit cannot tell a gap from a deliberate omission.
+    ("was not reached: sibling specialization", "template-sibling-not-reached"),
     ("base classes are not supported", "cxx-inheritance"),
     # W2.18 admitted the SINGLE public non-virtual base as an ordinary first
     # field; the wording above is retained for the residual shapes (multiple,
@@ -557,11 +594,15 @@ _CXX_BLOCKER_SUBSTRINGS = [
     # mutability). Mirrors lib/ImportC/RejectionLedger.cpp.
     ("mutable reference argument borrowed from a std::unique_ptr",
      "stl-unique-ptr-ref-argument"),
+    # FR-241 defect 7: the receiver row used to sit LAST and was DEAD --
+    # every wording it exists for ends "... receiver is not a recognized
+    # STL type", so the generic type row matched first and
+    # stl-unrecognized-receiver could never be produced. Mirrors
+    # lib/ImportC/RejectionLedger.cpp.
+    ("receiver is not a recognized STL", "stl-unrecognized-receiver"),
     ("is not a recognized STL type", "stl-unrecognized-type"),
     ("is not a recognized STL method", "stl-unrecognized-method"),
-    ("receiver is not a recognized STL", "stl-unrecognized-receiver"),
     # W2.16 class-template frontier; mirrors lib/ImportC/RejectionLedger.cpp.
-    ("explicit class template specialization", "cxx-class-template-explicit-spec"),
     ("partial class template specialization", "cxx-class-template-partial-spec"),
     ("non-type template argument in class template instantiation", "cxx-class-template-nttp"),
     ("variadic class template (template parameter pack)", "cxx-class-template-pack"),
@@ -592,10 +633,27 @@ _CXX_BLOCKER_SUBSTRINGS = [
 # catch-all "other" into a node-named tag makes the tabulation a directly
 # actionable backlog. Tags are display-only for the C corpus, whose manifest
 # records program names, not tags.
+# FR-241 defect 1: the two POINTER families had no row, so every
+# `unsupported pointer expression: <Node>` and `unsupported pointer cast
+# (<CastKind>)` lost its node class into `other` -- 55 distinct corpus
+# cases. The CAST form's delimiter is `(` rather than `: ` and needs no
+# special handling: the node class is still the run of word characters that
+# follows, and `)` terminates it exactly as a space does.
+#
+# The table is (needle, tag-prefix) so it diffs line-for-line against
+# `kNodeNamedPrefixes` in lib/ImportC/RejectionLedger.cpp; the regex is
+# DERIVED from the needle below rather than spelled separately, which is
+# what keeps `\w+` identical to the C++ side's open-coded word-char scan.
+_NODE_NAMED_PREFIXES = [
+    ("unsupported pointer expression: ", "unsupported-ptr-expr:"),
+    ("unsupported pointer cast (", "unsupported-ptr-cast:"),
+    ("unsupported assignable expression: ", "unsupported-assign-expr:"),
+    ("unsupported expression: ", "unsupported-expr:"),
+    ("unsupported statement: ", "unsupported-stmt:"),
+]
 _NODE_NAMED_RE = [
-    (re.compile(r"unsupported assignable expression: (\w+)"), "unsupported-assign-expr:"),
-    (re.compile(r"unsupported expression: (\w+)"), "unsupported-expr:"),
-    (re.compile(r"unsupported statement: (\w+)"), "unsupported-stmt:"),
+    (re.compile(re.escape(needle) + r"(\w+)"), prefix)
+    for needle, prefix in _NODE_NAMED_PREFIXES
 ]
 
 
