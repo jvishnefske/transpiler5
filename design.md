@@ -15510,6 +15510,49 @@ piece and becomes FR-45.
   `classify_blocker` call, and the census shows an `errno` tag instead of
   `other`. +0 TRACTOR expected and that is the point.
 
+- [x] FR-240 DEFECT (opened and LANDED 2026-09-10, found by the FR-238
+  implementer while reading the ledger it did not need to touch): **THE
+  `no known target object` NEEDLE MATCHED ONE OF ITS FIVE EMITTING SITES, SO
+  FOUR OF THEM FELL INTO THE `other` JUNK BUCKET.** Worth **+0 TRACTOR** --
+  it is the ranking instrument, not the compiler.
+  MEASURED: `RejectionLedger.cpp` and its hand-mirrored twin in
+  `run_realworld.py` both keyed on **`"with no known target object"`**. Five
+  sites emit that family and **only one spells it "with"**
+  (`ImportCStatements.cpp`); the other four say **"has"** -- `ImportC.cpp`
+  three times and `ImportCGlobals.cpp` once. So every "has" site classified as
+  `other`, which is the bucket nobody ranks work out of. Confirmed live: a
+  `--recover` run on `011_uninit_char_ptr` tagged its stub `[other]`.
+  **THE NEEDLE WAS ALSO DEAD CODE.** Across the whole 252-case corpus,
+  **zero** cases carried the "with" spelling and **four** carried "has" -- so
+  the tag it was written to produce had never once fired on this corpus, while
+  the four cases that should have produced it were mis-filed.
+  THE FIX IS THE SHARED SUFFIX, not a swap: matching `no known target object`
+  catches both spellings, so neither site can drift out again. Both mirrors
+  changed in the same commit and verified by **CALLING** `classify_blocker` on
+  all four wordings rather than reading it -- `has`, `with`, the struct-member
+  form, and `pointer assigned a non-address value` all return
+  `pointer-local-nonaddress`.
+  **THE TALLY DELTA IS EXACTLY ZERO, AND THAT IS WHY IT LANDED NOW.** The only
+  four corpus cases carrying the tag were 011/012 exec+lib, which FR-238 had
+  just fixed in the same session, so they are no longer blocked at all. Fixing
+  the needle a day later would have changed a published census figure;
+  fixing it in this window changed nothing. The value is entirely prospective:
+  RealWorld inputs and any future case now classify correctly.
+  **THIS IS THE FOURTH `other`-BUCKET BLIND SPOT FOUND IN ONE SESSION**, after
+  FR-230's missing needle (which did worse than hide a case -- it manufactured
+  a lever that did not exist), FR-239's `errno`, and the global `char *end`
+  endptr shape noted in FR-234 rung 2. Four is a pattern about the instrument,
+  not four coincidences: **the ledger and its Python mirror are hand-kept and
+  nothing tests that a diagnostic the compiler can emit is a diagnostic the
+  ledger can classify.** A test that enumerates every `emitError` wording in
+  `lib/ImportC` and asserts each one classifies to something other than
+  `other` would have caught all four, and is the obvious next instrument
+  increment.
+  `test/Kernel/linux-6.6.94-allnoconfig/rejection-report.txt` is a stored
+  artifact with no lit consumer (checked), so it is not a gate input; the
+  `test/Driver` rejection-report tests generate their own and DO exercise the
+  classifier, which is the right place for a tag shift to surface.
+
 - [x] FR-228 (opened 2026-09-09 and LANDED 2026-09-10, found by the FR-224 implementation's own
   byte-diff oracle while trying to admit `abort`): **EVERY EMITTED CRATE HAS
   THE WRONG STDOUT BUFFERING MODEL, AND EXACTLY ONE CONSTRUCT MAKES IT
