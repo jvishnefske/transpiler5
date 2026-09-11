@@ -14909,6 +14909,34 @@ piece and becomes FR-45.
      read-only, shared, a constant 32-trip bound, about as provable as a bound
      gets -- is REFUSED. SPHINCS+ functions are loops over buffers. The class
      that exists to admit them cannot see them.
+  **SECOND CORRECTION, 2026-09-10, AND IT PARTLY REINSTATES FR-226's ORIGINAL
+  HEADLINE. I OVER-GENERALISED FROM sha2 TO ALL OF SPHINCS+ AND NEARLY WROTE
+  OFF THE ONLY PAYABLE WORK IN THE SUBTREE.**
+  Measured over FR-236's export verdicts, of the 80 SPHINCS+ `lib` cases
+  **exactly 12 export and 68 are refused.** The 12 are all blake, all
+  `SPX_initialize_hash_function`, all matched `exact` (not through the name
+  fold) and all with `body_derived_risk: False` -- so the verdict is not a
+  stub artefact.
+  **Those 12 are NOT among the 34 the 3-fix cover clears.** The 34 are sha2
+  only. The blake 12 sit at **depth 6** -- five distinct importer blockers
+  plus `unreached-by-import` -- and their crates report 19 refused symbols
+  against 3 exported.
+  So the corrected board for this subtree is:
+  * **12 blake `initialize_hash_function` cases: up to +12 PASS**, gated on
+    roughly FIVE importer fixes. `tractor-eval.py` is STRICT MODE ONLY and
+    pays no partial credit, so **every one of the 19 refused symbols must
+    emit before ANY of the 12 scores** -- all-or-nothing, which is exactly
+    what FR-221 measured when it fixed one blocker of a set and got +0.
+    And the depth is a LOWER bound, so "+12 after five fixes" is an upper
+    bound on an upper bound.
+  * **The other 68: +0 PASS**, export-walled behind FR-181 exactly as this
+    entry's items 3-5 establish. That part stands.
+  FR-226's "+12" therefore named the right CASES for the wrong reason, and my
+  retraction of it was too broad. The retraction is correct about the sha2
+  family and about `prf_addr`, `gen_message_random` and `hash_message` in
+  every backend; it was wrong to extend that to blake
+  `initialize_hash_function`. Three passes over the same question, each
+  correcting the last -- which is the ledger working, not failing.
   CONSEQUENCE FOR RANKING: the three importer fixes are worth **+34 EMIT and
   +0 PASS**. That is not nothing -- FR-228 and FR-232 also landed at +0 PASS
   and were worth landing -- but it must never again be quoted as "+12 PASS".
