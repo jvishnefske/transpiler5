@@ -15063,6 +15063,32 @@ piece and becomes FR-45.
   A `--recover` leg was checked too: a crate mixing an admitted
   `strtol(buf,NULL,10)` with a refused `&s.e` site builds, stubs only the bad
   function, and prints the native's answer.
+  **MEASURED 2026-09-10, AND IT RETIRES THIS ENTRY'S OWN "+3 HONEST CEILING"
+  AS A FORECAST NOBODY CAN STAND BEHIND.** I ran `--recover --incremental` on
+  all five argv programs and counted stubs, which is the rule for reading a
+  blocker set. The result is that **their depth is structurally unmeasurable
+  until argv is admitted**: recovery drops `c_main` WHOLE (1 rejected item,
+  tag `argv`, **0 stubs**), and in every one of the five `main` holds
+  essentially the entire program -- 35 to 65 lines with one or two top-level
+  definitions. Nothing else exists to stub. So the census cannot see, and I
+  cannot forecast, what these programs need beyond argv.
+  That makes "+3 to +5" a guess about code no tool in this repo has imported,
+  which is the same error class as the nine first-failure miscounts: predicting
+  yield from a blocker set structurally incapable of showing depth. **The one
+  honest bound is a weak one**: these are 35-65 line programs, so the residue
+  behind `main` is small by construction -- unlike the SPHINCS+ cases, where
+  fourteen stubs hid behind a single first error.
+  **RUNG 2 AND RUNG 3 ARE MUTUALLY ENTANGLED AND NEITHER CAN BE SCORED
+  ALONE.** `planArgvUsesFor` is ALL-OR-NOTHING -- argv is admitted only when
+  EVERY use fits the read grammar -- and all five programs spell their uses as
+  `strtoX(argv[i], &end, base)`. So argv cannot admit until `argv[i]` is
+  admissible as a char-region argument to a hosted conversion AND the `&end`
+  out-parameter is admissible. Rung 2 is independently testable on a plain
+  `char buf[]` (no argv), which is why it is built first; but **rung 2 will
+  score +0 on its own**, and rung 3 is what finally makes the residue visible.
+  The correct sequence is therefore: land rung 2 on plain locals, widen argv's
+  grammar in rung 3 to include the hosted-conversion argument position, and
+  **THEN re-measure the depth** -- do not re-forecast it before that.
   ACCEPTANCE: `strtol`/`strtoul`/`strtod` with a NULL `endptr` over a char
   region, byte-identical to the clang native on a differential vector set
   including overflow (`ERANGE` clamping to `LONG_MAX`/`LONG_MIN`), leading

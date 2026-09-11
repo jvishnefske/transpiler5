@@ -144,6 +144,18 @@ are invisible — the census docstring names `004_nineality_sieve` as depth 1,
 actually ≥4. Honest ceiling ≈ **+3**: 007 also needs `pow` (a deliberate
 bit-exactness refusal), 006 a returned pointer, 008 an unreached item.
 
+**Neither rung can be scored alone, measured 2026-09-10.** `--recover` on all
+five argv programs drops `c_main` WHOLE — 1 rejected item, **0 stubs** — and in
+each one `main` holds essentially the whole program (35–65 lines, 1–2 top-level
+defs). So their depth is structurally invisible until argv is admitted, and the
+"+3" above is a guess about code nothing has imported. `planArgvUsesFor` is
+all-or-nothing and all five spell their uses as `strtoX(argv[i], &end, base)`,
+so argv cannot admit until *both* the hosted-conversion argument position and
+the `&end` out-parameter are admissible. Build rung 2 on plain locals (it will
+score +0), widen argv in rung 3, **then re-measure** — do not re-forecast.
+The one real bound is weak but genuine: 35–65 line programs cannot hide much,
+unlike the SPHINCS+ cases where fourteen stubs sat behind one first error.
+
 Smaller than it looks. `argv` is already half-built (`ArgvTableType`,
 `ArgvArgOp`, a `Vec<Vec<i8>>` crate wrapper); `planArgvUsesFor` just admits a
 narrow read grammar and otherwise leaves the old rejection. The real blocker is
