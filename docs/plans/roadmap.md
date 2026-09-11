@@ -182,7 +182,11 @@ verified to carry the runtime and re-checked by their own oracles.
 Ranked by FR-236's export-aware search, and I checked the C before ranking
 them — which changed the answer for one of the two.
 
-**`taking the address of a global variable` — 024/025, 4 cases (exec + lib).**
+**`taking the address of a global variable` — 024/025, *2* clean cases, not 4.**
+I filed this as 4 and had to correct it: `025`'s `lib` half is **export-refused**
+(`not all-scalar`), so it is +0 whatever the importer does, and `025`'s exec half
+has three blockers (address-of-global, `errno`, and an `fgets` result test) not
+one. The clean target is `024` + `024_lib`, both depth 1, the lib half exporting.
 Well-defined C, no UB: a `static house_t the_house` with mutator functions
 taking `&the_house`. This is the FR-62 C-owner-method shape almost exactly —
 a singleton with methods — so the machinery to lift it already exists and
@@ -190,7 +194,10 @@ FR-179's actor path already handles singletons. The likeliest real work is
 deciding the singleton's construction, not inventing a model.
 
 **`pointer variable has no known target object` — 011/012, 4 cases (exec + lib).
-Read the vectors before touching this one.** The C is
+Now the best ratio on the board: 4 cases behind ONE blocker.** All four are
+depth 1, all four ship a real vector beside the skipped `has_ub` one, and both
+`_lib` halves export (`driver`, `exact`, plain `no_mangle`). **Read the vectors
+before touching it, though.** The C is
 `char *data; printLine(data);` — an *uninitialized* pointer, which is UB, and
 the refusal is CORRECT. But the corpus tags that path's vector `has_ub` and
 the harness skips it, leaving one real vector that only exercises the

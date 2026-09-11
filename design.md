@@ -15265,6 +15265,23 @@ piece and becomes FR-45.
   to that global's struct type, lower the call as a METHOD on the owner
   (`add_floor(&the_house)` -> the owner's `add_floor`) instead of refusing it.
   Everything else about `&global` stays refused.
+  **CORRECTED THE SAME DAY, BEFORE ANY WORK STARTED: THIS IS 2 CLEAN CASES,
+  NOT 4.** I filed "4 cases" without checking the `_lib` halves' export
+  verdicts -- the rule-4 trap, caught this time by running the check instead
+  of assuming. Measured against FR-236's verdicts:
+  * `024_struct_and_static` (exec) -- 1 blocker, payable.
+  * `024_struct_and_static_lib` -- 1 blocker, and it **exports** (`driver`,
+    matched `exact`, via plain `no_mangle`). Payable.
+  * `025_struct_and_errno_and_static` (exec) -- **3 blockers**, not 1: the
+    address-of-global, `unsupported pointer expression: CallExpr` (that is
+    `errno`, FR-239), and `unsupported: an fgets result must be compared
+    against a null pointer or tested for truth`, which I had not recorded at
+    all.
+  * `025_struct_and_errno_and_static_lib` -- **EXPORT-REFUSED**, `its
+    signature is not all-scalar`. It is +0 no matter what the importer does,
+    until the export wall itself moves.
+  So the clean, one-fix target is **024 and 024_lib: two cases behind a single
+  blocker.** 025 is a three-fix case whose `lib` half is walled outright.
   **DO NOT COST 025 FROM THE CENSUS.** It is deeper than its blocker set shows:
   025 ALSO needs `errno` (which is not modelled at all -- see FR-239) and a
   `strtoX` endptr (FR-234 rung 2). 024 is the clean one; 025 is a three-fix
@@ -15281,6 +15298,12 @@ piece and becomes FR-45.
   4 cases: `011_uninit_char_ptr`, `012_uninit_int_ptr`, each exec + lib.
   Refused today with `unsupported: pointer variable 'data' has no known target
   object`, at depth 1.
+  **ALL FOUR CHECKED, AND ALL FOUR HOLD UP -- which makes this the best ratio
+  on the board: 4 cases behind ONE blocker.** Every one is depth 1; all four
+  ship a real `good` vector beside the skipped `has_ub` one; and both `_lib`
+  halves **export** (`driver`, matched `exact`, via plain `no_mangle`), so
+  neither meets FR-227's wall. Compare FR-237, which I filed as "4 cases" and
+  had to correct to 2 for exactly the check I ran here.
   THE C, measured: `void bad() { char *data; printLine(data); }` -- an
   UNINITIALIZED pointer read and passed. That is undefined behaviour, so
   `emitrust-cc` refusing it is right, and "model an indeterminate pointer" is
