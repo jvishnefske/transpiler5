@@ -15180,6 +15180,78 @@ piece and becomes FR-45.
   citing a program set without enumerating what each member actually needs.
   The per-program form table above is the thing to re-read before dispatching,
   and the depth BEYOND the argv gate remains unmeasurable until argv admits.
+  **RUNG 3 IMPLEMENTED. THE ACCEPTANCE TARGET IS TWO PROGRAMS, NOT THREE, AND
+  I CONTRADICTED MYSELF INSIDE THIS ENTRY TO GET THE WRONG NUMBER.**
+  `006_static_alias` is NOT winnable on forms 1+2: it emits argv fine now and
+  then dies at `unsupported: returned pointer value (only a returned
+  whole-global or function address has a representation)` -- `static_alias`
+  returns `int *` -- and `--recover` shows a SECOND stub, `pointer assigned a
+  non-address value`. **This entry had ALREADY RECORDED "006 also needs
+  `returned pointer value`" ~200 lines above the scoping paragraph that then
+  asserted 006 "uses NOTHING ELSE".**
+  **THE METHOD IS WHAT FAILED, NOT MY MEMORY, AND THE LESSON GENERALISES:
+  ENUMERATING argv FORMS ANSWERS "WHAT DOES EACH PROGRAM USE", NOT "WHAT ELSE
+  BLOCKS IT".** 006's extra blocker is a RETURN-VALUE blocker -- not an argv
+  form at all -- so it was outside the enumeration's frame by construction,
+  and I read a complete-looking form table as a complete blocker list. A form
+  enumeration must be crossed with the case's full blocker set, exactly as a
+  blocker count must be crossed with `kind` and export. Measured acceptance:
+  **004 and 005, both at 0 stubs under `--recover`.**
+  **THE SLICE/REGION QUESTION WAS AN ADAPTER, NOT A MISMATCH.**
+  `emitrust.argv_arg` already yields `!emitrust.ref<!emitrust.slice<i8>>` --
+  the exact type `__emitrust_strtol` takes and `emitCharRegionSlice` produces.
+  Form 1 is four lines of plumbing, and the shared-vs-mut check falls out for
+  free because the deref's operand is a `ref`, not a `mut_ref`, so argv can
+  never become a mutable string argument.
+  **FORM 2 WAS THE REAL WORK AND MY FRAMING OF IT WAS WRONG.** I asked whether
+  the rung-2 region join "survives when the co-argument is an argv slice". It
+  does not JOIN anything -- **there is no region to join to.** `argv` is a run
+  of DISJOINT objects selected at runtime, so an argv-rooted pointer cannot be
+  a bare cursor: at offset 0 a cursor alone cannot tell `argv[1]` from
+  `argv[2]`, which is exactly where every corpus program's no-conversion test
+  sits. The argument index is carried as a SECOND `memref<i64>` cell beside
+  the cursor and equality is the `(index, cursor)` PAIR. That also dissolves
+  the 006 worry about `end` walking two arguments: the selector is state the
+  second call overwrites.
+  **`argv[i] == NULL` HAD TO BE EXCLUDED FROM FORM 2, AND IT IS A MISCOMPILE
+  GUARD, NOT SCOPE.** The first cut admitted any pointer-typed other operand.
+  **`argv[argc]` IS a null pointer (C 5.1.2.2.1p2)**, and the argv
+  decomposition carries no null state, so the test would fold to a CONSTANT --
+  the wrong constant at `i == argc`. It also flipped a pinned
+  `argv[0] != 0` rejection. `admittedArgvPointerEquality` now takes the
+  `ASTContext` and rejects a null-pointer-constant operand.
+  **I TOLD IT TO REMOVE `ImportCFunctions.cpp:774-777` AND IT CORRECTLY DID
+  NOT.** The all-or-nothing rule makes that refusal exactly what keeps forms
+  3/4/5 failing loudly; removing it would have been the silent behaviour
+  change the spec's own bar forbids.
+  **THREE SILENT-FOLD HAZARDS THE SPEC DID NOT NAME, FOUND BY ADVERSARIAL
+  PROBING RATHER THAN BY ANY TEST.** An argv-rooted pointer is BASE-LESS,
+  which is also how a statically-NULL pointer looks to this importer.
+  Unguarded: `end == NULL` folded to **true**, `if (end)` folded to **false**,
+  and `*end` reported `dereference of a pointer that is only ever null` --
+  the right refusal for the wrong reason. **None of the three mentions `argv`,
+  so the admission grammar cannot screen them out**, and all three are
+  reachable from an admitted `main`. Fixed; the first two are byte-diff
+  columns.
+  FORM 6 (`strtoX(argv[i], NULL, base)`) CAME FREE and was not predicted:
+  form 1's admission does not inspect the endptr, and rung 1 already lowered a
+  NULL one.
+  **THE ORACLE WAS MUTATION-TESTED**, which is the right response to a spec
+  that warns about compile-clean evidence: comparison-ignores-the-index and
+  selector-stored-only-at-first-binding were each built and run, and each
+  FAILED the byte-diff. A test that cannot fail is not an oracle.
+  Left refused, signature wording byte-identical: `strlen(argv[i])`,
+  `argv[i] + k`, `fprintf(stderr, "%s", argv[i])`, ordered comparison against
+  `argv[i]`, and a project-supplied `strtol`. Six new located wordings, each
+  probed from the built tool, with the `argv-pointer` needle placed AFTER the
+  historical `{"use of main's argv","argv"}` row so first-match-wins keeps
+  that tag byte-identical.
+  Gate **1092/1092** (1089 + 3 new). Clippy 57 (+0), 294 files / 0 skipped /
+  hash unchanged. Binding 2307 (+0), p95 5 (+0). CTestSuite 220/220,
+  Cpp17Suite 35/35. **Golden movement 0** over 1364 sources
+  (`SAME=976 MOVED=0 BOTHFAIL=387 NEWLY_EMITS=1`, the 1 being its own test).
+  All anchors confirmed and each one fired on real input -- no anchor defect
+  this wave, the first time this session.
   ACCEPTANCE: `strtol`/`strtoul`/`strtod` with a NULL `endptr` over a char
   region, byte-identical to the clang native on a differential vector set
   including overflow (`ERANGE` clamping to `LONG_MAX`/`LONG_MIN`), leading

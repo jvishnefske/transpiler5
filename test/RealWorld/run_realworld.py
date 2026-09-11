@@ -304,6 +304,14 @@ _DYNMEM_NAMES = {"malloc", "calloc", "realloc", "free", "aligned_alloc"}
 _ALLOC_KEYWORDS = ("malloc", "calloc", "realloc", "aligned_alloc", "alloca")
 _BLOCKER_SUBSTRINGS = [
     ("use of main's argv", "argv"),
+    # FR-234 rung 3: argv's subject-string and pointer-equality forms now
+    # import, so a program that still refuses over argv is refusing a
+    # POINTER INTO an argv argument (a dereference, a write through it, a
+    # join with another object, a null binding, an ordered comparison) --
+    # different work from "argv is not modelled at all". Placed right after
+    # the historical entry so first-match-wins keeps the `argv` tag for the
+    # signature refusal. Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("main's argv", "argv-pointer"),
     # C99-43 slice 1: the cursor-parameter rejections split out of the
     # generic ptr-to-ptr bucket, listed ABOVE it so first-match-wins
     # routes them (every wording also contains "pointer-to-pointer" or

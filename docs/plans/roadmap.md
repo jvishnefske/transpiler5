@@ -9,14 +9,15 @@ this document, they win** — this one summarises, they record.
 
 | | |
 |---|---|
-| **TRACTOR PASS** | **64 / 252** (exec 26, lib 38) |
-| EMIT-cleared | 78 / 252 |
+| **TRACTOR PASS** | **66 / 252** (exec 28, lib 38) |
+| EMIT-cleared | 80 / 252 |
 | SYMBOL_MISSING | 13 — emit clean, export refused |
 | VACUOUS_PASS | 1 (`update_md5_lib`; its only vector is `has_ub` and skipped) |
 
-One session moved this **41 → 64**: FR-224's libc shim table (+4), FR-229's
+One session moved this **41 → 66**: FR-224's libc shim table (+4), FR-229's
 char-pointer byte view in three waves (+5, +5, +2), FR-230's `alloca` (+2) and
-`strchr` cursor bind (+1), and FR-238's uninitialized-pointer panic (+4).
+`strchr` cursor bind (+1), and FR-238's uninitialized-pointer panic (+4), and FR-234 rung 3's argv
+widening (+2).
 FR-228, FR-232, FR-235, FR-236 and FR-234 rungs 1-2 landed at +0 PASS by
 design — each is recorded as such so no reader infers yield from them.
 

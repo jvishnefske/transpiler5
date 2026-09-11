@@ -28,10 +28,8 @@ using namespace mlir;
 //===----------------------------------------------------------------------===//
 
 const clang::Expr *
-CImporter::matchArgvWholeSubscript(const clang::Expr *expr) const {
-  // Only an admitted `main` binds the table; without it argv never reaches
-  // here (its uses were rejected at the signature), so nothing matches.
-  if (!mainArgvTableValue)
+CImporter::matchArgvWholeSubscriptDecl(const clang::Expr *expr) const {
+  if (!mainArgvAdmittedParam)
     return nullptr;
   const clang::Expr *e = expr->IgnoreParenImpCasts();
   const auto *sub = llvm::dyn_cast<clang::ArraySubscriptExpr>(e);
@@ -42,6 +40,15 @@ CImporter::matchArgvWholeSubscript(const clang::Expr *expr) const {
   if (!ref || ref->getDecl() != mainArgvAdmittedParam)
     return nullptr;
   return sub->getIdx();
+}
+
+const clang::Expr *
+CImporter::matchArgvWholeSubscript(const clang::Expr *expr) const {
+  // Only an admitted `main` binds the table; without it argv never reaches
+  // here (its uses were rejected at the signature), so nothing matches.
+  if (!mainArgvTableValue)
+    return nullptr;
+  return matchArgvWholeSubscriptDecl(expr);
 }
 
 const clang::ArraySubscriptExpr *
@@ -69,6 +76,42 @@ FailureOr<Value> CImporter::emitArgvArgSlice(Location loc,
       .create<emitrust::ArgvArgOp>(loc, sliceRefType, mainArgvTableValue,
                                    *index)
       .getResult();
+}
+
+FailureOr<PtrExprValue>
+CImporter::emitArgvRegionArg(Location loc, const clang::Expr *indexExpr) {
+  // The index is evaluated exactly once: the SAME i64 value names the
+  // borrowed argument and the region identity, so a side-effecting or
+  // non-constant index (`argv[i]` in a loop) can never have the borrow and
+  // the identity disagree.
+  FailureOr<Value> index = emitRValue(indexExpr);
+  if (failed(index))
+    return failure();
+  if (!llvm::isa<IntegerType>((*index).getType()))
+    return emitError(loc) << "unsupported subscript index type";
+  auto i8Type = builder.getIntegerType(8);
+  auto sliceType = emitrust::SliceType::get(i8Type);
+  Value borrow = builder
+                     .create<emitrust::ArgvArgOp>(
+                         loc, emitrust::RefType::get(sliceType),
+                         mainArgvTableValue, *index)
+                     .getResult();
+  // The FR-72 slice-param region shape: a SHARED `!emitrust.lvalue<
+  // !emitrust.slice<i8>>` place plus a cursor. `emitCharRegionSlice`
+  // reslices it at the cursor, and its mutable-borrow check reads the
+  // deref's operand type -- a `!emitrust.ref` -- so a `char *` argv
+  // argument can never become a mutable string argument.
+  Value place =
+      builder
+          .create<emitrust::DerefOp>(
+              loc, emitrust::LValueType::get(sliceType), borrow)
+          .getResult();
+  PtrExprValue value{nullptr,
+                     createIntConstant(loc, builder.getIntegerType(64), 0)};
+  value.slicePlace = place;
+  value.argvIndex =
+      castToIntType(loc, *index, builder.getIntegerType(64));
+  return value;
 }
 
 FailureOr<Value>
@@ -1466,8 +1509,10 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
       // A statically-null pointer (base-less nullable region, CTS-P9)
       // decomposes to nothing at all; its null test folds to the constant
       // truth of `null == null`.
+      // FR-234 rung 3: an argv-rooted pointer is base-less but never null
+      // (C 7.22.1.4p7); without this screen `end == NULL` folded to TRUE.
       if (!pointer->base && !pointer->literalBacking && !pointer->baseIndex &&
-          !pointer->nonNull)
+          !pointer->nonNull && !pointer->argvIndex)
         return createBoolConstant(loc, isEq);
       if (!pointer->nonNull) // Statically non-null: the check folds.
         return createBoolConstant(loc, !isEq);
@@ -1490,6 +1535,45 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
     if (lhs->nonNull || rhs->nonNull)
       return emitError(loc)
              << "unsupported: comparison of possibly-null pointers";
+    // FR-234 rung 3: an argv-rooted side (form 2, `end == argv[i]`).
+    // `argv` is a run of DISJOINT objects selected at runtime, so equality
+    // is the (index, cursor) PAIR -- exactly the multi-base test below,
+    // with the discriminant supplied by the argv index instead of by a
+    // static base list. Comparing cursors alone would answer true for
+    // `end == argv[2]` whenever `end` sits at the base of `argv[1]`, which
+    // is the no-conversion case every corpus program tests. C defines
+    // ORDERED comparison only within one object and the index is a runtime
+    // value, so ordered stays a located rejection.
+    if (lhs->argvIndex || rhs->argvIndex) {
+      if (!lhs->argvIndex || !rhs->argvIndex)
+        return emitError(loc) << "unsupported: comparison of pointers into "
+                                 "different objects";
+      if (op->getOpcode() != clang::BO_EQ && op->getOpcode() != clang::BO_NE)
+        return emitError(loc) << "unsupported: ordered comparison of "
+                                 "pointers into main's argv";
+      Type argvCursorType = builder.getIntegerType(64);
+      Value sameArg = builder
+                          .create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                                 lhs->argvIndex,
+                                                 rhs->argvIndex)
+                          .getResult();
+      Value leftAt = lhs->cursor
+                         ? lhs->cursor
+                         : createIntConstant(loc, argvCursorType, 0);
+      Value rightAt = rhs->cursor
+                          ? rhs->cursor
+                          : createIntConstant(loc, argvCursorType, 0);
+      Value sameByte = builder
+                           .create<arith::CmpIOp>(
+                               loc, arith::CmpIPredicate::eq, leftAt, rightAt)
+                           .getResult();
+      Value same =
+          builder.create<arith::AndIOp>(loc, sameArg, sameByte).getResult();
+      if (op->getOpcode() == clang::BO_EQ)
+        return same;
+      Value truth = createBoolConstant(loc, true);
+      return builder.create<arith::XOrIOp>(loc, same, truth).getResult();
+    }
     if (lhs->baseIndex || rhs->baseIndex) {
       // A multi-base side compares by (discriminant, cursor) pair: C
       // defines equality across distinct objects (unequal) and within one
