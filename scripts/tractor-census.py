@@ -23,6 +23,33 @@ every one of those cases also needs four other fixes. Conversely a blocker in
 6 cases is worth 6 if it is the ONLY thing those 6 need. Marginal yield is a
 property of the SET, not of the histogram, and no histogram can show it.
 
+AND EMIT IS ONE STAGE OF THREE. A `_lib` case scores by `dlopen` plus `dlsym`
+of ONE named symbol, so clearing every emit blocker in it buys nothing unless
+that symbol acquires a C ABI. FR-233 measured the top 3-fix set-cover at +34
+EMIT of which all 34 were `lib`, four distinct symbols across eight build
+configurations, and probed all four with `--c-abi-exports`: none exported. The
+instrument was therefore ranking importer work by a number the rubric could
+not pay. So every `lib` case now also carries an EXPORT VERDICT, read out of
+the same `--recover --incremental --c-abi-exports` run: either the target
+symbol acquires `#[no_mangle]`/`#[export_name]`, or `emitrust-cc` names the
+shape that stopped it (FR-139/FR-182/FR-202/FR-209/FR-226 each have their own
+sentence, and the sentences are kept apart because a refusal's WORDING is this
+instrument's key), or the symbol never reaches the emitted module at all.
+
+THE EXPORT VERDICT IS AN OBSERVATION, NOT A PREDICTION. It says what THIS
+binary does to THIS signature today. It is not a claim that the wall is
+permanent -- an export-class widening is itself a fix somebody can make -- and
+it is not a claim that a stubbed body's signature is the signature the same
+function would have had if its body had imported. Two of the export classes
+(FR-202's bounded slice, FR-226's unaccessed pointer) are decided FROM THE
+BODY, so recovery's stub can move the verdict in either direction. What the
+verdict is good for is the negative: a `lib` case counted as "cleared" by an
+importer-only fix while its own symbol is refused today is a case whose EMIT
+movement demonstrably is not yield, and the set-cover below now says so
+instead of hiding it in a total. Calibration on the 50 `lib` cases that emit
+in STRICT mode: the verdict names the target symbol for exactly the 13
+SYMBOL_MISSING cases and for none of the 36 PASS ones.
+
 EVERY DEPTH THIS TOOL REPORTS IS A LOWER BOUND, and the instrument cannot be
 made exact. `--recover` drops whole TOP-LEVEL ITEMS, so every blocker INSIDE a
 rejected function is invisible: the importer bails at the first error in a
@@ -89,7 +116,12 @@ def recover_blockers(case, cc: Path, out_dir: Path, extra_cflags: str):
 
     Runs the same command `tractor-eval.emit` builds, plus --incremental
     (which implies --recover), into a scratch crate dir so the scored crate
-    is never touched. Returns (blockers, note).
+    is never touched. Returns (blockers, note, rejected_items, export).
+
+    `export` is the EXPORT-STAGE observation for a `_lib` case, read from the
+    very same run -- `tractor-eval.emit` already passes `--c-abi-exports` for
+    a library, so this costs no extra invocation and cannot disagree with the
+    scorer about the flags. `None` for an `exec` case, which has no dlsym gate.
     """
     crate = out_dir / "recover" / case.rel_name.replace("/", "__")
     shutil.rmtree(crate, ignore_errors=True)
@@ -125,7 +157,9 @@ def recover_blockers(case, cc: Path, out_dir: Path, extra_cflags: str):
 
     proc = run(cmd)
     if proc is None:
-        return set(), "recover timed out", 0
+        return set(), "recover timed out", 0, (
+            {"verdict": "unknown", "blocker": "", "why": "recover timed out"}
+            if case.is_library else None)
 
     prog = crate / "emitrust-progress.json"
     note = ""
@@ -173,12 +207,14 @@ def recover_blockers(case, cc: Path, out_dir: Path, extra_cflags: str):
         for line in (proc.stderr or "").splitlines():
             if "unsupported:" in line:
                 got.add(line.split("unsupported:", 1)[1].strip()[:110])
-        return got, (note or "no-progress-json"), dropped
+        return (got, (note or "no-progress-json"), dropped,
+                export_verdict(case, crate, proc.stderr or ""))
 
     try:
         data = json.loads(prog.read_text())
     except (OSError, json.JSONDecodeError):
-        return set(), "progress unreadable", dropped
+        return (set(), "progress unreadable", dropped,
+                export_verdict(case, crate, proc.stderr or ""))
 
     blockers = set()
     items = data.get("items") or data.get("entries") or []
@@ -205,7 +241,178 @@ def recover_blockers(case, cc: Path, out_dir: Path, extra_cflags: str):
              or it.get("detail") or "")
         if b:
             blockers.add(str(b).strip()[:110])
-    return blockers, note, dropped
+    return blockers, note, dropped, export_verdict(case, crate,
+                                                   proc.stderr or "")
+
+
+_EXPORT_REFUSAL_RX = re.compile(
+    r"no C-ABI export for '([^']+)': (.*?); it stays a plain 'pub fn' and is "
+    r"not reachable by dlsym")
+
+#: `#[export_name = "sym"]` -- FR-208's spelling, used whenever the emitted
+#: item's name is NOT the C symbol (the FR-53 idiomatic rename), and by every
+#: FR-182/FR-202/FR-226 delegating wrapper, whose item is
+#: `__emitrust_cabi_<sym>`.
+_EXPORT_NAME_RX = re.compile(r'#\[export_name\s*=\s*"([^"]+)"\]')
+
+#: `#[no_mangle] pub extern "C" fn sym` -- the plain all-scalar export, where
+#: the item's own name IS the symbol. Attributes between the two are tolerated.
+_NO_MANGLE_RX = re.compile(
+    r'#\[no_mangle\]\s*(?:#\[[^\]]*\]\s*)*'
+    r'pub\s+(?:unsafe\s+)?extern\s+"C"\s+fn\s+([A-Za-z_]\w*)')
+
+
+def _fold(name: str) -> str:
+    """The identifier key that survives FR-53's idiomatic rename.
+
+    MEASURED, NOT ASSUMED, and it is the reason this function exists. The
+    SPHINCS+ harness dlsyms `SPX_prf_addr`; the importer renames the item to
+    `spx_prf_addr`, and BOTH the refusal warning and `emitrust-progress.json`
+    carry the RUST name -- only `#[export_name = "..."]`, which exists solely
+    for symbols that DO export, carries the C spelling. So a refused symbol
+    cannot be matched to its case by string equality, and a matcher that
+    tried it reported 32 SPHINCS+ cases as `absent` (symbol not in the
+    module) when the module in fact contains the function and emitrust-cc in
+    fact printed its refusal.
+
+    Case and underscores are exactly what the rename moves, so they are what
+    this drops. It is a HEURISTIC and it is used only when the exact name
+    misses AND the folded key is UNIQUE among the candidates -- an ambiguous
+    fold is reported as ambiguous rather than guessed.
+    """
+    return name.lower().replace("_", "")
+
+
+def _unique_fold_match(symbol: str, names) -> str:
+    """`names`' member matching `symbol` after folding, if there is exactly one."""
+    key = _fold(symbol)
+    hits = [n for n in names if _fold(n) == key]
+    return hits[0] if len(hits) == 1 else ""
+
+
+def export_verdict(case, crate: Path, stderr: str) -> dict:
+    """What the CURRENT binary does to this `_lib` case's dlsym'd symbol.
+
+    Not a prediction and not a proof -- an OBSERVATION of one run, which is
+    the only thing this file is allowed to claim (see the module docstring,
+    and the deleted "CONFIRMED" column it warns about). Four ways to be
+    unexported and they are kept apart because the remedies differ:
+
+      * `refused`    -- emitrust-cc classified the signature and said, in that
+        shape's own sentence, why it gets no C ABI. This is the export WALL:
+        no importer fix moves it, only an export-class fix.
+      * `unexported` -- the symbol IS in the emitted module and drew no
+        refusal. FR-159 keeps a per-TU-module item out of the export path
+        without a diagnostic, and a `static` C function is not public at all;
+        either way there is nothing for the harness to dlsym.
+      * `absent`     -- the symbol never reached the emitted module (its TU
+        did not parse, or recovery dropped it outright).
+      * `ambiguous`  -- the fold above matched more than one candidate. Not
+        guessed; reported.
+
+    EXPORTED IS DECIDED BY EXACT NAME AND NOTHING ELSE, because `dlsym` is.
+    `#[export_name = "S"]` and `#[no_mangle] ... fn S` both put the literal
+    `S` in the dynamic symbol table, so `S == case.symbol` or the harness
+    does not find it. The fold is used ONLY to attribute a refusal or a
+    presence, never to declare an export.
+
+    WHICH SYMBOL. `case.symbol` -- tractor-eval's own answer, parsed from the
+    case's cando2 harness (`parse_lib_naming`), never re-derived here. If the
+    two files disagreed about the symbol the census would be wrong in a new
+    way, so there is exactly one definition of it and this reads it.
+    """
+    if not case.is_library:
+        return None
+    symbol = case.symbol or ""
+    refusals = {}
+    for m in _EXPORT_REFUSAL_RX.finditer(stderr or ""):
+        refusals.setdefault(m.group(1), m.group(2).strip())
+
+    text = ""
+    src = crate / "src"
+    if src.is_dir():
+        for rs in sorted(src.rglob("*.rs")):
+            try:
+                text += rs.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        # Keep the refusals next to the crate they describe, so this verdict
+        # can be re-derived without a second six-minute corpus pass.
+        try:
+            (crate / "export-warnings.txt").write_text(
+                "".join(f"{k}\t{v}\n" for k, v in sorted(refusals.items())),
+                encoding="utf-8")
+        except OSError:
+            pass
+
+    plain = set(_NO_MANGLE_RX.findall(text))
+    wrapped = set(_EXPORT_NAME_RX.findall(text))
+    exported_names = plain | wrapped
+    emitted_fns = set(re.findall(r"\bfn\s+([A-Za-z_]\w*)", text))
+
+    # HOW SOFT IS AN `exports` VERDICT? Two of the export classes are decided
+    # FROM THE BODY -- FR-202 needs a must-access bound proven from it, FR-226
+    # needs the body to never touch the pointer -- and a RECOVERY STUB has no
+    # body, so it satisfies "never accesses" vacuously. An `exports` verdict on
+    # a stubbed item that goes through a delegating wrapper is therefore the
+    # one shape this tool can over-report, and it is counted rather than
+    # smoothed over. `#[no_mangle]` on the function itself is FR-139's
+    # all-scalar class, which reads the SIGNATURE only and is unaffected.
+    status = ""
+    prog = crate / "emitrust-progress.json"
+    if prog.is_file():
+        try:
+            items = json.loads(prog.read_text()).get("items") or []
+            hits = [i for i in items
+                    if isinstance(i, dict) and _fold(i.get("symbol", ""))
+                    == _fold(symbol)]
+            if hits:
+                status = str(hits[0].get("status") or "")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    rec = {"symbol": symbol,
+           "refused_symbols": len(refusals),
+           "exported_symbols": len(exported_names),
+           "item_status": status,
+           "matched_as": "exact"}
+
+    if symbol in exported_names:
+        rec.update(verdict="exports", blocker="",
+                   via="no_mangle" if symbol in plain else "wrapper",
+                   body_derived_risk=bool(symbol in wrapped
+                                          and status not in ("ported", "")))
+        return rec
+    if symbol in refusals:
+        rec.update(verdict="refused", blocker=refusals[symbol])
+        return rec
+    if not text:
+        rec.update(verdict="absent", blocker="", matched_as="none",
+                   why="no crate was written by the recover run")
+        return rec
+
+    # The rename path. Try the refusals first -- a named refusal is strictly
+    # more informative than a bare presence.
+    hit = _unique_fold_match(symbol, refusals)
+    if hit:
+        rec.update(verdict="refused", blocker=refusals[hit],
+                   matched_as=f"renamed to '{hit}'")
+        return rec
+    if [n for n in refusals if _fold(n) == _fold(symbol)]:
+        rec.update(verdict="ambiguous", blocker="", matched_as="ambiguous",
+                   why="more than one emitted item folds to this C symbol")
+        return rec
+    hit = _unique_fold_match(symbol, emitted_fns)
+    if hit:
+        rec.update(verdict="unexported", blocker="",
+                   matched_as="exact" if hit == symbol else f"renamed to '{hit}'",
+                   why="the item is emitted but takes no export path and drew "
+                       "no refusal (FR-159 per-TU module, not public, or a "
+                       "recovery stub the exporter skipped)")
+        return rec
+    rec.update(verdict="absent", blocker="", matched_as="none",
+               why="the symbol is not in the emitted module")
+    return rec
 
 
 def normalize(b: str) -> str:
@@ -272,12 +479,15 @@ def main() -> int:
     sets = {}
     notes = {}
     dropped = {}
-    for name, blockers, note, ndropped in recs:
+    exports = {}
+    for name, blockers, note, ndropped, export in recs:
         sets[name] = {normalize(b) for b in blockers}
         if note:
             notes[name] = note
         if ndropped:
             dropped[name] = ndropped
+        if export is not None:
+            exports[name] = export
 
     # --- stage 3: the analysis that the histograms could not give ----------
     todo = {k: v for k, v in sets.items() if k not in passing}
@@ -348,6 +558,66 @@ def main() -> int:
     for k in sorted(ri):
         print(f"  {ri[k]:4} cases have {k} rejected item(s)")
 
+    # --- the EXPORT stage, for `lib` cases only ---------------------------
+    # Printed BEFORE the set cover because it is what the set cover is now
+    # allowed to say. Not a prediction: see the module docstring.
+    walled = {k for k, e in exports.items()
+              if e.get("verdict") != "exports"}
+    print("\nEXPORT VERDICT for the {} `lib` cases (an OBSERVATION of what "
+          "this\nbinary does to each case's dlsym'd symbol TODAY -- not a "
+          "prediction, and\nnot a claim the wall is permanent; widening an "
+          "export class is itself a fix):"
+          .format(len(exports)))
+    vd = collections.Counter(e.get("verdict") for e in exports.values())
+    for v in sorted(vd, key=lambda x: -vd[x]):
+        print(f"  {vd[v]:4}  {v}")
+    soft = sum(1 for e in exports.values() if e.get("body_derived_risk"))
+    stub = sum(1 for e in exports.values()
+               if e.get("verdict") == "exports"
+               and e.get("item_status") == "stubbed")
+    print(f"\n  {stub} of the `exports` verdicts are for an item RECOVERY "
+          f"STUBBED, and {soft} of\n  those reach the C ABI through a "
+          f"delegating wrapper. Only the second number is\n  soft: FR-202's "
+          f"bound and FR-226's unaccessed pointer are decided FROM THE BODY,\n"
+          f"  and a stub has none, so it can satisfy them vacuously. "
+          f"FR-139's plain\n  `#[no_mangle]` reads the signature only and is "
+          f"unaffected by the stub.")
+    renamed = sum(1 for e in exports.values()
+                  if str(e.get("matched_as", "")).startswith("renamed"))
+    print(f"\n  {renamed} of those verdicts were attributed through FR-53's "
+          f"rename (the C symbol\n  `SPX_prf_addr` is the item `spx_prf_addr` "
+          f"everywhere but `#[export_name]`),\n  by a UNIQUE case/underscore "
+          f"fold. Ambiguous folds are reported, never guessed.")
+    agree_ok = sum(1 for k, e in exports.items()
+                   if k in passing and e.get("verdict") == "exports")
+    agree_no = sum(1 for k, e in exports.items()
+                   if scored.get(k, ("", ""))[0] == "SYMBOL_MISSING"
+                   and e.get("verdict") != "exports")
+    npass = sum(1 for k in exports if k in passing)
+    nsym = sum(1 for k in exports
+               if scored.get(k, ("", ""))[0] == "SYMBOL_MISSING")
+    print(f"\n  CALIBRATION against the scored run, on the cases whose "
+          f"outcome the\n  export stage already decided: {agree_ok}/{npass} "
+          f"PASS cases read `exports`,\n  {agree_no}/{nsym} SYMBOL_MISSING "
+          f"cases read otherwise. A disagreement here\n  means this parser "
+          f"is wrong, not that the binary is.")
+
+    exb = collections.Counter(
+        normalize(e.get("blocker") or "") for e in exports.values()
+        if e.get("verdict") == "refused")
+    print("\nEXPORT REFUSAL WORDINGS -- kept APART on purpose. The census "
+          "keys on the\ndiagnostic, and collapsing shape-specific refusals "
+          "into one bucket is exactly\nwhat moves a real class into the "
+          "`other` junk heap where nobody ranks it:")
+    if not exb:
+        print("  (none)")
+    for b, n in exb.most_common(12):
+        print(f"  {n:4}  {b[:100]}")
+    print("\nNOT-EXPORTED `lib` cases that are ALSO non-passing at emit: "
+          f"{len(walled & set(todo))}.\nAn importer fix that clears every "
+          "emit blocker in one of those still scores\nZERO, because the "
+          "rubric pays on dlsym.")
+
     # SET COVER. Two exclusions, both of which changed the answer materially
     # when they were added, so neither is cosmetic:
     #
@@ -364,6 +634,16 @@ def main() -> int:
     # verified; there is no such set, so nothing is excluded on that basis
     # now. Measured calibration: predicted +14 EMIT for the system-header fix,
     # delivered +7.
+    #
+    #   * THE EXPORT WALL, and this one is not an exclusion but a SPLIT.
+    #     FR-233 read this table's "+34 EMIT (exec 0, lib 34)" as work worth
+    #     doing; all 34 were `lib` cases whose own dlsym'd symbol is refused
+    #     a C ABI by the binary that printed the number, so the honest EMIT
+    #     figure was 34 and the honest YIELD figure was 0. Every row below
+    #     therefore breaks its total into (exec / lib-exports / EXPORT-WALLED),
+    #     and a second table re-optimises with the walled cases removed from
+    #     the objective. Both remain UPPER BOUNDS, and "walled" is a statement
+    #     about today's binary -- an export-class widening would move it.
     NON_ACTIONABLE = {"unreached-by-import", ""}
     solid = {k: v - NON_ACTIONABLE for k, v in todo.items()}
     solid = {k: v for k, v in solid.items() if v}
@@ -374,24 +654,59 @@ def main() -> int:
           f"{len(todo)} non-passing cases have an actionable blocker.\n"
           f"EVERY FIGURE IS AN UPPER BOUND -- see the note above the "
           f"single-blocker table.")
-    best_by_size = {}
-    for k in range(1, args.max_combo + 1):
-        best = (0, None)
-        for combo in itertools.combinations(cands, k):
-            s = set(combo)
-            cleared = sum(1 for v in solid.values() if v <= s)
-            if cleared > best[0]:
-                best = (cleared, combo)
-        best_by_size[k] = best
-        if best[1]:
-            got = [c for c, v in solid.items() if v <= set(best[1])]
-            nexec = sum(1 for c in got if kinds.get(c) == "exec")
-            print(f"  {k} fix(es) -> +{best[0]} EMIT   "
-                  f"(exec {nexec}, lib {len(got) - nexec})")
-            for b in best[1]:
+    def split(got):
+        """(exec, lib-that-exports, lib-that-is-export-walled)."""
+        nexec = sum(1 for c in got if kinds.get(c) == "exec")
+        nok = sum(1 for c in got if kinds.get(c) != "exec"
+                  and exports.get(c, {}).get("verdict") == "exports")
+        return nexec, nok, len(got) - nexec - nok
+
+    def cover(objective):
+        """Best `k`-combination for each k, maximising `objective(case)`."""
+        table = {}
+        for k in range(1, args.max_combo + 1):
+            best = (0, None)
+            for combo in itertools.combinations(cands, k):
+                cs = set(combo)
+                score = sum(1 for c, v in solid.items()
+                            if v <= cs and objective(c))
+                if score > best[0]:
+                    best = (score, combo)
+            table[k] = best
+        return table
+
+    def emit_table(table, label):
+        for k, (score, combo) in sorted(table.items()):
+            if not combo:
+                print(f"  {k} fix(es) -> +0 cases")
+                continue
+            got = [c for c, v in solid.items() if v <= set(combo)]
+            nexec, nok, nwall = split(got)
+            print(f"  {k} fix(es) -> +{len(got)} EMIT   "
+                  f"(exec {nexec}, lib-exports {nok}, EXPORT-WALLED {nwall})"
+                  + (f"   [{label} {score}]" if label else ""))
+            for b in combo:
                 print(f"        {b[:72]}")
-        else:
-            print(f"  {k} fix(es) -> +0 cases")
+
+    best_by_size = cover(lambda c: True)
+    emit_table(best_by_size, "")
+
+    # The same optimisation with the export-walled cases taken OUT of the
+    # objective. This is the table to rank importer work by; the one above is
+    # the table that told FR-233 it had found +34 when the rubric would have
+    # paid 0.
+    def not_walled(c):
+        return (kinds.get(c) == "exec"
+                or exports.get(c, {}).get("verdict") == "exports")
+    yield_by_size = cover(not_walled)
+    npayable = sum(1 for c in solid if not_walled(c))
+    print(f"\nSET COVER, EXPORT-AWARE -- the same search re-optimised over "
+          f"only the\n{npayable} of {len(solid)} actionable cases whose "
+          f"symbol can reach dlsym as this\nbinary stands. STILL AN UPPER "
+          f"BOUND (every blocker set is a lower bound),\nand still not a "
+          f"prediction: the walled cases are not unreachable, they need an\n"
+          f"EXPORT-class fix in addition to the importer one.")
+    emit_table(yield_by_size, "payable")
 
     report = {
         "cases": len(cases),
@@ -406,6 +721,12 @@ def main() -> int:
         "rejected_items": dropped,
         "set_cover": {str(k): {"cleared": v[0], "fixes": list(v[1] or [])}
                       for k, v in best_by_size.items()},
+        "export_verdicts": exports,
+        "export_verdict_is_an_observation_not_a_prediction": True,
+        "export_refusal_wordings": dict(exb.most_common()),
+        "set_cover_export_aware": {
+            str(k): {"payable": v[0], "fixes": list(v[1] or [])}
+            for k, v in yield_by_size.items()},
     }
     (out / "census.json").write_text(json.dumps(report, indent=2) + "\n")
     print(f"\nreport: {out / 'census.json'}")

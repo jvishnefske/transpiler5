@@ -14033,6 +14033,11 @@ piece and becomes FR-45.
 - [ ] FR-226 (opened 2026-09-09, spiked the same hour from FR-225's ranked
   item 1): **THE 20-CASE LEVER IS TWO FIXES, NOT FIVE, AND ONE OF THEM IS A
   FUNCTION THAT DOES NOTHING.** Measured, not extrapolated.
+  **RETRACTED IN PART BY FR-233 (2026-09-10): THE "+12 PASS" HEADLINE IS
+  WRONG AND THE CORRECT FIGURE IS +0 PASS.** All 32 remaining SPHINCS+ cases
+  are `lib`, all four of their target symbols take a MUTABLE byte slice, and a
+  mutable slice export is FR-181's hard NO-GO. The importer fixes below are
+  worth EMIT only. Read FR-233 before ranking any of this.
   **THE CENSUS'S 5-BLOCKER SET FOR THESE CASES WAS OVER THE WRONG SOURCES.**
   Run through the harness's own `cmake_configure` -> `target_closure` ->
   `filtered_compdb` path, `053_blake_128f_s_initialize_hash_function_lib` has
@@ -14850,6 +14855,274 @@ piece and becomes FR-45.
   MINOR, UNRELATED, NOT FIXED: `?:` on enum operands is refused
   (`conditional operator on a non-scalar operand`), a pre-existing gap the
   EndToEnd test had to work around with an `if`.
+
+- [ ] FR-233 NO-GO (opened 2026-09-10 from the 60/252 census re-run, measured
+  the same hour): **THE SPHINCS+ PACKAGE (FR-226) IS WORTH +0 PASS, NOT +12,
+  BECAUSE ITS EXPORT SIDE IS FR-181'S HARD NO-GO. THE TWO ENTRIES WERE
+  WRITTEN AS IF INDEPENDENT AND THEY ARE THE SAME WALL.**
+  This corrects `docs/plans/roadmap.md` item 3 and FR-226's headline, both
+  mine, and it is the RULE-4 TRAP ("clearing a stage is not passing; cross
+  every blocker count with `kind`") committed inside a document that lists
+  that rule as its own rule 4.
+  MEASURED, in this order:
+  1. The census at 60/252 ranks a 3-fix set (`aliasing mutable pointer
+     arguments`, `non-constant array size`, `string function argument must
+     designate a char array`) at **+34 EMIT -- exec 0, lib 34**. Every case
+     it clears is a `lib` case, so every one must still export a dlsym-able
+     symbol before it scores.
+  2. Those 34 are **4 distinct symbols x 8 build configurations**, not 34
+     problems: `initialize_hash_function`, `prf_addr`, `gen_message_random`,
+     `hash_message`. FR-225's "the denominator is not what it looks like"
+     again, now inside the SPHINCS+ subtree itself.
+  3. Every one of the four takes at least one pointer that imports as a
+     **mutable byte slice**, and each such export is refused.
+     **CORRECTED THE SAME DAY BY FR-236, AND THE CORRECTION IS MINE TO OWN:
+     I PROBED A BODY I INVENTED INSTEAD OF THE CORPUS'S.** I wrote
+     `void initialize_hash_function(spx_ctx *ctx) { ctx->pub_seed[0] = 1; }`,
+     saw `pub fn ...(_ctx: &mut [u8])` with `no C-ABI export ... not
+     all-scalar`, and generalised from it. That body is NEITHER backend's.
+     The real blake body (`test_case/lib/blake/src/hash_blake.c:29`) is
+     `{ (void)ctx; }` -- a genuine no-op -- so FR-226's UnaccessedPointer
+     class exports it, soundly, and **all 12 blake `initialize_hash_function`
+     configurations DO export today**:
+     `#[export_name = "SPX_initialize_hash_function"] pub extern "C" fn ...
+     (_ctx: *mut core::ffi::c_void)`. The sha2 body is `{ seed_state(ctx); }`
+     and really is refused.
+     So the WRITE was in my probe, not in the program, and this is rule 7
+     ("verify an anchor by running the tool") failing in its other direction:
+     I ran the tool, on the wrong input. **The conclusion about the 34-case
+     cover survives and was independently re-measured at 33 of 34 walled; the
+     generalisation about the SHAPES does not.** 12 blake cases are EMIT-only
+     opportunities that would PAY, and this entry as first written would have
+     discarded them.
+  4. `classifyCAbiSignature` explains it and the explanation is SOUND. Class
+     2 (`SliceBound`) requires `sliceIsShared` -- a `&` slice -- because a
+     `&mut [T]` is `noalias` to LLVM where a C caller may legally alias, which
+     is FR-181's measured miscompile (crc16 native 21983 against export 25322,
+     exit 0, no panic, no diagnostic). All four SPHINCS+ symbols write through
+     an output pointer. They are `&mut` by nature and cannot become class 2.
+  5. Class 2 is narrower still, and this is the part that surprised me:
+     `cAbiProvenSliceBound` requires the body to be **ONE block with no
+     operation carrying a region**, every index a CONSTANT, and every access a
+     READ. **Any loop disqualifies it.** Probed: `unsigned ctx_sum(const
+     unsigned char *b) { for (int i=0;i<32;i++) s+=b[i]; return s; }` --
+     read-only, shared, a constant 32-trip bound, about as provable as a bound
+     gets -- is REFUSED. SPHINCS+ functions are loops over buffers. The class
+     that exists to admit them cannot see them.
+  CONSEQUENCE FOR RANKING: the three importer fixes are worth **+34 EMIT and
+  +0 PASS**. That is not nothing -- FR-228 and FR-232 also landed at +0 PASS
+  and were worth landing -- but it must never again be quoted as "+12 PASS".
+  The SPHINCS+ subtree is 128 of 252 cases and **its gate is the export side,
+  not the importer.**
+  NOT AN ARGUMENT FOR OVERTURNING FR-181. The `&mut`-is-`noalias` reasoning is
+  correct and the miscompile behind it was measured, not feared. A widening
+  worth spiking LATER, recorded here so it is not lost: for `sliceCount == 1
+  && refCount == 0` and everything else scalar there is **no second reference
+  in the signature to alias against**, which is a different situation from the
+  multi-argument shape FR-181 killed. That is a HYPOTHESIS. It does not
+  survive a caller that aliases the slice with a global the body also touches,
+  and it must be spiked with the byte-diff suite in the loop before anyone
+  believes it.
+  ACCEPTANCE: nothing is implemented by this entry. It is a measurement, and
+  its claim is that FR-226 must be re-ranked to +0 PASS and its "up to +12"
+  headline retracted.
+
+- [ ] FR-234 (opened 2026-09-10 from the same census re-run): **THE TOP
+  REMAINING EMIT LEVER IS `argv`, IT IS THE ONLY ONE WHOSE CASES ARE ALL
+  `exec`, AND IT IS ALREADY HALF-BUILT.**
+  The 60/252 census ranks `use of main's argv parameter` first among single
+  fixes at **+5 EMIT (exec 5, lib 0)**. Being `exec` is the whole point: an
+  `exec` case runs its binary and never meets FR-233's export wall, so EMIT
+  here can actually become PASS. The roadmap never ranked argv at all.
+  **EVERY FIGURE HERE IS AN UPPER BOUND AND I CAN NAME WHY**: all six argv
+  cases have `main` DROPPED by recovery, so every blocker inside `main` is
+  invisible. `tractor-census.py`'s own docstring names
+  `004_nineality_sieve` as the measured instance -- depth 1, actually at
+  least four. Assume the same of the other five.
+  MEASURED, by reading the six sources rather than the histogram: they are a
+  TIGHT CLUSTER. All six need `strtoX(argv[i], &end, base)` and the pointer
+  identity `end == argv[i]`; `strtol` in 003/004/005/006, `strtod` in 007,
+  `strtoul` in 008.
+  Per-case residue that argv alone will NOT clear, so the honest ceiling is
+  about +3, not +5: **007_errno_pow also needs `pow`**, which is a DELIBERATE
+  bit-exactness refusal and should stay one; 006 also needs `returned pointer
+  value`; 008 also carries an `unreached-by-import` item.
+  THE WORK IS SMALLER THAN THE REFUSAL SUGGESTS, and this is the finding.
+  `argv` is NOT unimplemented -- C99-43 C3 already built an `ArgvTableType`,
+  an `ArgvArgOp`, a `mainArgvAdmittedParam` plan flag and a crate wrapper that
+  passes a `Vec<Vec<i8>>`. `planArgvUsesFor` admits argv only when EVERY use
+  fits a narrow read grammar (`argv[i]` as a direct-`printf` `%s`/`%.Ns`
+  argument, or `argv[i][j]` read as a value) and otherwise records nothing,
+  leaving the historical signature-time rejection. So this is a WIDENING of an
+  admitted set, not a new capability.
+  THE REAL BLOCKER IS UNDERNEATH AND IS INDEPENDENT OF `argv`. Probed on a
+  plain local `char buf[8]` with no argv anywhere: `strtol(buf, &end, 10)` is
+  refused with `unsupported: taking the address of a pointer variable`, and
+  `strtol(buf, NULL, 10)` is refused with `call to 'strtol' declared in a
+  system header`. **The `strtol` family is not in the hosted table at all**,
+  and the `endptr` out-parameter is a second, separate gap. Both are testable
+  in EndToEnd against a clang native with no corpus dependency, which is how
+  they should be built -- importer first, argv widening second.
+  ADJACENT MACHINERY THAT ALREADY EXISTS, so the cost is a fraction of what a
+  from-scratch reading suggests: `emitAtoiCall` is the exact shape a
+  `strtol` arm needs (`emitCharRegionArg` -> `emitCharRegionSlice` ->
+  `requestStringHelper` -> `CallOpaqueOp`, roughly 30 lines); `__emitrust_atof`
+  ALREADY IMPLEMENTS C's `strtod` PREFIX GRAMMAR, which is the expensive part
+  of `strtod`; and FR-230's `strchr` cursor bind already landed the
+  cursor-into-a-char-region representation an `endptr` needs, with FR-229's
+  byte view underneath it. Three capabilities that landed this session are
+  precisely this item's prerequisites.
+  ONE HAZARD, NAMED IN ADVANCE: `strtod` must NOT be built by copying
+  `__emitrust_atof`, which carries a measured silent divergence -- see the
+  atof defect entry. Build the panic classification in from the start.
+  ACCEPTANCE: `strtol`/`strtoul`/`strtod` with a NULL `endptr` over a char
+  region, byte-identical to the clang native on a differential vector set
+  including overflow (`ERANGE` clamping to `LONG_MAX`/`LONG_MIN`), leading
+  whitespace, sign, base 0/8/10/16, and no-conversion; THEN the `endptr`
+  out-parameter as a cursor with `end == base` pointer identity; THEN the
+  `argv` admission widening. Each rung is a separate increment with its own
+  byte-diff oracle. Report EMIT and PASS separately and expect PASS to lag.
+
+- [x] FR-235 DEFECT (opened and LANDED 2026-09-10, found while probing FR-234's
+  `strtod` prerequisite): **`atof` SILENTLY RETURNED THE WRONG NUMBER FOR
+  EVERY NON-DECIMAL FORM OF C's `strtod` GRAMMAR, AND THE HELPER'S OWN COMMENT
+  CALLED IT A DELIBERATE REFINEMENT.** Worth **+0 TRACTOR** -- a correctness
+  fix, and the entry should not be read as yield.
+  REPRO, measured before filing: `atof("0x1p3")` is 8.0 natively and **0.0** in
+  the emitted crate; `atof("inf")` is `inf` and **0.0**; `atof("nan")` is `nan`
+  and **0.0**. Exit 0, no panic, no diagnostic -- the silent-wrong-answer class
+  this repo's doctrine forbids outright.
+  **THE TREE HELD TWO ANSWERS TO ONE QUESTION.** FR-229 faced this exact
+  problem for `scanf %f` and settled it: parse `inf`/`infinity`/`nan` (Rust's
+  parser and glibc are both correctly rounded per IEEE-754 and agree BIT FOR
+  BIT), and PANIC on the two forms Rust cannot reproduce -- hex floats and NaN
+  payloads. `atof` predates that and answered 0.0 to all of them. The fix is
+  not new policy; it is applying the settled one.
+  **THE BLAST RADIUS WAS 7x THE COMMENT'S CLAIM.** The comment named three
+  forms. Measured over a 44-vector battery: **21 of 44 wrong before, 0 after**
+  -- every case-fold (`INF`, `iNfInItY`), every backtracking prefix (`infi`,
+  `infx`, `infinit`), both signs, and `nanQ`. `-0x1p3` silently produced
+  **NEGATIVE ZERO** where C gives -8.0.
+  A CORRECTION TO MY OWN SPEC, and it removes a class of false aborts:
+  **`0x.p3` must NOT panic.** I listed it with the hex forms on the strength of
+  FR-229's note that glibc accepts it outside the C grammar. Measured, glibc
+  `atof("0x.p3")` is **0.0** and strict C's longest-valid-prefix rule also
+  gives 0.0 -- there is no divergence to stop on. Same for `0xyz`, `0x`, `0X`.
+  So the hex DETECTION here is deliberately SHARPER than `scanf`'s: after the
+  sign, `0x`/`0X` must be followed by a hex digit (optionally behind one `.`)
+  before the panic fires. `scanf` cannot do this -- it has one character of
+  pushback -- and `atof` has the whole string. The CLASSIFICATION matches
+  FR-229 exactly; only the detection differs. Those five strings are pinned as
+  must-answer-0.0.
+  RESIDUAL CONSERVATISM, DOCUMENTED RATHER THAN HIDDEN: `0x0` panics although C
+  reads 0.0, because proving it is a zero needs a second hex grammar.
+  **MIRRORING `__emitrust_scan_float_word` VERBATIM DOES NOT WORK**, and this
+  is the finding that would have cost an hour: `scanf` is greedy and never
+  backtracks, so `INFINIT` is a MATCHING FAILURE; `strtod` backtracks, so
+  `infinit`, `infi` and `infx` are all `inf`. The word-table idea and the
+  `| 32` case-fold carry over; the match does not. Longest-prefix, `m >= 3`.
+  HEX-FLOAT PARSING DELIBERATELY NOT IMPLEMENTED. Unlike decimal it is exactly
+  representable and therefore feasible, but subnormal and overflow rounding is
+  precisely the bug class being fixed here, so it stays a loud stop and earns
+  its own increment with its own vector battery.
+  IMPORT-TIME REJECTION FOR LITERAL ARGUMENTS CONSIDERED AND DECLINED, for
+  three reasons in order of weight: it would REFUSE CORRECT PROGRAMS (an
+  `atof("0x1p3")` on a never-executed path ports and runs correctly today);
+  it is strictly worse for the corpus metric (a panicking crate still emits,
+  builds and `dlsym`s, while a rejection drops the CALLER and under `--recover`
+  orphans everything only that caller reached); and the literal sub-case is
+  nearly empty, since real sites are `atof(buf)` and even the repro uses
+  `char a[16] = "0x1p3"`, an array, so it would need dataflow rather than a
+  `StringLiteral` check.
+  NO `RejectionLedger` NEEDLE IS NEEDED and that is not an oversight: these are
+  RUNTIME panics, not importer diagnostics. The ledger and the census key on
+  `emitError` text and are untouched. Wordings, probed from the built crate:
+  `atof: hexadecimal floating-point input is not supported` and `atof: a NaN
+  payload, nan(...), is not supported` -- FR-229's voice exactly.
+  Gate **1081/1081** (1079 + 2 new). Clippy 57 (+0), epoch-7 hash unchanged.
+  Binding free temps 2307 (+0), depth p95 5 (+0). CTestSuite 220/220,
+  Cpp17Suite 35/35, both with `miscompiled=0`. **Moved goldens: exactly 2**,
+  and the bound is tight because the entire non-comment diff is one helper
+  string -- a whole-file sweep over 1133 test sources found 2 requesting
+  `__emitrust_atof`, and the `split-file`-blind gap was closed by grepping
+  every test source for `atof`. Both re-verified by their own oracles
+  (EndToEnd byte-diff; FileCheck). Nothing re-blessed. `test/Import/C` run in
+  full for additivity: 366/366.
+  BIT-LEVEL EVIDENCE, not a committed test because NaN bit patterns are not
+  C-defined: `-nan`/`nan`/`-inf`/`inf` are bit-identical to glibc
+  (`fff8000000000000`, `7ff8000000000000`, `fff0000000000000`), so the sign is
+  carried rather than dropped.
+  INCIDENTAL, LOCATED, NOT FIXED: two natural ways to feed a runtime-selected
+  string to `atof` are both refused today -- `atof(tbl[i])` over a `static
+  const char *const tbl[]` gives `row of string table 'v' used as a pointer
+  value (the padded lowering gives its rows no address)`, and returning a
+  literal from a helper gives `returned pointer value`. Neither is silent. The
+  tests work around it with a `char[N][W]` table copied into a local.
+
+- [x] FR-236 (opened and LANDED 2026-09-10, forced by FR-233): **THE
+  INSTRUMENT THAT RANKS ALL WORK MEASURED ONLY THE FIRST OF THREE STAGES, AND
+  IT RECOMMENDED THE ONE SET THE RUBRIC CANNOT PAY FOR.** Worth **+0 TRACTOR**
+  by construction -- it is the ranking tool, not the compiler.
+  FR-233 established that the export stage gates the `lib` half of the corpus.
+  `tractor-census.py` could not see it, so its top recommendation was a set
+  whose cases are structurally incapable of scoring. Script-only change
+  (+344/-23); no `.cpp`, no test, no oracle touched.
+  WHAT IT NOW REPORTS, over the 160 `lib` cases: **93 refused, 64 exports, 3
+  absent**, with the refusal WORDINGS KEPT APART rather than bucketed -- 88
+  FR-139 all-scalar, 3 FR-182 unfaithful-layout pointer, 2 FR-209
+  delegation-induced slice. Collapsing them is exactly what drops a real class
+  into the `other` junk heap where nobody ranks it.
+  **CALIBRATED, WHICH IS THE PART THAT MAKES IT TRUSTWORTHY**: on the 50 cases
+  whose outcome the export stage already decides, **36/36 PASS read `exports`
+  and 13/13 SYMBOL_MISSING read otherwise**. A disagreement there means the
+  parser is wrong, not the binary.
+  THE RANKING ACTUALLY CHANGED, which is the whole point. The 3-fix cover's
+  headline is unchanged at +34 EMIT, but **33 of the 34 are export-walled**
+  and one exports. Re-optimising with walled cases out of the objective picks
+  a **completely different 3-fix set worth 11 payable** (exec 8, lib-exports 3)
+  instead of 1: argv, `pointer variable has no known target object`, and
+  `taking the address of a global variable`. The instrument no longer
+  recommends the aliasing/non-constant-array-size/string-function trio.
+  **IT CONTRADICTED FR-233 AND FR-233 WAS WRONG** -- see that entry's
+  corrected item 3. `SPX_initialize_hash_function` exports today in all 12
+  blake configurations.
+  A DEFECT IN ITS OWN FIRST IMPLEMENTATION, RECORDED BECAUSE IT WILL RECUR:
+  matching the target symbol by string equality reported **32 SPHINCS+ cases
+  as `absent`** while emitrust-cc was plainly printing their refusals. The
+  warning and `emitrust-progress.json` both carry the **Rust** name
+  (`spx_prf_addr`); only `#[export_name]` carries the C spelling
+  (`SPX_prf_addr`), and that attribute exists only for symbols that already
+  export. There is no machine-readable C->Rust map in any tool output, so
+  attribution goes through a documented case/underscore fold, used **only when
+  the fold is unique** and never to declare an export (`dlsym` needs exact).
+  **68 of the 160 verdicts rest on that fold** and the report says so.
+  A SOFT SPOT SURFACED RATHER THAN HIDDEN: `--recover` stubs a body, and
+  FR-202's bound and FR-226's unaccessed pointer are decided FROM THE BODY, so
+  a stub can satisfy "never accesses the pointer" VACUOUSLY. 12 `exports`
+  verdicts are on stubbed items; **6 of those reach the C ABI through a
+  delegating wrapper and are genuinely soft.** The other 6 are FR-139 plain
+  `#[no_mangle]`, which reads the signature only and is unaffected. Both
+  numbers are printed and both are in `census.json`.
+  EVERY EXISTING CAUTION SURVIVES VERBATIM -- the "EVERY DEPTH IS A LOWER
+  BOUND" docstring, the deleted-CONFIRMED-column warning, the FR-224 +14/+7
+  calibration, and the "AND AT THE EMIT STAGE ONLY" paragraph. The new column
+  is labelled an OBSERVATION of what this binary does today, never a
+  prediction: a walled case is not unreachable, it needs an export-class fix
+  IN ADDITION to the importer one.
+  **A CORRECTION TO MY OWN SPEC: `tractor-census.py` IS NOT IN THE FAST LIT
+  TIER.** I told the agent it was. `grep -rn tractor-census` matches only
+  `CLAUDE.md`, `design.md` and the two plan files -- no test, no
+  `meson.build`, no `lit.cfg.py`. I had conflated it with `plan.py check`,
+  which IS gated. **The tool this repo ranks all work with has no test at
+  all**; that is a real gap and it is not fixed here. The fast tier was run
+  anyway: 731 lit tests passed, 0 failed.
+  TWO C++ CHANGES IDENTIFIED AND DELIBERATELY NOT MADE, either of which would
+  delete the fold heuristic and make the census exact: the export refusal
+  warning names the **Rust** item rather than the C symbol the harness
+  `dlsym`s, and `emitrust-progress.json` likewise records only the Rust name
+  where a `c_symbol` field would serve every downstream consumer.
+  Each recover crate now also writes `export-warnings.txt`, so verdicts can be
+  re-derived without a second six-minute corpus pass.
 
 - [x] FR-228 (opened 2026-09-09 and LANDED 2026-09-10, found by the FR-224 implementation's own
   byte-diff oracle while trying to admit `abort`): **EVERY EMITTED CRATE HAS

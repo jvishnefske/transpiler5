@@ -3843,23 +3843,49 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "    if neg { acc } else { acc.wrapping_neg() }\n"
        "}"},
       // FR-224: C's atof (7.20.1.1) is `strtod(s, NULL)`. strtod is a
-      // PREFIX parse -- leading whitespace, one optional sign, a decimal
-      // significand with an optional fraction and an optional exponent,
-      // consuming the LONGEST initial subsequence of that form and
-      // ignoring everything after it, with 0.0 for no such prefix. Rust's
-      // `str::parse::<f64>` will not do that job: it demands the WHOLE
-      // string, rejects leading whitespace, and rejects a trailing
+      // PREFIX parse -- leading whitespace, one optional sign, then the
+      // LONGEST initial subsequence of the number grammar, ignoring
+      // everything after it, with 0.0 when there is no such prefix.
+      // Rust's `str::parse::<f64>` will not do that job: it demands the
+      // WHOLE string, rejects leading whitespace, and rejects a trailing
       // newline -- `"3.0\n".parse()` is an Err where C reads 3.0. So the
       // helper scans the prefix itself and hands only that prefix to
       // `from_str`, which is correctly rounded, as glibc's strtod is;
       // two correctly-rounded parses of the same digits are bit-identical
       // by definition, which is what makes this differentiable at all.
-      // The forms deliberately NOT scanned -- hexadecimal floats
-      // (0x1p3), `inf`, `nan` -- simply fail the prefix grammar and yield
-      // 0.0 here where C would parse them; they are excluded from the
-      // supported subset by `emitAtofCall`'s caller rejecting nothing,
-      // so this is the one shape where the helper is a REFINEMENT rather
-      // than a match. See design.md FR-224.
+      //
+      // FR-235: strtod's grammar is NOT only the decimal form, and the
+      // three shapes outside it used to fall off the end of the decimal
+      // scan and answer 0.0 SILENTLY -- `atof("inf")` returned 0.0 where
+      // C returns infinity, exit 0, no diagnostic. That is a miscompile,
+      // not a refinement. The classification here is the one FR-229
+      // already settled for `scanf %f` (see `__emitrust_scan_float_text`),
+      // so the tree has ONE answer to the question rather than two:
+      //   `inf` / `infinity` / `nan`, any case, either sign -- PARSED.
+      //     IEEE-754 fixes every bit of those three values, so no rounding
+      //     question arises and both sides produce the identical pattern
+      //     (measured: glibc `-nan` is fff8000000000000 and Rust's
+      //     `-f64::NAN` is fff8000000000000). Matching is LONGEST-PREFIX
+      //     and, unlike scanf's one-character-pushback scanner, backtracks
+      //     freely because the whole string is in hand: `infinit` and
+      //     `infx` are both `inf`, as glibc gives.
+      //   hexadecimal floats (`0x1p3`, and the exponent-less `0X10`) --
+      //     PANIC. Rust's parser does not accept them and converting one
+      //     here means reimplementing libc's rounding.
+      //   a NaN payload (`nan(1)`) -- PANIC. The mapping of the n-char
+      //     sequence into the significand is libc-specific.
+      // A loud stop is this project's documented safe direction; silently
+      // answering a different number is not.
+      //
+      // The hex test is deliberately MORE precise than scanf's, which has
+      // to fire on `0x` alone: with the whole string available this one
+      // requires an actual hex digit (optionally behind a `.`), so the
+      // strings where C's hexadecimal form does NOT apply -- `0xyz`, `0x`,
+      // and glibc's degenerate `0x.p3` -- fall through to the decimal scan
+      // and answer C's 0.0 exactly instead of aborting. What remains
+      // conservative is `0x0`, which C reads as 0.0 and which panics here
+      // rather than growing a second hex grammar to prove it is a zero.
+      // See design.md FR-224 and FR-229.
       {"__emitrust_atof",
        "fn __emitrust_atof(s: &[i8]) -> f64 {\n"
        "    let mut i = 0usize;\n"
@@ -3869,8 +3895,46 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "        i += 1;\n"
        "    }\n"
        "    let start = i;\n"
+       "    let mut neg = false;\n"
        "    if i < s.len() && (s[i] as u8 == b'+' || s[i] as u8 == b'-') {\n"
+       "        neg = s[i] as u8 == b'-';\n"
        "        i += 1;\n"
+       "    }\n"
+       "    if i + 2 < s.len() && s[i] as u8 == b'0'\n"
+       "        && ((s[i + 1] as u8) | 32) == b'x' {\n"
+       "        let mut j = i + 2;\n"
+       "        if s[j] as u8 == b'.' { j += 1; }\n"
+       "        if j < s.len() && (s[j] as u8).is_ascii_hexdigit() {\n"
+       "            panic!(\n"
+       "                \"atof: hexadecimal floating-point input is not "
+       "supported\"\n"
+       "            );\n"
+       "        }\n"
+       "    }\n"
+       "    let head = if i < s.len() { (s[i] as u8) | 32 } else { 0 };\n"
+       "    if head == b'i' || head == b'n' {\n"
+       "        let is_nan = head == b'n';\n"
+       "        let word: &[u8] = if is_nan { b\"nan\" } else "
+       "{ b\"infinity\" };\n"
+       "        let mut m = 0usize;\n"
+       "        while m < word.len() && i + m < s.len()\n"
+       "            && ((s[i + m] as u8) | 32) == word[m] {\n"
+       "            m += 1;\n"
+       "        }\n"
+       "        if is_nan && m == 3 {\n"
+       "            if i + 3 < s.len() && s[i + 3] as u8 == b'(' {\n"
+       "                panic!(\n"
+       "                    \"atof: a NaN payload, nan(...), is not "
+       "supported\"\n"
+       "                );\n"
+       "            }\n"
+       "            return if neg { -f64::NAN } else { f64::NAN };\n"
+       "        }\n"
+       "        if !is_nan && m >= 3 {\n"
+       "            return if neg { f64::NEG_INFINITY } else "
+       "{ f64::INFINITY };\n"
+       "        }\n"
+       "        return 0.0;\n"
        "    }\n"
        "    let digits_start = i;\n"
        "    while i < s.len() && (s[i] as u8).is_ascii_digit() { i += 1; }\n"
