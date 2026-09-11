@@ -15382,7 +15382,7 @@ piece and becomes FR-45.
   native, with zero `unsafe` and no `static mut`. Report EMIT and PASS
   separately. Do NOT forecast 025 until `errno` and rung 2 are settled.
 
-- [ ] FR-238 (opened 2026-09-10 from FR-236's export-aware cover; **READ THE
+- [x] FR-238 (opened 2026-09-10 from FR-236's export-aware cover; **READ THE
   VECTORS BEFORE TOUCHING THIS**): **THE C IS UNDEFINED AND THE REFUSAL IS
   CORRECT. THE CASE IS STILL WINNABLE, BUT ONLY BY REFINING THE UB INTO A
   DETERMINISTIC PANIC -- NEVER BY INVENTING A POINTER VALUE.**
@@ -15414,6 +15414,69 @@ piece and becomes FR-45.
   PASS (`update_md5_lib` is the live example). 011/012 each keep one real
   vector, so they can score properly -- but verify that before costing any
   sibling by the same argument.
+  **LANDED 2026-09-10 AT +4 EMIT AND +4 PASS -- TRACTOR 60 -> 64, EMIT 74 ->
+  78, and all four named cases individually PASS.** The first item this
+  session to move PASS, and the only queued one that survived all three
+  ranking axes.
+  **THE PANIC GOES AT THE USE, WIDENED TO THE ENCLOSING EXPRESSION STATEMENT
+  -- NOT AT FUNCTION ENTRY, WHICH IS UNSOUND.** Counterexample, pinned twice
+  (an `--emit=rust` golden and a runtime byte-diff):
+  `void pick(int c){ char *data; if (c) printLine(data); else printf("ok\n"); }`
+  has a fully defined `c == 0` path, and a function-entry panic miscompiles
+  it. Statement granularity rather than EXPRESSION granularity because a
+  `!`-typed hole has no representation in this value model: `PtrExprValue`
+  must be handed back, and fabricating one after a panic IS the "invent a
+  value" failure. Replacing the whole statement evaluates no argument and
+  fabricates no address, and the emitter's existing diverging-callee rule
+  truncates the rest of the block.
+  **THE ORACLE CAUGHT A MISCOMPILE THAT `cargo build` NEVER SAW, AND IT IS THE
+  MOST INSTRUCTIVE THING HERE.** The first cut broke c-testsuite **00219**:
+  `const int *const ptr;` uninitialized, then `_Generic(ptr, int *:1, int *
+  const:2, default:20)`. **C11 6.5.1.1p3 -- the controlling expression of a
+  generic selection IS NOT EVALUATED.** The program is well defined and prints
+  20, but clang's AST still spells the operand with an `LValueToRValue` cast
+  because the selection is made on the CONVERTED type. Counting that as a read
+  panicked a defined program, and the build was clean the entire time it was
+  wrong. `collectPointerVarReads` now skips `GenericSelectionExpr` controlling
+  expressions (descending only into the selected association),
+  `UnaryExprOrTypeTraitExpr` and `OffsetOfExpr`; skipping a subtree can only
+  LOSE a panic, never manufacture one. Regression-pinned.
+  **MY SUGGESTED PRECEDENT WAS REJECTED, WITH A BETTER REASON THAN I HAD.** I
+  pointed at `ImportC.cpp:3619-3621`, where a statically-null pointer returns
+  `PtrExprValue{}`. Returning that for an UNINITIALIZED pointer would fold its
+  null tests to FALSE and `(int)p` to 0 -- which is inventing the value NULL,
+  exactly what the spec forbade. An uninitialized pointer is not the neighbour
+  of a statically-null one: it has no value at all, which is why the answer
+  had to be a diverging STATEMENT rather than a representation.
+  TWO INDEPENDENT NEVER-WRITTEN CHECKS, and the syntactic one is load-bearing
+  rather than belt-and-braces: for `char *data; char **pp = &data;` the
+  address-of is CONSUMED by the CTS-P5 second-order binding, so it does not
+  invalidate the region and `regionOf(data)` stays null -- the region analysis
+  alone would wrongly call it never-written. Pinned.
+  ADMITTED: an expression statement free of `&&`/`||`/`?:`/`({...})`
+  containing an lvalue-to-rvalue read of an automatic pointer local with a
+  null region, not address-taken, not pointer-to-pointer/pool/carrier, and
+  never written under the function body. LEFT REFUSED, with today's wording
+  unchanged: `if`/`while` conditions, `return`, `DeclStmt` initializers,
+  short-circuit and conditional operands, `for` increments, write-through,
+  globals, parameters, struct members, second-order pointers. **A pointer
+  uninitialized on SOME paths stays refused** -- a false panic on a defined
+  path is a miscompile and strictly worse than the status quo.
+  THREE CORRECTIONS TO MY SPEC: **012 does NOT match the repro I gave** (it
+  dereferences `*intNumber` with no null guard, and its `good()` takes the
+  address of a local rather than a string literal -- only 011 matches);
+  `printLine`'s `line != NULL` test plays NO role, because the parameter
+  lowers to `&mut [i8]`, a slice that is never null, and the test folds to
+  unconditional true; and the `lib` halves route through the IDENTICAL entry
+  point, differing only in `driver` vs `main`.
+  Gate **1089/1089** (1086 + 3 new). Clippy 57 (+0), population 294 files /
+  0 skipped / hash unchanged. Binding 2307 (+0), p95 5 (+0). CTestSuite
+  220/220, Cpp17Suite 35/35, both `miscompiled=0`. **Golden movement 0**, from
+  a paired sweep over all 1141 test sources with only the two implementation
+  files reverted: 756 emitted identically on both sides, 385 rejected
+  identically. Verified independently in the main tree, including running
+  corpus case 011 by hand: emits, builds, prints `string` on stdin `1`,
+  matching its `good.json`.
   ACCEPTANCE: 011 and 012 emit, and the `good` vector byte-diffs against the
   clang native. The UB path must abort loudly; it must never produce a value.
 
