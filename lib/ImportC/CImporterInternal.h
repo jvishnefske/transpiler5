@@ -5174,6 +5174,40 @@ private:
   /// reads its argument from input. The runtime panic covers both.
   FailureOr<Value> emitAtofCall(const clang::CallExpr *call);
 
+  /// FR-234 rung 1: lowers a definition-less `strtol`/`strtoul` with a
+  /// NULL `endptr` to the matching `__emitrust_strto{l,ul}` helper over
+  /// the argument's char region, with the base passed through as an
+  /// ordinary i32 runtime value. `isUnsigned` selects both the helper
+  /// and its result domain, which is not cosmetic: C 7.22.1.4 saturates
+  /// an overflowing conversion to LONG_MAX/LONG_MIN for one and to
+  /// ULONG_MAX for the other, so the same input string has two different
+  /// answers.
+  ///
+  /// A NON-NULL `endptr` is a LOCATED REJECTION here (rung 2), not a
+  /// silent drop: the out-parameter is the caller's cursor and a
+  /// lowering that ignored it would leave the caller reading a stale
+  /// pointer. The refusal carries its own `RejectionLedger` needle
+  /// (`strtox-endptr`) so the census can still see it after the name
+  /// left the system-header bucket.
+  /// FR-234 rung 1: succeeds only when argument `index` of `call` is a
+  /// null pointer constant, and otherwise raises the rung-2 refusal at
+  /// that argument's location.
+  LogicalResult requireNullEndptr(const clang::CallExpr *call,
+                                  llvm::StringRef name, unsigned index);
+
+  FailureOr<Value> emitStrtoIntCall(const clang::CallExpr *call,
+                                    llvm::StringRef name, bool isUnsigned);
+
+  /// FR-234 rung 1: lowers a definition-less `strtod(s, NULL)`. C
+  /// 7.22.1.1p2 DEFINES `atof(s)` as `strtod(s, NULL)`, so this is the
+  /// same lowering as `emitAtofCall` -- the SAME `__emitrust_atof`
+  /// helper, not a copy of it -- which is the whole point: FR-235
+  /// settled the non-decimal half of that grammar once, and a second
+  /// float helper would be a second place for it to be settled
+  /// differently. A non-NULL `endptr` is rejected exactly as the integer
+  /// forms reject it.
+  FailureOr<Value> emitStrtodCall(const clang::CallExpr *call);
+
   /// FR-224: lowers a definition-less `strcspn`/`strspn` to the matching
   /// byte-scan helper over two shared string regions, converting the
   /// i64 count to the call's declared size_t result type.

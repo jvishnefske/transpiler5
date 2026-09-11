@@ -15003,6 +15003,66 @@ piece and becomes FR-45.
   ONE HAZARD, NAMED IN ADVANCE: `strtod` must NOT be built by copying
   `__emitrust_atof`, which carries a measured silent divergence -- see the
   atof defect entry. Build the panic classification in from the start.
+  **RUNG 1 LANDED 2026-09-10 AT +0 EMIT AND +0 PASS. IT IS A PREREQUISITE WITH
+  ZERO STANDALONE YIELD AND MUST NOT BE READ AS MOVEMENT.**
+  `strtol`, `strtoul` and `strtod` over a char region with a NULL `endptr`.
+  +740/-0, purely additive: three name-guarded dispatch arms, `emitStrtoIntCall`
+  / `emitStrtodCall` / `requireNullEndptr`, three runtime helpers, and the
+  `strtox-endptr` needle mirrored into `run_realworld.py`.
+  **WHY +0, COUNTED AS PROGRAMS AND VERIFIED INDEPENDENTLY BY ME**: the corpus
+  has **21 `strto*` call sites in 15 files, and 20 of them pass a NON-NULL
+  `endptr`.** The single NULL site is `strtol(argv[3], NULL, 10)` in
+  `003_string_slicing`, which also has non-NULL sites *and* needs argv. My
+  count adds one correction to the agent's: **4 of the 15 files are
+  `Hidden-Tests`, which TRACTOR does not score at all**, so the ceiling is
+  **11 Public-Tests programs**, not 15 files. No corpus case clears on rung 1.
+  **THE ENDPTR FRONTIER IS FOUR FRONTIERS, NOT ONE, AND THIS CORRECTS MY OWN
+  RUNG-2 PLAN.** I specced rung 2 as work in `emitStrtoIntCall`. It is not:
+  `&end` on a LOCAL pointer and a `char **` PARAMETER -- the two shapes the
+  whole corpus actually uses -- are sunk by `PointerRegionAnalysis` BEFORE any
+  call is lowered, by refusals older than this feature (`taking the address of
+  a pointer variable`; `pointer-to-pointer parameter escapes the
+  cursor-parameter shape`). The new `strtol with a non-null endptr argument`
+  refusal is reachable only through a member address or a cast. **Rung 2 must
+  be an admission in `PointerRegionAnalysis`** -- `consumedAddrOf` at
+  `lib/ImportC/ImportC.cpp:1709` is the existing hook shape -- and rung 2, not
+  rung 3, is where the corpus value sits.
+  **`strtod` NEEDED NO NEW FLOAT HELPER AT ALL**, which is the strongest
+  available form of the anti-drift hazard this entry warned about: C 7.22.1.1p2
+  *defines* `atof(s)` as `strtod(s, NULL)`, so `strtod` lowers to
+  `__emitrust_atof` verbatim -- same op, same helper, no second grammar. There
+  is literally no second place for FR-235's classification to drift to.
+  CONSEQUENCE, ACCEPTED DELIBERATELY: a `strtod("0x1p3")` panic still reads
+  `atof: hexadecimal floating-point input is not supported`. Retitling it would
+  edit `test/EndToEnd/libc-atof-loud-stop.c` and **close epoch-7** for a panic
+  string, which is not a trade worth making.
+  **OUT-OF-RANGE BASE IS UB (C 7.22.1.4p2) AND IS REFINED, NOT STOPPED ON.**
+  The helper converts nothing and returns 0, which is glibc's behaviour,
+  following `emitAbsCall`'s precedent rather than `atof`'s. The distinction is
+  load-bearing: `atof` panics on forms C DEFINES and Rust cannot reproduce,
+  whereas here C defines nothing, so there is no wrong answer to give and a new
+  abort class buys nothing. Both UB columns (bases 1 and 37) are pinned in the
+  byte-diff and labelled a **platform-refinement pin, not a conformance
+  claim**.
+  `strtoll`/`strtoull`/`strtoimax`/`strtoumax`/`strtof`/`strtold` STAY REFUSED
+  and are pinned as such: each needs its own saturation constants or float
+  width, and an unverified alias is exactly the silent divergence rung 1 exists
+  to prevent.
+  ORACLE: 748/748 byte-diff lines identical against the clang native --
+  46 forms x 8 bases x 2 functions plus 12 `strtod` rows, covering `LONG_MAX`
+  and `LONG_MIN` saturation, `strtoul` of `-1` (negate mod 2^64) and of `-0`
+  (which must NOT become `ULONG_MAX`), base-0 octal auto-detect, `08` as a
+  non-octal, letter digits to base 36, the conditional `0x` prefix, `1e400` to
+  `inf`, and the minimum subnormal. The helpers were also differentially
+  validated standalone against glibc over 736 vectors before being wired in.
+  **GOLDEN MOVEMENT 0, PROVEN RATHER THAN SWEPT**: the C++ diff is +740/-0 and
+  the only insertion into an existing function body is three name-guarded
+  `if (name == ...)` arms in `emitCall`; no existing test source contains a
+  `strto*` call. The full lit suite -- the only thing that sees `split-file`
+  sub-units -- is green, so the proof and the sweep agree.
+  A `--recover` leg was checked too: a crate mixing an admitted
+  `strtol(buf,NULL,10)` with a refused `&s.e` site builds, stubs only the bad
+  function, and prints the native's answer.
   ACCEPTANCE: `strtol`/`strtoul`/`strtod` with a NULL `endptr` over a char
   region, byte-identical to the clang native on a differential vector set
   including overflow (`ERANGE` clamping to `LONG_MAX`/`LONG_MIN`), leading

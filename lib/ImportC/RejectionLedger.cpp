@@ -138,6 +138,14 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
      llvm::StringLiteral("byte-view-global")},
     {llvm::StringLiteral("byte view with no write-back point"),
      llvm::StringLiteral("byte-view-writeback")},
+    // FR-234 rung 1: the strto* family's endptr frontier. strtol/strtoul/
+    // strtod with a NULL endptr now IMPORT, so a still-refused call is
+    // specifically the out-parameter shape (rung 2) -- a different piece
+    // of work from "the name is unsupported", and it must not vanish from
+    // the census when the name leaves the `libc:<name>` bucket. Mirrors
+    // test/RealWorld/run_realworld.py's classify_blocker.
+    {llvm::StringLiteral("with a non-null endptr argument"),
+     llvm::StringLiteral("strtox-endptr")},
     {llvm::StringLiteral("returned pointer value"),
      llvm::StringLiteral("returned-pointer")},
     {llvm::StringLiteral("pointer return type"),

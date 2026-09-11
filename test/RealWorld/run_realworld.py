@@ -338,6 +338,12 @@ _BLOCKER_SUBSTRINGS = [
     ("byte view of an aggregate with interior padding", "byte-view-padding"),
     ("byte view of the global object", "byte-view-global"),
     ("byte view with no write-back point", "byte-view-writeback"),
+    # FR-234 rung 1: the strto* family's endptr frontier. With a NULL
+    # endptr strtol/strtoul/strtod now import, so a still-refused call is
+    # specifically the out-parameter shape (rung 2) and must keep a tag of
+    # its own rather than falling into `other` once the name has left the
+    # `libc:<name>` bucket. Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("with a non-null endptr argument", "strtox-endptr"),
     ("returned pointer value", "returned-pointer"),
     ("pointer return type", "returned-pointer"),
     ("return sites disagree", "returned-pointer"),
