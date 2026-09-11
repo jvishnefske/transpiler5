@@ -69,6 +69,14 @@ int main(void) {
 // items, and they are ORDINARY SAFE FUNCTIONS -- no `unsafe`, no
 // `extern`, no binding.
 // CHECK: emitrust.verbatim "fn __emitrust_atof(s: &[i8]) -> f64
+// FR-234 rung 2 split the float grammar's ONE copy out into
+// `__emitrust_atof_end`, which also answers the consumed length that
+// `strtod(s, &e)` needs; `__emitrust_atof` above is now a thin projection
+// of its first component. The pair is emitted TOGETHER and in this order
+// (the lowering requests both names; the helper table has no dependency
+// edges), which this CHECK-NEXT pins -- an emitted `__emitrust_atof`
+// without its scan would not compile, and that is the loud direction.
+// CHECK-NEXT: emitrust.verbatim "fn __emitrust_atof_end(s: &[i8]) -> (f64, i64)
 // FR-235: the two forms of C's strtod grammar that Rust cannot reproduce
 // STOP LOUDLY inside that helper rather than answering 0.0. The wording is
 // the one FR-229 already settled for `scanf %f`, in the same voice, and it
@@ -79,9 +87,12 @@ int main(void) {
 // CHECK-SAME: atof: hexadecimal floating-point input is not supported
 // CHECK-SAME: atof: a NaN payload, nan(...), is not supported
 // ... and `inf`/`infinity`/`nan` are PARSED, not refused and not dropped:
-// IEEE-754 fixes their bits, so the helper returns them directly.
-// CHECK-SAME: return if neg { -f64::NAN } else { f64::NAN };
-// CHECK-SAME: return if neg { f64::NEG_INFINITY } else { f64::INFINITY };
+// IEEE-754 fixes their bits, so the helper returns them directly. They now
+// return the value PAIRED with its consumed length (3 for `inf`/`nan`, 8
+// for a full `infinity`), which is the only thing rung 2 changed about
+// them.
+// CHECK-SAME: let v = if neg { -f64::NAN } else { f64::NAN };
+// CHECK-SAME: let v = if neg { f64::NEG_INFINITY } else { f64::INFINITY };
 // CHECK: emitrust.verbatim "fn __emitrust_strcspn(s: &[i8], reject: &[i8]) -> i64
 // CHECK: emitrust.verbatim "fn __emitrust_strspn(s: &[i8], accept: &[i8]) -> i64
 

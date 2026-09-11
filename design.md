@@ -15089,6 +15089,71 @@ piece and becomes FR-45.
   The correct sequence is therefore: land rung 2 on plain locals, widen argv's
   grammar in rung 3 to include the hosted-conversion argument position, and
   **THEN re-measure the depth** -- do not re-forecast it before that.
+  **RUNG 2 LANDED 2026-09-10 AT +0 EMIT AND +0 PASS, AS PREDICTED.** The real
+  `endptr` out-parameter: a local `char *end`, `&end` as the endptr, then
+  `end == buf`, `*end`, `end - buf`, `end[0]`.
+  **MY `pairedArgQuery` LEAD WAS WRONG, AND I HAD FLAGGED IT AS UNVERIFIED --
+  WHICH IS THE ONLY REASON IT COST NOTHING.** Both providers
+  (`ImportCFunctions.cpp:1386`, `:2402`) open with `callee->getDefinition()`,
+  so a hosted `strtol` can never answer and the hook cannot be reused. Neither
+  was touched. The implementation is instead a **FOURTH admission block** in
+  `PointerRegionAnalysis`'s CallExpr arm beside Shape-P and Shape-G, driven by
+  a free function `hostedEndptrCoIndex(callee, index, numArgs)` that mirrors
+  the `strchr` precedent: a library-supplied plan, inline, no callback. It
+  gates on `!callee->getDefinition()`, so a PROJECT-supplied `strtol` is not
+  intercepted -- verified, not assumed.
+  TWO OTHER THINGS I LISTED AS UNVERIFIED, BOTH RESOLVED: `recordPointerWrite`
+  DOES accept a hosted co-argument (`call->getArg(0)` decays and classifies
+  unchanged, no change needed); and the no-conversion case survives -- **but
+  not via the join, which is where I expected it.** C 7.22.1.4p7's "store
+  `nptr` ITSELF" is carried by the HELPER: every no-conversion exit of the scan
+  returns 0 and the store is `argCursor + 0`. Confirmed against glibc on base-2
+  over `"\t\n\v\f\r 42"` -- six bytes scanned, offset still **0**,
+  `end == buf` true on both sides.
+  A THIRD ANCHOR OF MINE WAS OFF: the live diagnostic is at column **24**, not
+  26. Same file, same site, same wording -- but it is the fourth anchor defect
+  I have shipped in a spec this session, and the column is the part I keep
+  copying rather than re-running.
+  ORACLE: **588/588 byte-diff lines identical** to the clang native. The rows
+  that carry the design: base-2 over leading whitespace (no conversion after
+  six bytes scanned); `""`, `" "`, `"-"`, `"+"` all at offset 0 with
+  `end == buf`; `"0x"` and `"0xg"` at base 16 converting the single `0` and
+  leaving `end` on the `x` at offset **1**, where an unconditional two-byte
+  prefix skip would say 2; 23-digit overflow saturating the VALUE while the
+  cursor still advances to **23**/**24**; the `O` rows pinning the coordinate
+  correction (`end - wide` 4 and 9 against `end - p` 2 and 2); and a `Q`
+  section for self-aliasing `strtol(q, &q, 0)`, the only shape where the
+  lowering's internal order -- read argument 0, THEN store -- is observable.
+  THE IMPLEMENTING AGENT STRENGTHENED THE INHERITED TESTS AND CORRECTED NO
+  ROW OF THEM. It added six `strtod` word forms because the `inf`/`nan`
+  LENGTHS had no byte-diff coverage: `infinity` consumes **8** and `infin`
+  consumes **3**, so a scan advancing by the matched-prefix count would print
+  5 for the second. All six match glibc. It also re-measured the inherited
+  claim that glibc leaves `*endptr` COMPLETELY UNTOUCHED for bases 1 and 37
+  (`0xdeadbeef` reads back), confirming that excluding out-of-range bases from
+  the endptr table was right and that storing `nptr` there is the safe
+  refinement.
+  **A CENSUS BLIND SPOT LEFT OPEN DELIBERATELY, AND FLAGGED RATHER THAN
+  SILENTLY ACCEPTED**: a GLOBAL `char *end` still refuses with the
+  pre-existing `taking the address of a pointer variable`, which
+  `classify_blocker` buckets as **`other`**. So that shape is invisible to the
+  ranking instrument. No needle was added because it is not a NEW refusal
+  class and giving it one would re-key an existing tag -- but it is the third
+  `other`-bucket blind spot found this session (FR-230's missing needle,
+  FR-239's `errno`, and now this), which is a pattern about the instrument
+  rather than three coincidences.
+  `--recover` produces FR-52's marker correctly for the new refusal: a
+  located warning plus `unimplemented!("unsupported: strtol endptr must walk
+  the parsed string's region")`.
+  WHY +0, COUNTED AS PROGRAMS: 16 `strto*` sites across **11 Public-Tests
+  programs**. **Seven pass `argv[N]` as argument 0** (003, 004, 005, 006, 007,
+  008, 020_lib) and are blocked at the argv frontier, which rung 3 owns. The
+  remaining four (023, 023_lib, 025, 025_lib) share one `parse_val` body, and
+  `--recover` on 023 shows **two surviving blockers, neither of them the
+  endptr**: `unsupported pointer expression: CallExpr` (that is `errno = 0`,
+  FR-239) and `an fgets result must be compared against a null pointer or
+  tested for truth`. **No corpus program is one endptr away from either
+  stage**, and the `_lib` halves additionally need a `dlsym`-able export.
   ACCEPTANCE: `strtol`/`strtoul`/`strtod` with a NULL `endptr` over a char
   region, byte-identical to the clang native on a differential vector set
   including overflow (`ERANGE` clamping to `LONG_MAX`/`LONG_MIN`), leading

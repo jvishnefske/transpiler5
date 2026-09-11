@@ -1701,7 +1701,12 @@ FailureOr<Value> CImporter::emitAtofCall(const clang::CallExpr *call) {
       emitCharRegionSlice(loc, *pointer, /*isMut=*/false);
   if (failed(slice))
     return failure();
+  // FR-234 rung 2: `__emitrust_atof` is a PROJECTION of
+  // `__emitrust_atof_end`, so the pair is requested together -- the helper
+  // table has no dependency edges, and an emitted projection without its
+  // scan would not compile (the loud direction).
   requestStringHelper("__emitrust_atof");
+  requestStringHelper("__emitrust_atof_end");
   Value parsed =
       builder
           .create<emitrust::CallOpaqueOp>(
@@ -1723,21 +1728,70 @@ FailureOr<Value> CImporter::emitAtofCall(const clang::CallExpr *call) {
   return emitError(loc) << "unsupported: atof result type";
 }
 
-// FR-234 rung 1: the shared NULL-`endptr` guard for the strto* family.
-// Returns success only when `arg` is a null pointer constant; every other
-// spelling gets the rung-2 rejection, whose wording carries the
-// `strtox-endptr` ledger needle.
-LogicalResult CImporter::requireNullEndptr(const clang::CallExpr *call,
-                                           llvm::StringRef name,
-                                           unsigned index) {
+// FR-234 rung 2: the shared `endptr` classifier for the strto* family.
+// NULL is rung 1's admission; `&end` over a decomposed pointer local is
+// rung 2's; every other spelling keeps the rung-1 rejection, whose wording
+// carries the `strtox-endptr` ledger needle.
+FailureOr<const clang::VarDecl *>
+CImporter::classifyStrtoEndptr(const clang::CallExpr *call,
+                               llvm::StringRef name, unsigned index) {
   const clang::Expr *endptr = call->getArg(index);
   Location loc = translateLoc(endptr->getBeginLoc());
   if (isNullPointerConstantExpr(endptr))
-    return success();
+    return static_cast<const clang::VarDecl *>(nullptr);
+  // Mirrors `PointerRegionAnalysis`'s admission exactly (ImportC.cpp): the
+  // SAME peel, the SAME `&local` test. If the two disagreed the region
+  // would have been joined without a write, or written without a join --
+  // so this re-derives the shape rather than trusting a flag.
+  const clang::Expr *argument = stripTrivia(endptr);
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(argument))
+    argument = stripTrivia(cast->getSubExpr());
+  if (const auto *addrOf = llvm::dyn_cast<clang::UnaryOperator>(argument);
+      addrOf && addrOf->getOpcode() == clang::UO_AddrOf)
+    if (const clang::VarDecl *pointer = asLocalVarRef(addrOf->getSubExpr()))
+      if (pointerLocals.contains(pointer))
+        return pointer;
   // The location is the ARGUMENT's, not the call's: at a real site the
-  // interesting token is the `&end`, and rung 2's work starts there.
+  // interesting token is the `&end`.
   return emitError(loc) << "unsupported: " << name
                         << " with a non-null endptr argument";
+}
+
+LogicalResult CImporter::emitStrtoEndptrWrite(Location loc,
+                                              llvm::StringRef name,
+                                              const clang::VarDecl *endptr,
+                                              const PtrExprValue &region,
+                                              Value offset) {
+  auto it = pointerLocals.find(endptr);
+  if (it == pointerLocals.end()) // Defensive; the classifier required it.
+    return emitError(loc) << "unsupported: " << name
+                          << " endptr must walk the parsed string's region";
+  const PointerLocalInfo &info = it->second;
+  // The cursor C hands back is an offset into ARGUMENT 0's region. A
+  // pointer that walks anything else -- a different object, a multi-base
+  // region (CTS-P7), a member-rooted or heap-backed one that argument 0
+  // does not share -- has nowhere to put that answer, so it is refused
+  // rather than approximated. `region.cursor` is required for the same
+  // reason: a degenerate base has no element offset to advance.
+  if (!info.multiBases.empty() || region.baseIndex || !info.cursorCell ||
+      !region.cursor || info.base != region.base ||
+      info.member != region.member ||
+      info.literalBacking != region.literalBacking ||
+      info.backing != region.backing)
+    return emitError(loc) << "unsupported: " << name
+                          << " endptr must walk the parsed string's region";
+  Value absolute =
+      builder.create<arith::AddIOp>(loc, region.cursor, offset).getResult();
+  // C 7.22.1.4p7 stores a pointer INTO the subject string -- never a null
+  // one, and never nothing, including the no-conversion case (where the
+  // stored pointer is `nptr` itself, which is exactly `region.cursor + 0`).
+  // So a nullable `endptr` takes a definite `true`, not the co-argument's
+  // own flag.
+  if (info.nonNullCell)
+    builder.create<memref::StoreOp>(loc, createBoolConstant(loc, true),
+                                    info.nonNullCell);
+  builder.create<memref::StoreOp>(loc, absolute, info.cursorCell);
+  return success();
 }
 
 FailureOr<Value> CImporter::emitStrtoIntCall(const clang::CallExpr *call,
@@ -1747,11 +1801,12 @@ FailureOr<Value> CImporter::emitStrtoIntCall(const clang::CallExpr *call,
   if (call->getNumArgs() != 3)
     return emitError(loc)
            << "unsupported: " << name << " requires exactly 3 arguments";
-  // Checked BEFORE the region is emitted so the frontier reads off the
+  // Classified BEFORE the region is emitted so the frontier reads off the
   // endptr rather than off whatever the region lowering happens to say
-  // about `&end` (which today is the unrelated "taking the address of a
-  // pointer variable").
-  if (failed(requireNullEndptr(call, name, /*index=*/1)))
+  // about `&end`.
+  FailureOr<const clang::VarDecl *> endptr =
+      classifyStrtoEndptr(call, name, /*index=*/1);
+  if (failed(endptr))
     return failure();
   FailureOr<PtrExprValue> pointer = emitCharRegionArg(call->getArg(0));
   if (failed(pointer))
@@ -1786,6 +1841,23 @@ FailureOr<Value> CImporter::emitStrtoIntCall(const clang::CallExpr *call,
                          builder.getStringAttr(helper),
                          /*args=*/ArrayAttr(), ValueRange{*slice, radix})
                      .getResult(0);
+  // FR-234 rung 2: C's second answer. ONE SCAN, TWO ENTRY POINTS -- the
+  // cursor does not depend on the saturation limit (the subject sequence
+  // is the whole run of digits however the accumulator overflows), so
+  // `strtol` and `strtoul` of one string agree on it and rung 1's pinned
+  // wrapper lowering above does not move. The SAME slice value feeds both
+  // calls: the value and the cursor are two reads of one subject string.
+  if (*endptr) {
+    requestStringHelper("__emitrust_strto_end");
+    Value cursor = builder
+                       .create<emitrust::CallOpaqueOp>(
+                           loc, TypeRange{builder.getIntegerType(64)},
+                           builder.getStringAttr("__emitrust_strto_end"),
+                           /*args=*/ArrayAttr(), ValueRange{*slice, radix})
+                       .getResult(0);
+    if (failed(emitStrtoEndptrWrite(loc, name, *endptr, *pointer, cursor)))
+      return failure();
+  }
   // Convert to the call's declared result type; the standard prototype
   // already says long/unsigned long, but a K&R-style declaration may
   // differ (matching emitAtoiCall / emitStrlenCall).
@@ -1803,7 +1875,9 @@ FailureOr<Value> CImporter::emitStrtodCall(const clang::CallExpr *call) {
   if (call->getNumArgs() != 2)
     return emitError(loc)
            << "unsupported: strtod requires exactly 2 arguments";
-  if (failed(requireNullEndptr(call, "strtod", /*index=*/1)))
+  FailureOr<const clang::VarDecl *> endptr =
+      classifyStrtoEndptr(call, "strtod", /*index=*/1);
+  if (failed(endptr))
     return failure();
   // C 7.22.1.1p2: atof(s) IS strtod(s, NULL). Delegating rather than
   // duplicating is what keeps FR-235's classification (inf/nan parsed,
@@ -1817,14 +1891,32 @@ FailureOr<Value> CImporter::emitStrtodCall(const clang::CallExpr *call) {
       emitCharRegionSlice(loc, *pointer, /*isMut=*/false);
   if (failed(slice))
     return failure();
-  requestStringHelper("__emitrust_atof");
-  Value parsed =
-      builder
-          .create<emitrust::CallOpaqueOp>(
-              loc, TypeRange{builder.getF64Type()},
-              builder.getStringAttr("__emitrust_atof"),
-              /*args=*/ArrayAttr(), ValueRange{*slice})
-          .getResult(0);
+  Value parsed;
+  if (*endptr) {
+    // FR-234 rung 2: the value and the cursor come out of ONE call, so
+    // they cannot disagree -- `__emitrust_atof` is itself a projection of
+    // this helper's first component, and the float grammar exists in
+    // exactly one place (the FR-235 invariant).
+    requestStringHelper("__emitrust_atof_end");
+    auto both = builder.create<emitrust::CallOpaqueOp>(
+        loc, TypeRange{builder.getF64Type(), builder.getIntegerType(64)},
+        builder.getStringAttr("__emitrust_atof_end"),
+        /*args=*/ArrayAttr(), ValueRange{*slice});
+    parsed = both.getResult(0);
+    if (failed(emitStrtoEndptrWrite(loc, "strtod", *endptr, *pointer,
+                                    both.getResult(1))))
+      return failure();
+  } else {
+    // The projection and its scan travel together (see `emitAtofCall`).
+    requestStringHelper("__emitrust_atof");
+    requestStringHelper("__emitrust_atof_end");
+    parsed = builder
+                 .create<emitrust::CallOpaqueOp>(
+                     loc, TypeRange{builder.getF64Type()},
+                     builder.getStringAttr("__emitrust_atof"),
+                     /*args=*/ArrayAttr(), ValueRange{*slice})
+                 .getResult(0);
+  }
   FailureOr<Type> resultType = mapType(call->getType(), loc);
   if (failed(resultType))
     return failure();

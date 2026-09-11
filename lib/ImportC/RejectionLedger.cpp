@@ -146,6 +146,12 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
     // test/RealWorld/run_realworld.py's classify_blocker.
     {llvm::StringLiteral("with a non-null endptr argument"),
      llvm::StringLiteral("strtox-endptr")},
+    // FR-234 rung 2 admitted `&end` over a decomposed pointer local, so
+    // the remaining endptr refusal is a REGION mismatch (an `end` that
+    // walks some other object, a multi-base or member-rooted one). Same
+    // work, same tag. Mirrors test/RealWorld/run_realworld.py.
+    {llvm::StringLiteral("endptr must walk the parsed string's region"),
+     llvm::StringLiteral("strtox-endptr")},
     {llvm::StringLiteral("returned pointer value"),
      llvm::StringLiteral("returned-pointer")},
     {llvm::StringLiteral("pointer return type"),
