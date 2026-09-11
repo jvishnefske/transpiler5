@@ -91,7 +91,7 @@ reproduce. 120,000 random values byte-identical; 119 panics, zero silent
 divergences. Hex floats are deliberately *not* implemented: glibc accepts
 `0x.p3` as 0, outside the C grammar, so a scanner would still diverge.
 
-### 3. FR-226 — the SPHINCS+ package · **mostly retracted (FR-233), one live remnant**
+### 3. FR-226 — the SPHINCS+ package · **68 cases walled, 12 payable behind ~5 fixes**
 
 **This item and "FR-227, not to be funded" are the same wall, and I wrote them
 as if they were independent.** Measured at the 60/252 census and re-measured
@@ -107,13 +107,26 @@ still refused.
 This was the rule-4 trap ("clearing a stage is not passing") committed inside
 the document that lists rule 4.
 
-**The live remnant, and it exists because FR-233 was wrong about it.** I
-probed a body I invented rather than the corpus's. The real *blake*
+**The live remnant, and it exists because FR-233 was wrong about it — twice.**
+I probed a body I invented rather than the corpus's. The real *blake*
 `initialize_hash_function` is `{ (void)ctx; }` — a genuine no-op — so FR-226's
-unaccessed-pointer class already exports it, and **all 12 blake configurations
-export today**. Those 12 are EMIT-only opportunities that would *pay*, and the
-entry as first written discarded them. The sha2 body calls `seed_state(ctx)`
-and really is walled.
+unaccessed-pointer class already exports it. Measured over FR-236's verdicts:
+of the 80 SPHINCS+ `lib` cases, **exactly 12 export and 68 are refused**. The
+12 are all blake `SPX_initialize_hash_function`, all matched *exact* rather
+than through the name fold, all with `body_derived_risk: False`.
+
+**Those 12 are not among the 34** — the 34 are sha2 only. The blake 12 sit at
+**depth 6**: five distinct importer blockers, and crates reporting 19 refused
+symbols against 3 exported. Since `tractor-eval.py` is strict-mode-only with no
+partial credit, **all 19 must emit before any of the 12 scores.** All-or-
+nothing, exactly what FR-221 measured when it fixed one blocker of a set and
+got +0 — and depth is a lower bound, so "+12 after five fixes" is an upper
+bound on an upper bound.
+
+So FR-226's "+12" named the **right cases for the wrong reason**, and my
+retraction was too broad: correct for sha2 and for `prf_addr`,
+`gen_message_random` and `hash_message` in every backend, wrong for blake
+`initialize_hash_function`. Three passes, each correcting the last.
 
 ### 3′. FR-234 — `argv`, and the `strtoX` family under it · **the export-aware cover's top pick**
 
