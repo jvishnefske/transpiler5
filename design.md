@@ -15154,6 +15154,32 @@ piece and becomes FR-45.
   FR-239) and `an fgets result must be compared against a null pointer or
   tested for truth`. **No corpus program is one endptr away from either
   stage**, and the `_lib` halves additionally need a `dlsym`-able export.
+  **RUNG 3 SCOPED BY ENUMERATING EVERY argv USE FORM, 2026-09-10, rather than
+  by re-reading the blocker tag.** The six programs use exactly SIX distinct
+  forms, and the current grammar admits none of them:
+  1. `strtoX(argv[i], &end, base)` -- `argv[i]` as the char-region argument to
+     a hosted conversion. **All six programs.**
+  2. `end == argv[i]` -- pointer identity between the endptr cursor and
+     `argv[i]`'s region base. 003, 004, 005, 006.
+  3. `strlen(argv[1])` -- `argv[i]` to a different hosted function. 003 only.
+  4. `argv[1] + start` consumed by `%.*s`. 003 only, and **`%.*s` is a
+     SEPARATE live refusal** (`unsupported: '*' precision in printf format`,
+     re-measured today), so 003 needs that fixed too.
+  5. `fprintf(stderr, "...%s...", argv[i])` -- `%s` to **stderr via fprintf**,
+     where the admitted grammar covers only a direct `printf`. 007, 008.
+  6. `strtoX(argv[i], NULL, base)`. 003 only.
+  **SO THE CLEAN RUNG-3 TARGET IS FORMS 1 AND 2, AND IT IS THREE PROGRAMS:
+  004, 005 and 006, which use NOTHING ELSE.** 003 needs three more forms
+  including a separate printf fix; 008 needs form 5.
+  **007 IS NOT WINNABLE AND SHOULD BE STRUCK FROM EVERY "five programs" COUNT
+  I HAVE WRITTEN, INCLUDING THIS ENTRY'S.** Measured: it needs argv, form 5,
+  `errno` (lines 19/21/30/32, and `errno` is not modelled at all -- FR-239),
+  and **`pow`**, which is a DELIBERATE bit-exactness refusal that should stay
+  one. Four fixes, one of them permanent by policy.
+  This is the same shape of error as the retired "+3 ceiling": I had been
+  citing a program set without enumerating what each member actually needs.
+  The per-program form table above is the thing to re-read before dispatching,
+  and the depth BEYOND the argv gate remains unmeasurable until argv admits.
   ACCEPTANCE: `strtol`/`strtoul`/`strtod` with a NULL `endptr` over a char
   region, byte-identical to the clang native on a differential vector set
   including overflow (`ERANGE` clamping to `LONG_MAX`/`LONG_MIN`), leading
