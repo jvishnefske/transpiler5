@@ -5162,6 +5162,16 @@ private:
   /// and then hands that prefix to Rust's correctly-rounded
   /// `f64::from_str`, which agrees with glibc's correctly-rounded
   /// `strtod` bit for bit on every prefix both accept.
+  ///
+  /// FR-235: the grammar's non-decimal shapes are handled there too --
+  /// `inf`/`infinity`/`nan` are parsed (IEEE fixes their bits exactly),
+  /// and the two forms Rust cannot reproduce, a hexadecimal float and a
+  /// NaN payload, PANIC. Nothing is refused HERE, deliberately: the
+  /// divergence is a property of the string, which is a runtime value at
+  /// almost every real call site, and an import-time rejection keyed on
+  /// the literal sub-case would refuse a program whose `atof("0x1p3")`
+  /// sits on a path that never runs while still missing every call that
+  /// reads its argument from input. The runtime panic covers both.
   FailureOr<Value> emitAtofCall(const clang::CallExpr *call);
 
   /// FR-224: lowers a definition-less `strcspn`/`strspn` to the matching

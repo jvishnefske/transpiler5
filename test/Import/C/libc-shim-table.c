@@ -69,6 +69,19 @@ int main(void) {
 // items, and they are ORDINARY SAFE FUNCTIONS -- no `unsafe`, no
 // `extern`, no binding.
 // CHECK: emitrust.verbatim "fn __emitrust_atof(s: &[i8]) -> f64
+// FR-235: the two forms of C's strtod grammar that Rust cannot reproduce
+// STOP LOUDLY inside that helper rather than answering 0.0. The wording is
+// the one FR-229 already settled for `scanf %f`, in the same voice, and it
+// is pinned here in the FAST tier so a refactor of the helper text cannot
+// quietly retire the refusal -- the runtime behaviour itself is byte-diffed
+// in test/EndToEnd/libc-atof-loud-stop.c. The whole helper is ONE verbatim
+// string, so these are CHECK-SAME on that same line.
+// CHECK-SAME: atof: hexadecimal floating-point input is not supported
+// CHECK-SAME: atof: a NaN payload, nan(...), is not supported
+// ... and `inf`/`infinity`/`nan` are PARSED, not refused and not dropped:
+// IEEE-754 fixes their bits, so the helper returns them directly.
+// CHECK-SAME: return if neg { -f64::NAN } else { f64::NAN };
+// CHECK-SAME: return if neg { f64::NEG_INFINITY } else { f64::INFINITY };
 // CHECK: emitrust.verbatim "fn __emitrust_strcspn(s: &[i8], reject: &[i8]) -> i64
 // CHECK: emitrust.verbatim "fn __emitrust_strspn(s: &[i8], accept: &[i8]) -> i64
 

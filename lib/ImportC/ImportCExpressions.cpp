@@ -2707,7 +2707,9 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     // FR-224: atof is atoi's shape at f64 -- a C-exact PREFIX parse over
     // the argument's char region, through a helper that scans the
     // strtod grammar itself (Rust's `parse` demands the whole string and
-    // would reject the trailing newline every fgets leaves).
+    // would reject the trailing newline every fgets leaves). FR-235: the
+    // helper also covers `inf`/`nan` and stops loudly on the hexadecimal
+    // and NaN-payload forms; no shape of the argument is refused here.
     if (name == "atof")
       return emitAtofCall(call);
     // FR-224: div/ldiv/lldiv build their ISO { quot, rem } result from

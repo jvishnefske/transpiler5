@@ -1,6 +1,6 @@
 # TRACTOR roadmap
 
-State at `411d987`, 2026-09-10. This is the human-readable companion to the
+State at `7892c90`, 2026-09-10. Census re-run at 60/252. This is the human-readable companion to the
 two authoritative files: `design.md` is the prose evidence ledger, and
 `docs/plans/backlog.toml` is the machine index. **Where they disagree with
 this document, they win** — this one summarises, they record.
@@ -42,13 +42,38 @@ Its `REJECTED ITEMS PER CASE` histogram is the cheap progress signal, because
 it moves after each individual fix rather than only when a whole set lands:
 
 ```
-60 cases  0 items   ← never emitted a crate (the openssl parse failures)
-35        1         ← shallow; a bound worth trusting
-15        2
+62 cases  0 items   ← never emitted a crate (48 are the openssl parse failures)
+32        1         ← shallow; a bound worth trusting
+13        2
  1        3
  4        4
 16        7    16   8    16  14    32  15   ← the 80 SPHINCS+ lib cases
 ```
+
+**It was blind to the stage that matters most; FR-236 fixed that.** The census
+measured the EMIT stage only, so for any `lib` case a clean row meant nothing
+on its own — that is rule 4, and item 3 above is what breaking it looks like.
+It now reports a per-case **export verdict** over the 160 `lib` cases:
+
+```
+93 refused    64 exports    3 absent
+```
+
+calibrated against the scored run — **36/36 PASS read `exports`, 13/13
+SYMBOL_MISSING read otherwise**. A disagreement there means the parser is
+wrong, not the binary.
+
+Two cautions that travel with it. The verdict is an **observation of what this
+binary does today**, never a prediction: a walled case is not unreachable, it
+needs an export-class fix *in addition* to the importer one. And **68 of the
+160 verdicts rest on a case/underscore fold** between the Rust item name and
+the C symbol, because no tool output carries a machine-readable map of the two
+(the fold is used only where unique, and never to *declare* an export). Making
+the refusal warning name the C symbol would delete the heuristic outright.
+
+**The tool this repo ranks all work with still has no test of its own.** It is
+not in the fast tier and never was — I had conflated it with `plan.py check`.
+That gap is open.
 
 ## Ranked work
 
@@ -66,14 +91,57 @@ reproduce. 120,000 random values byte-identical; 119 panics, zero silent
 divergences. Hex floats are deliberately *not* implemented: glibc accepts
 `0x.p3` as 0, outside the C grammar, so a scanner would still diverge.
 
-### 3. FR-226 — the SPHINCS+ package · up to +12 PASS, cost unknown
+### 3. FR-226 — the SPHINCS+ package · **mostly retracted (FR-233), one live remnant**
 
-Five importer fixes plus the (already landed) unaccessed-pointer export class.
-**Do not commit to the set up front.** Each of the 12 blake cases hides
-fourteen stubbed functions, so "+12" is a loose upper bound. Fix **one** class,
-re-measure the stub count, and re-cost — the histogram makes that cheap now.
+**This item and "FR-227, not to be funded" are the same wall, and I wrote them
+as if they were independent.** Measured at the 60/252 census and re-measured
+independently by FR-236: the 3-fix set clears **+34 EMIT** and **33 of the 34
+are export-walled**. Those 34 are **4 symbols × 8 sha2 configurations**, and
+their sha2 bodies write through a *mutable* byte slice. A mutable slice export
+is FR-181's hard NO-GO (`&mut [T]` is `noalias` to LLVM where a C caller may
+legally alias), and class 2 additionally demands a single-block, region-free,
+constant-index, **read-only** body — so much as a `for` loop disqualifies it.
+Probed: a read-only `for (i=0;i<32;i++) s+=b[i]` with a constant bound is
+still refused.
 
-### 4. ~~FR-228 — the stdout buffering model~~ · **DONE, EMIT +1 / PASS +0**
+This was the rule-4 trap ("clearing a stage is not passing") committed inside
+the document that lists rule 4.
+
+**The live remnant, and it exists because FR-233 was wrong about it.** I
+probed a body I invented rather than the corpus's. The real *blake*
+`initialize_hash_function` is `{ (void)ctx; }` — a genuine no-op — so FR-226's
+unaccessed-pointer class already exports it, and **all 12 blake configurations
+export today**. Those 12 are EMIT-only opportunities that would *pay*, and the
+entry as first written discarded them. The sha2 body calls `seed_state(ctx)`
+and really is walled.
+
+### 3′. FR-234 — `argv`, and the `strtoX` family under it · **the export-aware cover's top pick**
+
+Once export-walled cases leave the objective, the set-cover search picks a
+**completely different trio** — argv, `pointer variable has no known target
+object`, and `taking the address of a global variable` — worth **11 payable**
+(exec 8, lib-exports 3) against the old trio's **1**. argv leads it.
+
+#### Why argv, specifically · +5 EMIT upper bound, **all exec**
+
+The new top lever, and the roadmap never ranked it. `exec` cases never meet the
+export wall, so EMIT here can become PASS. **Upper bound, and the reason is
+nameable**: all six have `main` dropped by recovery, so blockers inside `main`
+are invisible — the census docstring names `004_nineality_sieve` as depth 1,
+actually ≥4. Honest ceiling ≈ **+3**: 007 also needs `pow` (a deliberate
+bit-exactness refusal), 006 a returned pointer, 008 an unreached item.
+
+Smaller than it looks. `argv` is already half-built (`ArgvTableType`,
+`ArgvArgOp`, a `Vec<Vec<i8>>` crate wrapper); `planArgvUsesFor` just admits a
+narrow read grammar and otherwise leaves the old rejection. The real blocker is
+underneath and independent: **`strtol` is not in the hosted table at all**, and
+the `endptr` out-parameter is a second gap — both reproducible on a plain
+`char buf[8]` with no argv in sight, so both are EndToEnd-testable with no
+corpus dependency. `emitAtoiCall` is the shape to copy, `__emitrust_atof`
+already implements the `strtod` prefix grammar, and FR-230's `strchr` cursor
+bind is the `endptr` representation. Build it importer-first, argv second.
+
+### ~~FR-228 — the stdout buffering model~~ · **DONE, EMIT +1 / PASS +0**
 
 Landed 2026-09-10. Two things worth carrying forward. **A `BufWriter` does not
 reproduce C** — glibc fills its buffer and flushes only when a write no longer
@@ -84,13 +152,43 @@ destructors**, so every exit path needed an explicit flush spliced in
 and guessing wrong truncates silently. 482 pre-existing goldens moved, all
 verified to carry the runtime and re-checked by their own oracles.
 
+### 5. The other two legs of the export-aware cover · 8 cases, both checked for well-definedness
+
+Ranked by FR-236's export-aware search, and I checked the C before ranking
+them — which changed the answer for one of the two.
+
+**`taking the address of a global variable` — 024/025, 4 cases (exec + lib).**
+Well-defined C, no UB: a `static house_t the_house` with mutator functions
+taking `&the_house`. This is the FR-62 C-owner-method shape almost exactly —
+a singleton with methods — so the machinery to lift it already exists and
+FR-179's actor path already handles singletons. The likeliest real work is
+deciding the singleton's construction, not inventing a model.
+
+**`pointer variable has no known target object` — 011/012, 4 cases (exec + lib).
+Read the vectors before touching this one.** The C is
+`char *data; printLine(data);` — an *uninitialized* pointer, which is UB, and
+the refusal is CORRECT. But the corpus tags that path's vector `has_ub` and
+the harness skips it, leaving one real vector that only exercises the
+initialized path. So the case is winnable *without* modelling an indeterminate
+pointer: since the `bad()` path is undefined, **a deterministic panic is a
+legal refinement**, and the tree already does exactly that elsewhere ("C
+undefined behavior refined into a deterministic panic"). What is NOT legal is
+inventing a value for `data` and carrying on.
+
+This is the counterexample to reading a blocker name and costing it: the two
+legs look like one kind of work and are not.
+
 ### Not to be funded for yield
 
 - **FR-230 item 3 — the pointer-member load.** +4 EMIT, **+0 PASS, and the +0
   is structural**: the only admitted pointer-struct-member model represents
   the field as an index into an owner array proven inside the unit, and every
   affected case is a `lib` entry point whose caller supplies a real address.
-- **FR-227 — the multi-reference export wall.** 67 cases, 27% of the corpus,
+- **FR-227 — the export wall.** 67 cases, 27% of the corpus — **and per FR-233
+  it also gates the whole SPHINCS+ subtree, which is 128 of 252.** It is the
+  single largest structural item on the board and the reason EMIT and PASS have
+  decoupled. Not fundable as written, but it is where the corpus actually ends.
+  Original entry: 67 cases,
   behind FR-181's *measured miscompile* (native 104 against export 10, exit 0,
   no diagnostic). FR-222's mutability insight rescues exactly one of them,
   because one `&mut` aliasing one `&` is UB precisely as much as two `&mut`.
