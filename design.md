@@ -15598,7 +15598,8 @@ piece and becomes FR-45.
   nobody ranks work out of", which is what this entry first said.**
   `tractor-census.py` deliberately ranks on the full DIAGNOSTIC, not the tag,
   and records why in a comment. The tag's real consumers are
-  `RatchetReport.cpp`, **`RatchetManifest.tags` (a GATE)**, `FrontierSearch`
+  `RatchetReport.cpp`, `RatchetManifest.tags` (NOT a gate -- see FR-241's
+  second correction), `FrontierSearch`
   and `ShardMetadata`. The defect is real; my stated blast radius was not.
   **THE NEEDLE WAS ALSO DEAD CODE.** Across the whole 252-case corpus,
   **zero** cases carried the "with" spelling and **four** carried "has" -- so
@@ -15631,7 +15632,7 @@ piece and becomes FR-45.
   `test/Driver` rejection-report tests generate their own and DO exercise the
   classifier, which is the right place for a tag shift to surface.
 
-- [ ] FR-241 (opened 2026-09-10, a MECHANICAL AUDIT commissioned after four
+- [x] FR-241 (opened and LANDED 2026-09-10, a MECHANICAL AUDIT commissioned after four
   `other`-bucket blind spots were found by accident in one session):
   **THE DRIFT IS SYSTEMATIC, IT FOUND SIX MORE DEFECTS, AND IT REFUTED THE
   PREMISE I COMMISSIONED IT ON.** Worth **+0 TRACTOR** -- instrument work.
@@ -15644,8 +15645,7 @@ piece and becomes FR-45.
   `('other',)`** under the tag view; 13 distinct tag-sets against 39 distinct
   wording-sets. So "invisible to the ranking instrument" was FALSE for the
   census specifically. It remains TRUE for the consumers that do read the tag:
-  `RatchetReport.cpp:74`, **`RatchetManifest.tags` at `:165`, which is a
-  GATE**, `FrontierSearch.cpp:561`, `ShardMetadata.h:123`, and the ledger's own
+  `RatchetReport.cpp:74`, `RatchetManifest.tags` at `:165`, `FrontierSearch.cpp:561`, `ShardMetadata.h:123`, and the ledger's own
   blocker tabulation. Correct the target, keep the concern.
   METHOD, with its blind spots measured rather than asserted: anchored on
   `emitError` plus the deferred builders (`markInvalid`,
@@ -15712,12 +15712,85 @@ piece and becomes FR-45.
   missing.
   **ROOT CAUSE, measured: 54 of 89 tags are asserted NOWHERE in `test/` except
   inside the Python mirror itself.** That is why needles rot.
+  **LANDED 2026-09-10 AT +0 EMIT AND +0 PASS, AS PREDICTED BY BOTH SIDES.**
+  All six fixed, plus a SEVENTH the liveness check found on its first run, and
+  the check itself is now in the fast tier as
+  `test/Driver/rejection-ledger-needles.c` over
+  `scripts/check-rejection-ledger.py`.
+  **DEFECT 7, FOUND BY THE TEST RATHER THAN BY A HUMAN, WHICH IS THE WHOLE
+  ARGUMENT FOR THE TEST: `stl-unrecognized-receiver` HAD NEVER BEEN
+  REACHABLE.** All five wordings it was minted for end `... receiver is not a
+  recognized STL type`, and the generic `is not a recognized STL type` row sat
+  ABOVE it and took all five. Nothing pinned either tag. Surfaced by check
+  (c2) -- "a row that never WINS any enumerated literal" -- on the very first
+  run.
+  **FIX 6's PRESCRIBED REMEDY WAS INSUFFICIENT AND I HAD IT HALF RIGHT.**
+  Moving the broad `global address` row below the returned-pointer group fixes
+  `returned pointer value (a bare return cannot carry the global address)` but
+  NOT `return sites mix a global address and NULL` -- that wording says
+  **mix**, not **disagree**, so it matches none of the three existing
+  returned-pointer needles and fell straight through to `global address`
+  again. Both halves were needed: a new `return sites mix a global address`
+  row AND the reorder.
+  FIX 1's delimiter question answered: **no special handling needed.** The
+  existing extraction is "run of word characters after the needle" and `)` is
+  not a word character, so `unsupported pointer cast (` bounds
+  `ArrayToPointerDecay` exactly as a space bounds `CallExpr`. Verified on the
+  built tool, not reasoned.
+  **MEASURED MOVEMENT, over the 110,433-item kernel rejection report**:
+  `other` **59050 -> 53319 (-5731)**, entirely from fix 1 --
+  `unsupported-ptr-cast:ArrayToPointerDecay` +3819,
+  `unsupported-ptr-expr:CStyleCastExpr` +1060, `:StmtExpr` +499,
+  `:CallExpr` +353. **Every other tag moved by exactly 0**, which is the
+  direct evidence that fixes 6 and 7 disturbed no neighbour.
+  THE CHECK'S SHAPE, and the parts that make it not a maintenance tax:
+  `_NODE_NAMED_RE` is now DERIVED from a `(needle, tag-prefix)` table so `\w`
+  has one definition and the mirror comparison is mechanical; liveness allows
+  a `LIVE_VIA` waiver for interpolation-built needles and the waiver is
+  **self-verifying** -- a stale one (needle became literal) and a broken
+  anchor both FAIL; mirror equality is pure row-for-row with drift reported as
+  a SET difference rather than a positional dump. **Negative-tested rather
+  than assumed**: against the pre-fix tables it emits exactly 7 errors naming
+  defects 2-5 and the two unreachable rows; with only defect 7 re-introduced,
+  exactly 1.
+  **AN HONEST LIMIT, DOCUMENTED IN THE SCRIPT RATHER THAN HIDDEN: check (c)
+  CANNOT catch defect 6** and cannot without the `other` allowlist that was
+  deliberately rejected. Defect 6 is MESSAGE-level ambiguity between two rows
+  that both still win other wordings -- no row is dead, no needle nests. And
+  the table is BUILT on deliberate ordering (argv/argv-pointer, the ostream
+  operand family, the exception pair, and the STL pair defect 7 created), so
+  gating it would need a pinned list of the intentional ones. The compromise
+  is two sound structural rules plus a printed ambiguity inventory (12
+  wordings, each with its winner named) where defect 6's shape is legible.
+  **A THIRD NODE-NAMED FAMILY EXISTS AND WAS DELIBERATELY LEFT ALONE**:
+  `unsupported cast (<CastKind>)`, five emitters, **443 kernel items**
+  (`PointerToIntegral` 327, `BitCast` 116). It is NOT behaviour-neutral --
+  the specific `unsupported cast (UserDefinedConversion)` row sits ABOVE the
+  node-named prefixes, so a generic prefix would tag only the non-UDC kinds.
+  Same shape as fix 1, needs its own waiver, recorded as a follow-on rather
+  than smuggled in.
+  Gate **1093/1093** (1092 + the new check). Clippy 57 (+0), 294 files /
+  0 skipped / hash unchanged. Binding 2307 (+0), p95 5 (+0). CTestSuite
+  220/220, Cpp17Suite 35/35. **Golden movement 0 by CONSTRUCTION as well as
+  measurement**: `classifyBlocker`'s result flows only into
+  `RejectedItem::blockerTag`, and every consumer is a report, manifest or
+  metadata path -- none reaches emitted Rust.
+  NOTED, NOT FIXED: `test/Kernel/*.txt` are now stale as historical snapshots.
+  Nothing gates them, and hand-editing a record of a run that cannot be
+  reproduced would be worse than leaving them.
   ACCEPTANCE: the six defects above fixed (two rows added to the Python
   mirror, two dead rows deleted from both, the two pointer prefixes added to
   `kNodeNamedPrefixes`, the `global address` row moved below the
-  returned-pointer rows), then the liveness test. **`RatchetManifest.tags` is
-  a GATE, so the prefix change WILL move it** -- expect and record that
-  movement rather than being surprised by it.
+  returned-pointer rows), then the liveness test. **SECOND CORRECTION, TO THE AUDIT ITSELF: `RatchetManifest.tags` IS NOT A
+  GATE, AND I PROPAGATED THAT CLAIM WITHOUT CHECKING IT.**
+  `compareRatchetManifests` (`RatchetReport.cpp:255-285`) compares
+  `admittedTotal`, per-shard admitted and `condensationWarnings` -- **it never
+  touches `.tags`**; `:165` is the BUILDER, not a comparison. Verified by
+  reading the comparison myself. The only committed manifest carrying `tag`
+  lines is `test/Kernel/.../ratchet-manifest.txt` and **no test reads it**:
+  `test/Kernel/` holds only `.txt`, and lit's `suffixes` are `.mlir/.c/.cpp`.
+  So the tag has NO gate consumer at all and these fixes moved zero baselines.
+  Three passes over "who consumes this tag", each correcting the last.
 
 - [x] FR-228 (opened 2026-09-09 and LANDED 2026-09-10, found by the FR-224 implementation's own
   byte-diff oracle while trying to admit `abort`): **EVERY EMITTED CRATE HAS

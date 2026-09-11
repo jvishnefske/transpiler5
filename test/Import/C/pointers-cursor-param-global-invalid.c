@@ -12,11 +12,15 @@
 // (pointers-cursor-param-global.c). Each case pins the exact wording,
 // because the wording IS the ledger-tag split: the substring table in
 // RejectionLedger.cpp (and its line-for-line Python twin in
-// run_realworld.py) routes every wording containing "global address"
-// to ptr-to-ptr-global-target — narrowed by C1 to the residual
+// run_realworld.py) routes a "global address" wording to
+// ptr-to-ptr-global-target — narrowed by C1 to the residual
 // MULTI-global / outside-grammar cases (the FR-62 actor-decomposition
 // front), single-global-or-NULL now being admitted — and the shape
-// escapes to ptr-to-ptr-shape-escape. Any use of `p` outside `*p`
+// escapes to ptr-to-ptr-shape-escape. FR-241 moved that deliberately
+// broad needle BELOW the returned-pointer rows: at its old position it
+// also swallowed ImportCTypes.cpp's two returned-global-address
+// refusals, so a reader ranking this cursor-parameter front was
+// counting returned-pointer work in it. Any use of `p` outside `*p`
 // (including the variant-B `if (p)` guard) stays an escape: the outer
 // pointer has no representation under the `&mut Option<i64>` mapping.
 
