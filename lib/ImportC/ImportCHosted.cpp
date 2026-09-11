@@ -1723,6 +1723,119 @@ FailureOr<Value> CImporter::emitAtofCall(const clang::CallExpr *call) {
   return emitError(loc) << "unsupported: atof result type";
 }
 
+// FR-234 rung 1: the shared NULL-`endptr` guard for the strto* family.
+// Returns success only when `arg` is a null pointer constant; every other
+// spelling gets the rung-2 rejection, whose wording carries the
+// `strtox-endptr` ledger needle.
+LogicalResult CImporter::requireNullEndptr(const clang::CallExpr *call,
+                                           llvm::StringRef name,
+                                           unsigned index) {
+  const clang::Expr *endptr = call->getArg(index);
+  Location loc = translateLoc(endptr->getBeginLoc());
+  if (isNullPointerConstantExpr(endptr))
+    return success();
+  // The location is the ARGUMENT's, not the call's: at a real site the
+  // interesting token is the `&end`, and rung 2's work starts there.
+  return emitError(loc) << "unsupported: " << name
+                        << " with a non-null endptr argument";
+}
+
+FailureOr<Value> CImporter::emitStrtoIntCall(const clang::CallExpr *call,
+                                             llvm::StringRef name,
+                                             bool isUnsigned) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 3)
+    return emitError(loc)
+           << "unsupported: " << name << " requires exactly 3 arguments";
+  // Checked BEFORE the region is emitted so the frontier reads off the
+  // endptr rather than off whatever the region lowering happens to say
+  // about `&end` (which today is the unrelated "taking the address of a
+  // pointer variable").
+  if (failed(requireNullEndptr(call, name, /*index=*/1)))
+    return failure();
+  FailureOr<PtrExprValue> pointer = emitCharRegionArg(call->getArg(0));
+  if (failed(pointer))
+    return failure();
+  FailureOr<Value> slice =
+      emitCharRegionSlice(loc, *pointer, /*isMut=*/false);
+  if (failed(slice))
+    return failure();
+  FailureOr<Value> base = emitRValue(call->getArg(2));
+  if (failed(base))
+    return failure();
+  if (!llvm::isa<IntegerType>((*base).getType()))
+    return emitError(loc) << "unsupported: " << name
+                          << " base must be an integer";
+  Value radix = castToIntType(loc, *base, builder.getI32Type());
+  std::string helper = ("__emitrust_" + name).str();
+  requestStringHelper(helper);
+  // Both wrappers delegate to the shared scan, so it has to be requested
+  // explicitly -- the helper table has no dependency edges and emits
+  // exactly the names that were asked for.
+  requestStringHelper("__emitrust_strto_scan");
+  // The helper's result domain is the C function's own: saturation is
+  // type-directed (LONG_MAX/LONG_MIN vs ULONG_MAX), so a shared i64
+  // image with a cast on top would be a different function.
+  Type helperResult =
+      isUnsigned ? llvm::cast<Type>(IntegerType::get(builder.getContext(), 64,
+                                                     IntegerType::Unsigned))
+                 : llvm::cast<Type>(builder.getIntegerType(64));
+  Value parsed = builder
+                     .create<emitrust::CallOpaqueOp>(
+                         loc, TypeRange{helperResult},
+                         builder.getStringAttr(helper),
+                         /*args=*/ArrayAttr(), ValueRange{*slice, radix})
+                     .getResult(0);
+  // Convert to the call's declared result type; the standard prototype
+  // already says long/unsigned long, but a K&R-style declaration may
+  // differ (matching emitAtoiCall / emitStrlenCall).
+  FailureOr<Type> resultType = mapType(call->getType(), loc);
+  if (failed(resultType))
+    return failure();
+  auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+  if (!intType)
+    return emitError(loc) << "unsupported: " << name << " result type";
+  return castToIntType(loc, parsed, intType);
+}
+
+FailureOr<Value> CImporter::emitStrtodCall(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 2)
+    return emitError(loc)
+           << "unsupported: strtod requires exactly 2 arguments";
+  if (failed(requireNullEndptr(call, "strtod", /*index=*/1)))
+    return failure();
+  // C 7.22.1.1p2: atof(s) IS strtod(s, NULL). Delegating rather than
+  // duplicating is what keeps FR-235's classification (inf/nan parsed,
+  // hex floats and NaN payloads a loud stop) from having a second,
+  // divergent home. The panic text therefore still says `atof:` -- one
+  // helper, one pinned wording.
+  FailureOr<PtrExprValue> pointer = emitCharRegionArg(call->getArg(0));
+  if (failed(pointer))
+    return failure();
+  FailureOr<Value> slice =
+      emitCharRegionSlice(loc, *pointer, /*isMut=*/false);
+  if (failed(slice))
+    return failure();
+  requestStringHelper("__emitrust_atof");
+  Value parsed =
+      builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{builder.getF64Type()},
+              builder.getStringAttr("__emitrust_atof"),
+              /*args=*/ArrayAttr(), ValueRange{*slice})
+          .getResult(0);
+  FailureOr<Type> resultType = mapType(call->getType(), loc);
+  if (failed(resultType))
+    return failure();
+  if (*resultType == parsed.getType())
+    return parsed;
+  if (llvm::isa<Float32Type>(*resultType))
+    return builder.create<arith::TruncFOp>(loc, *resultType, parsed)
+        .getResult();
+  return emitError(loc) << "unsupported: strtod result type";
+}
+
 FailureOr<Value> CImporter::emitDivCall(const clang::CallExpr *call,
                                         llvm::StringRef name) {
   Location loc = translateLoc(call->getBeginLoc());

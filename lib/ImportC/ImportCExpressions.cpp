@@ -2712,6 +2712,22 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     // and NaN-payload forms; no shape of the argument is refused here.
     if (name == "atof")
       return emitAtofCall(call);
+    // FR-234 rung 1: the strto* family with a NULL endptr. strtol and
+    // strtoul are atoi's shape with a runtime base and a type-directed
+    // saturation; strtod is atof EXACTLY (C 7.22.1.1p2 defines atof(s)
+    // as strtod(s, NULL)) and reuses the same helper rather than a copy.
+    // A NON-NULL endptr is rung 2 and gets its own located rejection
+    // inside these, not a silent drop. The wider family -- strtoll,
+    // strtoull, strtoimax, strtof, strtold -- is deliberately NOT here:
+    // each needs its own saturation constants or float width, and an
+    // unverified alias would be exactly the silent divergence this rung
+    // exists to avoid, so they keep the system-header refusal.
+    if (name == "strtol")
+      return emitStrtoIntCall(call, name, /*isUnsigned=*/false);
+    if (name == "strtoul")
+      return emitStrtoIntCall(call, name, /*isUnsigned=*/true);
+    if (name == "strtod")
+      return emitStrtodCall(call);
     // FR-224: div/ldiv/lldiv build their ISO { quot, rem } result from
     // the same divsi/remsi C's `/` and `%` lower to.
     if (name == "div" || name == "ldiv" || name == "lldiv")

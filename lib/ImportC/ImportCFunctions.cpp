@@ -3964,6 +3964,154 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "        Err(_) => 0.0,\n"
        "    }\n"
        "}"},
+      // FR-234 rung 1: C's strtol/strtoul (7.22.1.4) with a NULL endptr.
+      // ONE grammar, two thin wrappers, deliberately: the scan is
+      // identical for both and the ONLY difference is the saturation
+      // limit, so a second copy of the scan would be a second place for
+      // the prefix rules to drift.
+      //
+      // The scan is C's, not Rust's `from_str_radix`, and the gap is not
+      // cosmetic: C converts the LONGEST INITIAL SUBSEQUENCE and ignores
+      // the rest (`42x` is 42), accepts leading whitespace and a sign,
+      // auto-detects the base when `base` is 0, accepts an optional
+      // `0x` prefix at base 16, and SATURATES on overflow. Rust's
+      // `from_str_radix` demands the whole string, rejects whitespace,
+      // rejects the `0x`, and errors instead of saturating -- five
+      // divergences, each of which would be a wrong answer rather than a
+      // refusal.
+      //
+      // THE `0x` PREFIX IS CONDITIONAL, which is the detail an
+      // unconditional two-character skip gets wrong: `0x` with no hex
+      // digit after it is not a prefix at all, so `strtol("0x", 0, 16)`
+      // converts the single `0` and answers 0 rather than converting
+      // nothing.
+      //
+      // OVERFLOW IS TYPE-DIRECTED. C returns LONG_MAX/LONG_MIN from
+      // strtol and ULONG_MAX from strtoul, so the same input string has
+      // two different answers; that is why the limit is a parameter and
+      // not a constant inside the scan. The accumulator keeps CONSUMING
+      // digits after it overflows (the subject sequence is still the
+      // whole run of digits) but stops accumulating, which is also what
+      // rung 2's endptr will need.
+      //
+      // A NEGATIVE INPUT TO strtoul IS DEFINED, not an error: C
+      // 7.22.1.4p5 negates the converted value modulo ULONG_MAX+1, so
+      // `strtoul("-1", 0, 10)` is ULONG_MAX. It reaches that value by a
+      // different route than `strtoul("18446744073709551616", 0, 10)`,
+      // which SATURATES to the same number -- distinguishable only once
+      // errno exists, and the returned values agree, which is what the
+      // byte-diff can see.
+      //
+      // AN OUT-OF-RANGE BASE (not 0 and not 2..=36) is UNDEFINED in C
+      // 7.22.1.4p2. It is REFINED here, not stopped on: the scan
+      // converts nothing and answers 0, which is what this project's
+      // differential oracle (glibc, which also sets EINVAL) does, taking
+      // the same direction `emitAbsCall` takes for abs(INT_MIN). A panic
+      // was considered and rejected -- there is no wrong answer to give
+      // when C gives none, and a new abort class buys nothing.
+      //
+      // errno IS NOT MODELLED anywhere in this importer, so the ERANGE
+      // half of the overflow contract has no image; only the returned
+      // value is reproduced. A program that reads errno after one of
+      // these keeps the system-header rejection on errno itself.
+      {"__emitrust_strto_scan",
+       "fn __emitrust_strto_scan(\n"
+       "    s: &[i8],\n"
+       "    base: i32,\n"
+       "    lim_pos: u64,\n"
+       "    lim_neg: u64,\n"
+       ") -> (u64, bool, bool) {\n"
+       "    if base < 0 || base == 1 || base > 36 {\n"
+       "        return (0, false, false);\n"
+       "    }\n"
+       "    let mut i = 0usize;\n"
+       "    while i < s.len() {\n"
+       "        let b = s[i] as u8;\n"
+       "        if b != b' ' && (b < 9 || b > 13) {\n"
+       "            break;\n"
+       "        }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    let mut neg = false;\n"
+       "    if i < s.len() && (s[i] as u8 == b'+' || s[i] as u8 == b'-') {\n"
+       "        neg = s[i] as u8 == b'-';\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    let mut radix = base as u32;\n"
+       "    if radix == 0 || radix == 16 {\n"
+       "        let hex = i + 2 < s.len()\n"
+       "            && s[i] as u8 == b'0'\n"
+       "            && ((s[i + 1] as u8) | 32) == b'x'\n"
+       "            && (s[i + 2] as u8).is_ascii_hexdigit();\n"
+       "        if hex {\n"
+       "            radix = 16;\n"
+       "            i += 2;\n"
+       "        } else if radix == 0 {\n"
+       "            radix = if i < s.len() && s[i] as u8 == b'0' { 8 } else { "
+       "10 };\n"
+       "        }\n"
+       "    }\n"
+       "    let limit = if neg { lim_neg } else { lim_pos };\n"
+       "    let cutoff = limit / radix as u64;\n"
+       "    let cutlim = limit % radix as u64;\n"
+       "    let mut acc = 0u64;\n"
+       "    let mut any = false;\n"
+       "    let mut ovf = false;\n"
+       "    while i < s.len() {\n"
+       "        let b = s[i] as u8;\n"
+       "        let d = if b.is_ascii_digit() {\n"
+       "            (b - b'0') as u32\n"
+       "        } else if b.is_ascii_lowercase() {\n"
+       "            (b - b'a') as u32 + 10\n"
+       "        } else if b.is_ascii_uppercase() {\n"
+       "            (b - b'A') as u32 + 10\n"
+       "        } else {\n"
+       "            99\n"
+       "        };\n"
+       "        if d >= radix {\n"
+       "            break;\n"
+       "        }\n"
+       "        any = true;\n"
+       "        if !ovf {\n"
+       "            if acc > cutoff || (acc == cutoff && d as u64 > cutlim) {\n"
+       "                ovf = true;\n"
+       "            } else {\n"
+       "                acc = acc * radix as u64 + d as u64;\n"
+       "            }\n"
+       "        }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    if !any {\n"
+       "        return (0, false, false);\n"
+       "    }\n"
+       "    (acc, neg, ovf)\n"
+       "}"},
+      {"__emitrust_strtol",
+       "fn __emitrust_strtol(s: &[i8], base: i32) -> i64 {\n"
+       "    let (acc, neg, ovf) =\n"
+       "        __emitrust_strto_scan(s, base, i64::MAX as u64, 1u64 << 63);\n"
+       "    if ovf {\n"
+       "        return if neg { i64::MIN } else { i64::MAX };\n"
+       "    }\n"
+       "    if neg {\n"
+       "        acc.wrapping_neg() as i64\n"
+       "    } else {\n"
+       "        acc as i64\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_strtoul",
+       "fn __emitrust_strtoul(s: &[i8], base: i32) -> u64 {\n"
+       "    let (acc, neg, ovf) =\n"
+       "        __emitrust_strto_scan(s, base, u64::MAX, u64::MAX);\n"
+       "    if ovf {\n"
+       "        return u64::MAX;\n"
+       "    }\n"
+       "    if neg {\n"
+       "        acc.wrapping_neg()\n"
+       "    } else {\n"
+       "        acc\n"
+       "    }\n"
+       "}"},
       // FR-224: strcspn/strspn (7.21.5.3/7.21.5.6) -- the length of the
       // initial segment of s1 consisting entirely of bytes NOT in / IN
       // s2. Both regions are read to their NUL; the backing of every
