@@ -4180,6 +4180,43 @@ private:
   /// produce located diagnostics at the offending construct.
   LogicalResult emitPointerLocal(const clang::VarDecl *var, Location loc);
 
+  /// FR-238: the pointer local that expression statement `expr` reads while
+  /// it is provably INDETERMINATE on every path, or null.
+  ///
+  /// `char *data; printLine(data);` reads a pointer that was never written
+  /// anywhere in its function. The lvalue-to-rvalue conversion of an
+  /// indeterminate pointer is C undefined behaviour (C11 6.3.2.1p2, Annex
+  /// J.2), so ANY behaviour conforms and `emitStmt` replaces the whole
+  /// statement with a deterministic panic -- the same refinement this
+  /// importer already applies to a null dereference and to a mistyped
+  /// `va_arg`. It never invents a value: the pointer keeps its empty
+  /// decomposition and nothing downstream of the panic is emitted.
+  ///
+  /// The claim "indeterminate on every path" is made WITHOUT dataflow, and
+  /// deliberately so, by requiring the variable to be written NOWHERE in
+  /// the function -- two independent checks that must agree:
+  ///
+  ///   * the region analysis recorded nothing at all for it (every
+  ///     assignment binds or unites, every `++`/`+=` records arithmetic,
+  ///     every `&p` invalidates or binds a second-order target, and each of
+  ///     those materializes a region), and
+  ///   * no syntactic write -- assignment, increment, or address-of --
+  ///     appears anywhere under `currentFunctionBody`.
+  ///
+  /// The blind spots differ (the analysis sees a write through a
+  /// second-order alias that the scan cannot; the scan sees a spelling the
+  /// analysis might stop recording), so agreement is the guard. Anything
+  /// less conclusive keeps the historical "has no known target object"
+  /// rejection: a panic on a DEFINED path would be a miscompile, strictly
+  /// worse than refusing.
+  ///
+  /// Scope is the EXPRESSION STATEMENT, not the function: a read under an
+  /// `if` leaves the other arm defined, so a function-entry panic would
+  /// miscompile it. Within the statement, any short-circuit operator,
+  /// conditional operator, or statement expression makes evaluation of the
+  /// read itself conditional, and those stay refused.
+  const clang::VarDecl *uninitializedPointerRead(const clang::Expr *expr);
+
   /// Emits the declaration of a second-order pointer local (`T **pp`,
   /// CTS-P5). The accepted shape is the degenerate one-cell region of
   /// cursor cells: `pp` statically selects a single first-order pointer

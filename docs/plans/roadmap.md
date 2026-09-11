@@ -9,14 +9,16 @@ this document, they win** — this one summarises, they record.
 
 | | |
 |---|---|
-| **TRACTOR PASS** | **60 / 252** (exec 24, lib 36) |
-| EMIT-cleared | 74 / 252 |
+| **TRACTOR PASS** | **64 / 252** (exec 26, lib 38) |
+| EMIT-cleared | 78 / 252 |
 | SYMBOL_MISSING | 13 — emit clean, export refused |
 | VACUOUS_PASS | 1 (`update_md5_lib`; its only vector is `has_ub` and skipped) |
 
-One session moved this **41 → 60**: FR-224's libc shim table (+4), FR-229's
+One session moved this **41 → 64**: FR-224's libc shim table (+4), FR-229's
 char-pointer byte view in three waves (+5, +5, +2), FR-230's `alloca` (+2) and
-`strchr` cursor bind (+1). FR-228 and FR-232 landed at +0 PASS by design.
+`strchr` cursor bind (+1), and FR-238's uninitialized-pointer panic (+4).
+FR-228, FR-232, FR-235, FR-236 and FR-234 rungs 1-2 landed at +0 PASS by
+design — each is recorded as such so no reader infers yield from them.
 
 ### The denominator is not what it looks like
 
@@ -201,8 +203,14 @@ a singleton with methods — so the machinery to lift it already exists and
 FR-179's actor path already handles singletons. The likeliest real work is
 deciding the singleton's construction, not inventing a model.
 
-**`pointer variable has no known target object` — 011/012, 4 cases (exec + lib).
-Now the best ratio on the board: 4 cases behind ONE blocker.** All four are
+**~~`pointer variable has no known target object` — 011/012~~ · DONE, +4 PASS.**
+Landed as FR-238 — the predicted +4 EMIT and +4 PASS both measured. The panic
+goes at the USE widened to the enclosing statement, never at function entry
+(which miscompiles a guarded defined path). Its first cut broke c-testsuite
+00219 because C11 6.5.1.1p3 leaves a `_Generic` controlling expression
+*unevaluated* while clang's AST still spells it with an `LValueToRValue` cast —
+a defined program panicked, and `cargo build` was clean throughout.
+Original entry:** All four are
 depth 1, all four ship a real vector beside the skipped `has_ub` one, and both
 `_lib` halves export (`driver`, `exact`, plain `no_mangle`). **Read the vectors
 before touching it, though.** The C is

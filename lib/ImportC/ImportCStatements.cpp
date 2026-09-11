@@ -37,6 +37,140 @@ using namespace mlir;
 // Statements
 //===----------------------------------------------------------------------===//
 
+/// FR-238: whether `stmt` contains a construct whose sub-expressions are
+/// evaluated CONDITIONALLY -- a short-circuit `&&`/`||`, a conditional
+/// operator, or a statement expression. An expression statement free of all
+/// three evaluates every leaf of its tree exactly when the statement is
+/// entered, which is what lets `uninitializedPointerRead`'s panic inherit
+/// the reachability of the undefined behaviour it replaces.
+static bool hasConditionalEvaluation(const clang::Stmt *stmt) {
+  if (!stmt)
+    return false;
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(stmt))
+    if (binary->getOpcode() == clang::BO_LAnd ||
+        binary->getOpcode() == clang::BO_LOr)
+      return true;
+  if (llvm::isa<clang::AbstractConditionalOperator>(stmt) ||
+      llvm::isa<clang::StmtExpr>(stmt))
+    return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (hasConditionalEvaluation(child))
+      return true;
+  return false;
+}
+
+/// FR-238: whether `stmt` anywhere WRITES the variable `var` -- assigns it,
+/// walks it with `++`/`--`, or takes its address (which hands the write to
+/// some other party). The redundant half of the never-written proof; see
+/// `uninitializedPointerRead` for why both halves are required.
+static bool writesVar(const clang::Stmt *stmt, const clang::VarDecl *var) {
+  if (!stmt)
+    return false;
+  auto namesVar = [&](const clang::Expr *expr) {
+    const auto *ref =
+        llvm::dyn_cast<clang::DeclRefExpr>(expr->IgnoreParenImpCasts());
+    return ref && ref->getDecl()->getCanonicalDecl() == var->getCanonicalDecl();
+  };
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(stmt)) {
+    if (binary->isAssignmentOp() && namesVar(binary->getLHS()))
+      return true;
+  } else if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt)) {
+    if ((unary->isIncrementDecrementOp() ||
+         unary->getOpcode() == clang::UO_AddrOf) &&
+        namesVar(unary->getSubExpr()))
+      return true;
+  } else if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt)) {
+    // `char *q = data;` is a read of `data`, but the DECLARATION of `var`
+    // itself carrying an initializer is a write of `var`.
+    for (const clang::Decl *decl : declStmt->decls())
+      if (const auto *declared = llvm::dyn_cast<clang::VarDecl>(decl))
+        if (declared->getCanonicalDecl() == var->getCanonicalDecl() &&
+            declared->getInit())
+          return true;
+  }
+  for (const clang::Stmt *child : stmt->children())
+    if (writesVar(child, var))
+      return true;
+  return false;
+}
+
+/// FR-238: collects every pointer-typed local variable `stmt` READS -- a
+/// `DeclRefExpr` under an lvalue-to-rvalue conversion, which is exactly the
+/// conversion C11 6.3.2.1p2 makes undefined for an indeterminate object.
+/// `&p` and the left side of `p = q` carry no such conversion and are
+/// therefore not reads, which is the point.
+///
+/// UNEVALUATED OPERANDS ARE NOT READS, and this is not a nicety: c-testsuite
+/// 00219 declares `const int * const ptr;` and never initializes it, then
+/// asks `_Generic(ptr, int *:1, int * const:2, default:20)`. C11 6.5.1.1p3
+/// says the controlling expression of a generic selection IS NOT EVALUATED
+/// -- the program is perfectly well-defined and prints 20 -- yet clang's AST
+/// still spells the operand with an lvalue-to-rvalue cast, because the
+/// selection is made on the CONVERTED type. Counting that as a read panicked
+/// a defined program; the byte-diff caught it. `sizeof`/`_Alignof` operands
+/// and `offsetof` are the same shape. Skipping a subtree can only LOSE a
+/// panic, never manufacture one, so this is the safe direction.
+static void collectPointerVarReads(
+    const clang::Stmt *stmt,
+    llvm::SmallVectorImpl<const clang::VarDecl *> &reads) {
+  if (!stmt)
+    return;
+  if (llvm::isa<clang::UnaryExprOrTypeTraitExpr>(stmt) ||
+      llvm::isa<clang::OffsetOfExpr>(stmt))
+    return;
+  if (const auto *generic = llvm::dyn_cast<clang::GenericSelectionExpr>(stmt)) {
+    // Only the selected association is evaluated; the controlling
+    // expression never is. A type-dependent selection has no result yet and
+    // is left entirely alone.
+    if (!generic->isResultDependent())
+      collectPointerVarReads(generic->getResultExpr(), reads);
+    return;
+  }
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(stmt))
+    if (cast->getCastKind() == clang::CK_LValueToRValue)
+      if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+              cast->getSubExpr()->IgnoreParens()))
+        if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+          if (var->getType().getCanonicalType()->isPointerType())
+            reads.push_back(var);
+  for (const clang::Stmt *child : stmt->children())
+    collectPointerVarReads(child, reads);
+}
+
+const clang::VarDecl *
+CImporter::uninitializedPointerRead(const clang::Expr *expr) {
+  // A conditionally evaluated read may never happen, and the path on which
+  // it does not is perfectly defined. Refuse rather than guess.
+  if (hasConditionalEvaluation(expr))
+    return nullptr;
+  llvm::SmallVector<const clang::VarDecl *, 2> reads;
+  collectPointerVarReads(expr, reads);
+  for (const clang::VarDecl *var : reads) {
+    // Only an automatic local is ever indeterminate: a static or global
+    // pointer is zero-initialized, and a parameter carries its argument.
+    if (!var->hasLocalStorage() || llvm::isa<clang::ParmVarDecl>(var))
+      continue;
+    if (var->getInit())
+      continue;
+    // A pointer-to-pointer, a node-pool handle, an integer carrier, and
+    // anything that already materialized runtime state all have a modeled
+    // value; only a first-order pointer the analysis knows NOTHING about is
+    // a candidate.
+    if (!pointerRegions.tracks(var) || pointerRegions.regionOf(var))
+      continue;
+    if (pointerRegions.tracksSecondOrder(var) || poolHandleVars.contains(var))
+      continue;
+    if (pointerLocals.count(var) || carrierLocals.count(var))
+      continue;
+    if (addressTaken.contains(var))
+      continue;
+    if (writesVar(currentFunctionBody, var))
+      continue;
+    return var;
+  }
+  return nullptr;
+}
+
 LogicalResult CImporter::emitStmt(const clang::Stmt *stmt) {
   // Belt-and-suspenders: a body-less function (e.g. an explicitly defaulted
   // special member whose `getBody()` is null) must never reach the statement
@@ -194,8 +328,24 @@ LogicalResult CImporter::emitStmt(const clang::Stmt *stmt) {
     builder.setInsertionPointToEnd(block);
     return emitStmt(switchCase->getSubStmt());
   }
-  if (const auto *expr = llvm::dyn_cast<clang::Expr>(stmt))
+  if (const auto *expr = llvm::dyn_cast<clang::Expr>(stmt)) {
+    // FR-238: an expression statement that unconditionally reads a pointer
+    // local written NOWHERE in the function is C undefined behaviour, and
+    // this tree refines it into a deterministic panic instead of refusing
+    // the translation unit. The statement is replaced WHOLE -- no argument
+    // is evaluated, no address is fabricated -- and the Rust emitter's
+    // diverging-callee rule truncates the rest of the block behind it.
+    // Every path that does not enter this statement is untouched.
+    if (const clang::VarDecl *uninit = uninitializedPointerRead(expr)) {
+      Attribute message = builder.getStringAttr(
+          ("read of uninitialized pointer '" + uninit->getName() + "'").str());
+      builder.create<emitrust::CallOpaqueOp>(
+          loc, TypeRange(), builder.getStringAttr("panic!"),
+          builder.getArrayAttr({message}), ValueRange());
+      return success();
+    }
     return emitExprStmt(expr);
+  }
   return emitError(loc) << "unsupported statement: "
                         << stmt->getStmtClassName();
 }
