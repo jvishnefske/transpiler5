@@ -15252,6 +15252,25 @@ piece and becomes FR-45.
   (`SAME=976 MOVED=0 BOTHFAIL=387 NEWLY_EMITS=1`, the 1 being its own test).
   All anchors confirmed and each one fired on real input -- no anchor defect
   this wave, the first time this session.
+  **RE-MEASURED AFTER RUNG 3 LANDED, WHICH IS WHAT THIS ENTRY SAID TO DO
+  INSTEAD OF FORECASTING. Only ONE of the three remaining programs became
+  visible.**
+  * **`006_static_alias`: argv now ADMITS**, and its body imported for the
+    first time. `--recover` shows **1 stub, 2 blockers**: `returned pointer
+    value` and `pointer assigned a non-address value`. Depth is now a real
+    measurement rather than a guess.
+  * **`003_string_slicing`: still at the argv wall**, 0 stubs, `main` still
+    dropped whole -- it needs forms 3, 4 and 6 (`strlen(argv[i])`,
+    `argv[i] + k`, and `%.*s`, the last a separate live refusal). **Its depth
+    remains unmeasurable.**
+  * **`008_long_run`: still at the argv wall**, 0 stubs, and it needs
+    **EXACTLY ONE form -- form 5, `fprintf(stderr, "...%s...", argv[i])`.**
+    Its other use is form 1, already admitted. That makes 008 the cheapest
+    remaining argv item by a wide margin, and its depth behind the gate is
+    still unknown.
+  The pattern holds: clearing a gate does not reveal what is behind it for the
+  cases still stuck ON the gate. Each of the three needs its own form before
+  anything can be said about its residue.
   ACCEPTANCE: `strtol`/`strtoul`/`strtod` with a NULL `endptr` over a char
   region, byte-identical to the clang native on a differential vector set
   including overflow (`ERANGE` clamping to `LONG_MAX`/`LONG_MIN`), leading
