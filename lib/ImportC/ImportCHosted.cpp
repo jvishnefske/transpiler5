@@ -675,6 +675,15 @@ CImporter::emitCharRegionArg(const clang::Expr *expr) {
       break;
     e = stripTrivia(cast->getSubExpr());
   }
+  // FR-234 rung 3 (form 1): a whole-value `argv[i]` as the char region of
+  // a hosted conversion. The argv table is not a modeled C object, so the
+  // pointer decomposition below has nothing to root it at; the borrow is
+  // the FR-72 slice-place shape instead, and the region carries the argv
+  // index so a joined `endptr` can be checked against it. Placed before
+  // every other arm because `argv[i]` is a SUBSCRIPT, which the decay and
+  // parameter arms would misread.
+  if (const clang::Expr *argvIndexExpr = matchArgvWholeSubscript(e))
+    return emitArgvRegionArg(loc, argvIndexExpr);
   // FR-88: a NULLABLE byte-slice parameter used as a byte-family region.
   // The guard-dominance scan already proved every such use sits under a
   // proven null guard, so the value is unwrapped AT the use site — the
@@ -1767,6 +1776,31 @@ LogicalResult CImporter::emitStrtoEndptrWrite(Location loc,
     return emitError(loc) << "unsupported: " << name
                           << " endptr must walk the parsed string's region";
   const PointerLocalInfo &info = it->second;
+  // FR-234 rung 3: an argv-rooted subject string. The two region kinds are
+  // checked as a PAIR -- an argv endptr with a non-argv subject (or the
+  // reverse) keeps the rung-2 refusal -- and the WRITE stores both halves
+  // of the answer: which argv argument was parsed and how far into it the
+  // scan got. Storing only the offset would leave the pointer walking
+  // whichever argument it selected last, which is exactly what 006's
+  // second `strtol(argv[2], &end, 10)` would hit.
+  if (info.argvIndexCell || region.argvIndex) {
+    if (!info.argvIndexCell || !region.argvIndex || !info.cursorCell ||
+        !region.cursor || info.base || region.base || info.member ||
+        region.member || info.literalBacking || region.literalBacking ||
+        info.backing || region.backing || !info.multiBases.empty() ||
+        region.baseIndex)
+      return emitError(loc) << "unsupported: " << name
+                            << " endptr must walk the parsed string's region";
+    Value argvAbsolute =
+        builder.create<arith::AddIOp>(loc, region.cursor, offset).getResult();
+    if (info.nonNullCell)
+      builder.create<memref::StoreOp>(loc, createBoolConstant(loc, true),
+                                      info.nonNullCell);
+    builder.create<memref::StoreOp>(loc, region.argvIndex,
+                                    info.argvIndexCell);
+    builder.create<memref::StoreOp>(loc, argvAbsolute, info.cursorCell);
+    return success();
+  }
   // The cursor C hands back is an offset into ARGUMENT 0's region. A
   // pointer that walks anything else -- a different object, a multi-base
   // region (CTS-P7), a member-rooted or heap-backed one that argument 0

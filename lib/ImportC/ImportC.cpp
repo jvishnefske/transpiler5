@@ -581,6 +581,10 @@ void mergeRegionFacts(PointerRegion &target,
     target.nullableLoc = absorbed.nullableLoc;
   }
   target.hasConditionalSource |= absorbed.hasConditionalSource;
+  if (absorbed.argvRooted && !target.argvRooted) {
+    target.argvRooted = true;
+    target.argvLoc = absorbed.argvLoc;
+  }
   if (absorbed.hasCarrierSource && !target.hasCarrierSource) {
     target.hasCarrierSource = true;
     target.carrierLoc = absorbed.carrierLoc;
@@ -597,6 +601,18 @@ void mergeRegionFacts(PointerRegion &target,
       target.invalidReason.empty()) {
     target.invalidReason = "unsupported: pointer assigned a non-address value";
     target.invalidLoc = target.carrierLoc;
+  }
+  // FR-234 rung 3: the same straddle for an argv-rooted region -- a union
+  // (`char *q = end;` where `end` walks `argv[1]` and `q` also binds a
+  // local array) joins storage the argv lowering has no representation
+  // for. Refuse at the argv binding site rather than pick a model.
+  if (target.argvRooted &&
+      (!target.bases.empty() || target.literalBase || target.allocSite ||
+       target.hasCarrierSource) &&
+      target.invalidReason.empty()) {
+    target.invalidReason = "unsupported: pointer joins main's argv with "
+                           "another object into one region";
+    target.invalidLoc = target.argvLoc;
   }
 }
 
@@ -654,6 +670,12 @@ void PointerRegionAnalysis::addBase(const clang::VarDecl *ptr,
   if (region.hasCarrierSource)
     return markInvalid(ptr, region.carrierLoc,
                        "unsupported: pointer assigned a non-address value");
+  // FR-234 rung 3: the argv table is not a modeled C object (see
+  // `recordArgvBase`); an object base cannot join it.
+  if (region.argvRooted)
+    return markInvalid(ptr, loc,
+                       "unsupported: pointer joins main's argv with another "
+                       "object into one region");
   bool known = llvm::any_of(region.bases,
                             [&](const PointerBaseBinding &existing) {
                               return existing.base == base &&
@@ -667,6 +689,11 @@ void PointerRegionAnalysis::addLiteralBase(const clang::VarDecl *ptr,
                                            const clang::StringLiteral *literal,
                                            clang::SourceLocation loc) {
   PointerRegion &region = regionFor(ptr);
+  // FR-234 rung 3: nor an argv-rooted one (see `recordArgvBase`).
+  if (region.argvRooted)
+    return markInvalid(ptr, loc,
+                       "unsupported: pointer joins main's argv with another "
+                       "object into one region");
   // A literal binding cannot join an integer-carrier region (CTS-P3).
   if (region.hasCarrierSource)
     return markInvalid(ptr, region.carrierLoc,
@@ -699,6 +726,30 @@ void PointerRegionAnalysis::recordNullable(const clang::VarDecl *ptr,
   }
 }
 
+void PointerRegionAnalysis::recordArgvBase(const clang::VarDecl *ptr,
+                                           clang::SourceLocation loc) {
+  // A GLOBAL pointer rooted in argv would outlive nothing (the table is
+  // alive for the whole program) but has no CTS-P4 lowering: the global
+  // machinery stores a cursor symbol and knows nothing about a runtime
+  // index. Keep the historical rejection.
+  if (!ptr->hasLocalStorage())
+    return markInvalid(ptr, loc,
+                       "unsupported: pointer assigned a non-address value");
+  PointerRegion &region = regionFor(ptr);
+  // An argv argument's bytes are not a modeled C object, so a region that
+  // also binds one (or a literal, an allocation, or an integer carrier)
+  // has no single representation. Refuse rather than pick one.
+  if (!region.bases.empty() || region.literalBase || region.allocSite ||
+      region.hasCarrierSource)
+    return markInvalid(ptr, loc,
+                       "unsupported: pointer joins main's argv with another "
+                       "object into one region");
+  if (!region.argvRooted) {
+    region.argvRooted = true;
+    region.argvLoc = loc;
+  }
+}
+
 void PointerRegionAnalysis::recordCarrierSource(const clang::VarDecl *ptr,
                                                 clang::SourceLocation loc) {
   // A global pointer never carries integers: its program-wide facts feed
@@ -709,8 +760,10 @@ void PointerRegionAnalysis::recordCarrierSource(const clang::VarDecl *ptr,
                        "unsupported: pointer assigned a non-address value");
   PointerRegion &region = regionFor(ptr);
   // A carrier source into a region that already binds a real address
-  // base, string literal, or allocation straddles the two models.
-  if (!region.bases.empty() || region.literalBase || region.allocSite)
+  // base, string literal, allocation, or argv argument straddles the two
+  // models.
+  if (!region.bases.empty() || region.literalBase || region.allocSite ||
+      region.argvRooted)
     return markInvalid(ptr, loc,
                        "unsupported: pointer assigned a non-address value");
   if (!region.hasCarrierSource) {
@@ -1308,6 +1361,18 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
         }
       }
     }
+
+  // FR-234 rung 3: `argv[i]` as a pointer source. This reaches
+  // `recordPointerWrite` ONLY through the hosted `strto*` endptr join
+  // above (`argvElementQuery` is armed only for an ADMITTED `main`, whose
+  // planning grammar admits no other argv source shape), so the region
+  // roots in the argv table: the cursor the callee hands back is a byte
+  // offset into argument `i`'s own run. Placed before the cast switch
+  // because `argv[i]` arrives under its own lvalue-to-rvalue cast, which
+  // the switch's `p = q` arm would otherwise fall past into the
+  // non-address rejection.
+  if (argvElementQuery && argvElementQuery(e))
+    return recordArgvBase(ptr, loc);
 
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
     switch (cast->getCastKind()) {
@@ -3577,7 +3642,12 @@ FailureOr<Value> CImporter::emitPointerTruth(const clang::Expr *expr) {
   // empty decomposition) folds to false.
   if (pointer->nonNull)
     return pointer->nonNull;
-  if (!pointer->base && !pointer->literalBacking && !pointer->baseIndex)
+  // FR-234 rung 3: an argv-rooted pointer is base-less like a
+  // statically-null one but is never null -- C 7.22.1.4p7 stores a pointer
+  // INTO the subject string on every path, no-conversion included. Without
+  // this screen `if (end)` folded to FALSE, a silent wrong answer.
+  if (!pointer->base && !pointer->literalBacking && !pointer->baseIndex &&
+      !pointer->argvIndex)
     return createBoolConstant(loc, false);
   return createBoolConstant(loc, true);
 }
@@ -3639,6 +3709,11 @@ CImporter::emitPointerLocalRead(Location loc, const clang::VarDecl *var) {
                      nonNull,     baseIndex, info.multiBases};
   value.member = info.member;
   value.backing = info.backing;
+  // FR-234 rung 3: an argv-rooted pointer additionally carries WHICH argv
+  // argument it currently walks; the pair (index, cursor) is its whole
+  // runtime state.
+  if (info.argvIndexCell)
+    value.argvIndex = loadPlace(loc, info.argvIndexCell);
   return value;
 }
 
@@ -3700,6 +3775,20 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
                  << "unsupported: pointer struct member '"
                  << field->getName() << "' bound to a string literal";
         return PtrExprValue{(*binding)->base, Value()};
+      }
+      // FR-234 rung 3: a whole-value `argv[i]` read decomposes to (argv
+      // index i, cursor 0) -- the base of argument i's own byte run. The
+      // slice itself is NOT materialized here: only the char-region
+      // channel needs one, and emitting an `emitrust.argv_arg` for every
+      // `end == argv[i]` test would leave a dead borrow in the output.
+      if (const clang::Expr *argvIndexExpr =
+              matchArgvWholeSubscript(cast->getSubExpr())) {
+        FailureOr<Value> index = emitRValue(argvIndexExpr);
+        if (failed(index))
+          return failure();
+        PtrExprValue value{nullptr, createIntConstant(loc, cursorType, 0)};
+        value.argvIndex = castToIntType(loc, *index, cursorType);
+        return value;
       }
       // A read of a pointer local: its base is static, its cursor is the
       // current value of the cursor cell (none for a degenerate base).
@@ -4325,6 +4414,15 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
                                              const PtrExprValue &pointer,
                                              Type pointeeType,
                                              GlobalWriteback *writeback) {
+  // FR-234 rung 3: an argv-rooted pointer designates a byte of a runtime
+  // argv argument. The read is representable (`argv[i][cursor]`) but is
+  // outside the admitted rung-3 grammar -- forms 1 and 2 only -- and it
+  // must NOT fall into the only-ever-null rejection below, which would
+  // name the wrong reason. A located refusal here is the floor; nothing
+  // silently resolves to the wrong place.
+  if (pointer.argvIndex)
+    return emitError(loc) << "unsupported: dereference of a pointer into "
+                             "main's argv";
   // A pointer of a nullable region that was never bound to any object can
   // only ever hold the null constant; it has no place to designate.
   if (!pointer.base && !pointer.literalBacking && !pointer.baseIndex &&

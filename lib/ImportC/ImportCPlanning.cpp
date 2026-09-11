@@ -3450,14 +3450,74 @@ static bool admittedPrintfStringArg(const clang::CallExpr *call,
          !directives[position].hasWidth;
 }
 
-/// Classifies ONE argv reference against the C99-43 C3 admitted read
-/// grammar: `argv[i]` whole-value as a direct-printf `%s`/`%.Ns`
-/// argument, or `argv[i][j]` consumed as a VALUE (any lvalue-to-rvalue
-/// context: comparisons, arithmetic, `%d`/`%c` holes, scalar
-/// initializers). Everything else — stores, other calls, address-of,
-/// `argv` arithmetic (`argv++`, `argv+1`, bare `*argv`), writes,
-/// pointer-value tests (`argv[0] != 0`) — is not admitted.
-static bool argvUseAdmitted(const clang::DeclRefExpr *ref,
+/// FR-234 rung 3 (form 1): whether `call` is a hosted `strtol`/`strtoul`/
+/// `strtod` -- definition-less, right arity -- with `argNode` in the
+/// SUBJECT-STRING position (argument 0). The name/definition/arity gate is
+/// `hostedEndptrCoIndex`'s verbatim: the three places that have to agree
+/// on which calls are hosted are this admission, the region join, and the
+/// call lowering, and a project that supplies its own `strtol` gets an
+/// ordinary call to its own code with the historical argv rejection.
+static bool admittedStrtoSubjectArg(const clang::CallExpr *call,
+                                    const clang::Stmt *argNode) {
+  const clang::FunctionDecl *callee = call->getDirectCallee();
+  if (!callee || callee->getDefinition() ||
+      !callee->getDeclName().isIdentifier())
+    return false;
+  if (call->getNumArgs() == 0 || call->getArg(0) != argNode)
+    return false;
+  llvm::StringRef name = callee->getName();
+  if ((name == "strtol" || name == "strtoul") && call->getNumArgs() == 3)
+    return true;
+  return name == "strtod" && call->getNumArgs() == 2;
+}
+
+/// FR-234 rung 3 (form 2): whether `argNode` is an operand of an EQUALITY
+/// comparison against another pointer -- `end == argv[i]`, the "nothing
+/// was converted" test C 7.22.1.4p7 makes the only portable way to detect
+/// a failed `strtol`. Ordered comparisons are excluded: C defines them
+/// only within one object, and which argv argument the other side walks is
+/// a runtime fact.
+///
+/// A NULL-POINTER-CONSTANT other side is excluded, and that exclusion is
+/// LOAD-BEARING rather than scope trimming. `argv[argc]` IS a null pointer
+/// (C 5.1.2.2.1p2), so `argv[i] == NULL` is a genuine runtime question,
+/// while the argv decomposition here has no null state at all and would
+/// fold the test to a constant -- the wrong constant for `i == argc`. It
+/// also keeps `test/Import/C/main-args.c`'s pinned `argv[0] != 0`
+/// rejection exactly where it was.
+static bool admittedArgvPointerEquality(clang::ASTContext &ctx,
+                                        const clang::BinaryOperator *op,
+                                        const clang::Stmt *argNode) {
+  if (op->getOpcode() != clang::BO_EQ && op->getOpcode() != clang::BO_NE)
+    return false;
+  if (op->getLHS() != argNode && op->getRHS() != argNode)
+    return false;
+  const clang::Expr *other =
+      op->getLHS() == argNode ? op->getRHS() : op->getLHS();
+  if (!other->getType()->isPointerType())
+    return false;
+  return other->isNullPointerConstant(ctx,
+                                      clang::Expr::NPC_NeverValueDependent) ==
+         clang::Expr::NPCK_NotNull;
+}
+
+/// Classifies ONE argv reference against the admitted read grammar:
+/// `argv[i]` whole-value as a direct-printf `%s`/`%.Ns` argument (C99-43
+/// C3), as the subject string of a hosted `strtol`/`strtoul`/`strtod`
+/// (FR-234 rung 3, form 1), or as an operand of a pointer EQUALITY test
+/// (rung 3, form 2); or `argv[i][j]` consumed as a VALUE (any
+/// lvalue-to-rvalue context: comparisons, arithmetic, `%d`/`%c` holes,
+/// scalar initializers). Everything else — stores, other calls,
+/// address-of, `argv` arithmetic (`argv++`, `argv+1`, bare `*argv`),
+/// writes, `%s` to anything but a direct `printf` — is not admitted.
+///
+/// THE RULE IS ALL-OR-NOTHING (see `planArgvUsesFor`): one unadmitted use
+/// abandons the whole table and the historical signature-time rejection
+/// stands, so widening this set is the only thing that can make argv
+/// import at all -- and a use that slips in here without a lowering would
+/// be a silent behaviour change rather than a located refusal.
+static bool argvUseAdmitted(clang::ASTContext &ctx,
+                            const clang::DeclRefExpr *ref,
                             const StmtParentMap &parents) {
   // `argv` itself must be the BASE of a subscript (crossing its own
   // lvalue-to-rvalue read of the pointer value).
@@ -3477,7 +3537,11 @@ static bool argvUseAdmitted(const clang::DeclRefExpr *ref,
     return climbTrivia(sub2, parents).sawLValueToRValue;
   }
   if (const auto *call = llvm::dyn_cast<clang::CallExpr>(fromSub1.parent))
-    return admittedPrintfStringArg(call, fromSub1.argNode);
+    return admittedPrintfStringArg(call, fromSub1.argNode) ||
+           admittedStrtoSubjectArg(call, fromSub1.argNode);
+  if (const auto *binary =
+          llvm::dyn_cast<clang::BinaryOperator>(fromSub1.parent))
+    return admittedArgvPointerEquality(ctx, binary, fromSub1.argNode);
   return false;
 }
 
@@ -3512,7 +3576,7 @@ LogicalResult CImporter::planArgvUsesFor(const clang::FunctionDecl *func) {
   if (refs.empty())
     return success();
   for (const clang::DeclRefExpr *ref : refs)
-    if (!argvUseAdmitted(ref, parents))
+    if (!argvUseAdmitted(astContext(), ref, parents))
       return success();
   mainArgvAdmittedParam = argvParam;
   return success();

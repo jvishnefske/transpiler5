@@ -88,6 +88,17 @@ struct BlockerSubstring {
 };
 constexpr BlockerSubstring kBlockerSubstrings[] = {
     {llvm::StringLiteral("use of main's argv"), llvm::StringLiteral("argv")},
+    // FR-234 rung 3: argv's SUBJECT-STRING and pointer-EQUALITY forms now
+    // import, so a program that still refuses over argv is refusing a
+    // pointer INTO an argv argument (a dereference, a write through it, a
+    // join with another object, a null binding, an ordered comparison) --
+    // a different piece of work from "argv is not modelled at all", and it
+    // must not fall into `other` now that the signature-time wording no
+    // longer fires for it. Placed immediately after the historical entry
+    // so first-match-wins keeps the `argv` tag byte-identical for the
+    // signature refusal. Mirrors test/RealWorld/run_realworld.py.
+    {llvm::StringLiteral("main's argv"),
+     llvm::StringLiteral("argv-pointer")},
     // C99-43 slice 1: the cursor-parameter rejections split out of the
     // generic ptr-to-ptr bucket, listed ABOVE it so first-match-wins
     // routes them (every wording also contains "pointer-to-pointer" or

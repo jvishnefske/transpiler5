@@ -521,6 +521,15 @@ struct PtrExprValue {
   /// panic-free unwrap sits inside the proven null guard by construction.
   /// Null for every other pointer value.
   Value slicePlace;
+  /// FR-234 rung 3: the i64 argv-table index of a pointer into `main`'s
+  /// admitted `argv` region -- `argv[i]`'s own index, or the index cell of
+  /// a pointer (a `strto*` `endptr`) that walks one argv argument's bytes.
+  /// An argv-rooted pointer is base-less like a string-literal one, but its
+  /// storage is selected at RUNTIME: two argv arguments are two disjoint
+  /// objects, so equality needs (index, cursor) as a PAIR -- comparing
+  /// cursors alone would make `end == argv[1]` and `end == argv[2]` both
+  /// true at offset 0. Null for every non-argv pointer value.
+  Value argvIndex;
 };
 
 /// FR-87: a resolved hosted byte-family (memset/memcpy/memmove/memcmp)
@@ -689,6 +698,13 @@ struct PointerLocalInfo {
   /// Null for every non-allocation local. Distinct from `literalBacking`
   /// (read-only string-literal backing).
   Value backing;
+  /// FR-234 rung 3: entry-block `memref<i64>` cell holding WHICH argv
+  /// argument this pointer currently walks, for a pointer of an argv-rooted
+  /// region. The argv table is a run of disjoint objects selected at
+  /// runtime, so the index is state exactly like the cursor is (006's `end`
+  /// walks `argv[1]` and then `argv[2]`); `cursorCell` holds the byte
+  /// offset within the selected argument. Null for every other pointer.
+  Value argvIndexCell;
 };
 
 /// The imported model of one pointer-typed global variable (CTS-P4): the
@@ -1044,6 +1060,17 @@ struct PointerRegion {
   /// Number of pointee elements the allocation covers; meaningful only
   /// with `allocSite`.
   uint64_t allocCount = 0;
+  /// FR-234 rung 3: true when every pointer of the region walks the bytes
+  /// of one of `main`'s admitted `argv` arguments -- the only source is a
+  /// hosted `strto*` `endptr` join against an `argv[i]` subject string.
+  /// Mutually exclusive with `bases`, `literalBase`, `allocSite` and
+  /// `hasCarrierSource`: an argv argument's storage is not a modeled C
+  /// object, so a region that also binds one has no single representation
+  /// and is invalidated instead.
+  bool argvRooted = false;
+  /// Where the argv binding was established; meaningful only with
+  /// `argvRooted`.
+  clang::SourceLocation argvLoc;
   /// First invalidating construct; meaningful only with `invalidReason`.
   clang::SourceLocation invalidLoc;
   /// Diagnostic text of the invalidating construct; empty when the region
@@ -1403,6 +1430,15 @@ public:
                                                 unsigned)>
       globalCursorArgQuery;
 
+  /// FR-234 rung 3: optional query telling the walk whether `expr` is a
+  /// whole-value `argv[i]` read of `main`'s ADMITTED argv parameter. Such
+  /// an expression is the subject string of a hosted `strto*` call, so the
+  /// joined `endptr` local roots in the argv table rather than in a modeled
+  /// C object. Left unset (every function but an admitted `main`, and every
+  /// pure-AST planning pass), an `argv[i]` source keeps the historical
+  /// non-address rejection.
+  std::function<bool(const clang::Expr *)> argvElementQuery;
+
   /// Returns whether `var` is a pointer local tracked by this analysis.
   bool tracks(const clang::VarDecl *var) const {
     return pointerVars.contains(var);
@@ -1485,6 +1521,13 @@ private:
   /// Flags `ptr`'s region as nullable at `loc` (a null pointer constant
   /// was assigned to one of its pointers); only the first site is kept.
   void recordNullable(const clang::VarDecl *ptr, clang::SourceLocation loc);
+
+  /// FR-234 rung 3: roots `ptr`'s region in `main`'s admitted argv table at
+  /// `loc` (a hosted `strto*` `endptr` joined an `argv[i]` subject string).
+  /// A region that already binds an object, string literal, allocation, or
+  /// integer carrier is invalidated instead: the argv table's storage is
+  /// not a modeled C object and the two models cannot mix.
+  void recordArgvBase(const clang::VarDecl *ptr, clang::SourceLocation loc);
 
   /// Flags `ptr`'s region as fed by an integer carrier at `loc` (CTS-P3):
   /// an integer-to-pointer cast or a call returning a carrier. Only local
@@ -4067,11 +4110,29 @@ private:
   /// table, null otherwise.
   const clang::Expr *matchArgvWholeSubscript(const clang::Expr *expr) const;
 
+  /// FR-234 rung 3: the AST-only twin of `matchArgvWholeSubscript`, keyed
+  /// on the ADMITTED argv parameter alone rather than on the bound table
+  /// value. `PointerRegionAnalysis` runs over the body BEFORE the prologue
+  /// binds the table, so the region walk cannot use the emission-time
+  /// matcher; planning (which has no table at all) shares it too.
+  const clang::Expr *matchArgvWholeSubscriptDecl(const clang::Expr *expr) const;
+
   /// Returns the outer subscript when `expr` (parens/implicit casts
   /// stripped) is a byte read `argv[i][j]` over the admitted argv table,
   /// null otherwise.
   const clang::ArraySubscriptExpr *
   matchArgvByteRead(const clang::Expr *expr) const;
+
+  /// FR-234 rung 3: the char-region channel for a whole-value `argv[i]`
+  /// (form 1, `strtoX(argv[i], ...)`). Borrows argument `indexExpr`'s
+  /// NUL-terminated run and hands back the FR-72 slice-place shape --
+  /// `slicePlace` = the deref of the `emitrust.argv_arg` borrow, cursor 0,
+  /// `argvIndex` = the evaluated index -- so `emitCharRegionSlice`
+  /// reslices it exactly like a byte-slice parameter's region. The index
+  /// is evaluated ONCE and shared between the borrow and the region
+  /// identity.
+  FailureOr<PtrExprValue> emitArgvRegionArg(Location loc,
+                                            const clang::Expr *indexExpr);
 
   /// Emits `emitrust.argv_arg` borrowing argument `indexExpr`'s
   /// NUL-terminated byte run out of the bound argv table, as an

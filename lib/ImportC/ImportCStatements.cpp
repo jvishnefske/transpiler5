@@ -3711,6 +3711,34 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
     return success();
   }
   if (region->bases.empty()) {
+    // FR-234 rung 3: an argv-rooted region (its only source is a hosted
+    // `strto*` `endptr` join against an `argv[i]` subject string). The
+    // pointer's whole runtime state is the PAIR (which argv argument, byte
+    // offset within it): the table is a run of disjoint objects selected at
+    // runtime, so the index is state exactly as the cursor is. Nothing is
+    // borrowed at the declaration -- an argv argument's slice is borrowed
+    // fresh at each use site, so no borrow of the table is ever held across
+    // statements.
+    if (region->argvRooted) {
+      if (!astContext().hasSameUnqualifiedType(pointee, astContext().CharTy))
+        return emitError(translateLoc(region->argvLoc))
+               << "unsupported: pointer element type does not match main's "
+                  "argv";
+      if (region->nullable)
+        return emitError(translateLoc(region->nullableLoc))
+               << "unsupported: null pointer constant assigned to a pointer "
+                  "into main's argv";
+      if (region->hasWriteThrough)
+        return emitError(translateLoc(region->writeThroughLoc))
+               << "unsupported: write through a pointer into main's argv";
+      PointerLocalInfo info;
+      info.cursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
+      info.argvIndexCell = createEntryAlloca(loc, builder.getIntegerType(64));
+      pointerLocals[var] = info;
+      if (const clang::Expr *init = var->getInit())
+        return storePointerAssign(loc, var, init);
+      return success();
+    }
     // A recognized constant-size heap allocation bound to a LOCAL pointer
     // (W4.2e Part A): the pointer decomposes against a synthesized
     // entry-block MUTABLE backing array of `allocCount` elements plus an
@@ -4294,6 +4322,26 @@ LogicalResult CImporter::storePointerAssign(Location loc,
         value->cursor ? value->cursor
                       : createIntConstant(loc, builder.getIntegerType(64), 0);
     builder.create<memref::StoreOp>(loc, multiCursor, info.cursorCell);
+    return success();
+  }
+  // FR-234 rung 3: an argv-rooted pointer's identity is the PAIR (argv
+  // index, byte cursor), so an assignment has to store both. Without this
+  // arm the base-null-vs-base-null test below passes vacuously and only
+  // the cursor moves -- the pointer would keep walking the previously
+  // selected argument. (Defensive: the rung-3 grammar admits no argv
+  // source in an assignment, so an unadmitted `main` keeps the historical
+  // signature-time rejection and this never runs today.)
+  if (info.argvIndexCell || value->argvIndex) {
+    if (!info.argvIndexCell || !value->argvIndex || !info.cursorCell)
+      return emitError(loc)
+             << "unsupported: pointer assignment would rebind to a different "
+                "object";
+    builder.create<memref::StoreOp>(loc, value->argvIndex,
+                                    info.argvIndexCell);
+    Value argvCursor =
+        value->cursor ? value->cursor
+                      : createIntConstant(loc, builder.getIntegerType(64), 0);
+    builder.create<memref::StoreOp>(loc, argvCursor, info.cursorCell);
     return success();
   }
   if (value->base != info.base || value->member != info.member ||

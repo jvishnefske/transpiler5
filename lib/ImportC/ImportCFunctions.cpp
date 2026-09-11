@@ -1413,6 +1413,14 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
       return std::nullopt;
     return it->second;
   };
+  // FR-234 rung 3: `argv[i]` is a region SOURCE (through the hosted
+  // `strto*` endptr join) only inside an ADMITTED `main`; everywhere else
+  // the query is unarmed and an `argv[i]` source keeps the historical
+  // non-address rejection. `matchArgvWholeSubscriptDecl` is the AST-only
+  // twin: the table value is not bound until the prologue below.
+  pointerRegions.argvElementQuery = [this](const clang::Expr *expr) {
+    return matchArgvWholeSubscriptDecl(expr) != nullptr;
+  };
   pointerRegions.analyze(astContext(), func->getBody());
 
   // Method prologue (Phase 4): the receiver dereferences once into the
