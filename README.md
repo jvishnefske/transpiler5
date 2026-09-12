@@ -216,7 +216,11 @@ twins of the arith/ub conversion patterns live behind `-DEMITRUST_ENABLE_PDLL=ON
 
 Architecture, the dialect contract, the C99 and C++17 roadmaps, the FR requirements
 traceability, and the evidence ledger — every spike verdict, measured corpus number, and
-recorded NO-GO — all live in [design.md](design.md). The open queue is indexed
+recorded NO-GO — live in the split ledger: [design.md](design.md) is the preamble, each
+FR/W2 entry is its own file under [docs/plans/entries/](docs/plans/entries/), and the
+frozen design chapters live under [docs/design/](docs/design/), joined in
+[docs/plans/ledger.manifest](docs/plans/ledger.manifest) order
+(`python3 docs/plans/plan.py join` prints the whole stream). The open queue is indexed
 machine-readably in [docs/plans/backlog.toml](docs/plans/backlog.toml); query it with
 `python3 docs/plans/plan.py next`. The theory underlying the pipeline's transformations
 (with citations and per-stage guarantees) is surveyed in

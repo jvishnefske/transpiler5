@@ -13,22 +13,37 @@ a change is worth N cases, measure N with the three-stage harness. An
 emit-stage win with +0 PASS is a legitimate and publishable result — say so
 explicitly rather than letting a reader infer yield.
 
-## 1. Plan in design.md; queue in docs/plans/backlog.toml
+## 1. Plan in the ledger; queue in docs/plans/backlog.toml
 
-Every feature is a numbered FR with testable acceptance criteria in design.md
-(the prose EVIDENCE ledger — spike verdicts and measured evidence live there
-and nowhere else); check its box only when tests validate it.
-`docs/plans/backlog.toml` is the machine-readable index (status, rank,
-blocked_by). Query it instead of re-reading design.md:
+Every feature is a numbered FR with testable acceptance criteria in the
+prose EVIDENCE ledger — spike verdicts and measured evidence live there and
+nowhere else. Since FR-242 the ledger is SPLIT: design.md is only the
+preamble; every entry is its own file `docs/plans/entries/<ID>.md` (its
+checkbox is line 1), frozen chapters live in `docs/design/`, and
+`docs/plans/ledger.manifest` lists all members in original byte-stream
+order — `plan.py join` prints the joined ledger, byte-identical to the
+old monolith. `docs/plans/backlog.toml` is the machine-readable index
+(status, rank, blocked_by). Query, don't read:
 
 - `python3 docs/plans/plan.py next -n 3` — next unblocked items
 - `python3 docs/plans/plan.py brief FR-113` — just that prose entry
 - `python3 docs/plans/plan.py json | jq ...` — arbitrary queries
+- `python3 docs/plans/plan.py join | grep ...` — whole-ledger search
 
-Update BOTH files in the same commit. `plan.py check` enforces the sync and
-runs in the fast lit tier, so drift fails the pre-commit gate. When editing
-design.md by script, prefer anchored single-entry edits over start..end range
-replacements — a range edit once silently deleted three FR entries.
+**Edit one entry file; never range-edit across entries** (a range edit on
+the old monolith once silently deleted three FR entries — the split exists
+to make that impossible). NEW ENTRY, one commit: create
+`docs/plans/entries/FR-N.md` (line 1 = its `- [ ] FR-N ...` box), add its
+path to ledger.manifest right after the newest existing FR entry's line,
+and add the backlog.toml item. Check a box (line 1 of the entry file) only
+when tests validate it, flipping the backlog status in the same commit.
+`plan.py check` enforces the two-way sync, manifest hygiene, and per-file
+anchor resolution, and runs in the fast lit tier, so drift fails the
+pre-commit gate.
+
+MERGE REPLAY for a branch that still edits the pre-split design.md:
+`python3 docs/plans/plan.py join > design.md`, apply their design.md
+patch, then `python3 scripts/split-ledger.py --write`.
 
 **Treat an existing entry's prose as a HYPOTHESIS, not a finding.** In one
 session, six of eight increments corrected the entry that launched them, and
