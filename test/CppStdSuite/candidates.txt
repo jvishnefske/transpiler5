@@ -1,0 +1,72 @@
+# CppStdSuite candidate corpus: llvm-test-suite programs that fit
+# the conformance-ledger contract (bare main, no stdin, exit 0,
+# deterministic byte-exact stdout). Paths are relative to the
+# third_party/llvm-test-suite submodule root and ARE the ledger
+# names. Regenerated ONLY on a submodule pin advance, via:
+#   nix develop -c python3 test/CppStdSuite/curate_candidates.py \
+#     --emit-expected test/CppStdSuite/expected
+SingleSource/Benchmarks/Misc-C++/bigfib.cpp
+SingleSource/Benchmarks/Misc-C++/mandel-text.cpp
+SingleSource/Benchmarks/Misc-C++/oopack_v1p8.cpp
+SingleSource/Regression/C++/2003-05-14-array-init.cpp
+SingleSource/Regression/C++/2003-05-14-expr_stmt.cpp
+SingleSource/Regression/C++/2003-06-08-BaseType.cpp
+SingleSource/Regression/C++/2003-06-08-VirtualFunctions.cpp
+SingleSource/Regression/C++/2003-06-13-Crasher.cpp
+SingleSource/Regression/C++/2003-08-20-EnumSizeProblem.cpp
+SingleSource/Regression/C++/2003-09-29-NonPODsByValue.cpp
+SingleSource/Regression/C++/2008-01-29-ParamAliasesReturn.cpp
+SingleSource/Regression/C++/2011-03-28-Bitfield.cpp
+SingleSource/Regression/C++/BuiltinTypeInfo.cpp
+SingleSource/Regression/C++/EH/ConditionalExpr.cpp
+SingleSource/Regression/C++/EH/class_hierarchy.cpp
+SingleSource/Regression/C++/EH/ctor_dtor_count-2.cpp
+SingleSource/Regression/C++/EH/ctor_dtor_count.cpp
+SingleSource/Regression/C++/EH/dead_try_block.cpp
+SingleSource/Regression/C++/EH/function_try_block.cpp
+SingleSource/Regression/C++/EH/inlined_cleanup.cpp
+SingleSource/Regression/C++/EH/recursive-throw.cpp
+SingleSource/Regression/C++/EH/simple_rethrow.cpp
+SingleSource/Regression/C++/EH/simple_throw.cpp
+SingleSource/Regression/C++/EH/throw_rethrow_test.cpp
+SingleSource/Regression/C++/custom_section_members.cpp
+SingleSource/Regression/C++/fixups.cpp
+SingleSource/Regression/C++/global_ctor.cpp
+SingleSource/Regression/C++/global_type.cpp
+SingleSource/Regression/C++/ofstream_ctor.cpp
+SingleSource/Regression/C++/pointer_member.cpp
+SingleSource/Regression/C++/pointer_method.cpp
+SingleSource/Regression/C++/pointer_method2.cpp
+SingleSource/Regression/C++/short_circuit_dtor.cpp
+SingleSource/UnitTests/2006-12-04-DynAllocAndRestore.cpp
+SingleSource/UnitTests/C++11/stdthreadbug.cpp
+SingleSource/UnitTests/DefaultInitDynArrays.cpp
+SingleSource/UnitTests/EH/cleanup-1.cpp
+SingleSource/UnitTests/EH/cleanup-2.cpp
+SingleSource/UnitTests/EH/cleanup-3.cpp
+SingleSource/UnitTests/EH/rethrow-1.cpp
+SingleSource/UnitTests/EH/rethrow-2.cpp
+SingleSource/UnitTests/EH/simple-1.cpp
+SingleSource/UnitTests/EH/simple-2.cpp
+SingleSource/UnitTests/SetjmpLongjmp/C++/C++Catch.cpp
+SingleSource/UnitTests/Vectorizer/VPlanNativePath/outer-loop-vect.cpp
+SingleSource/UnitTests/Vectorizer/any-of.cpp
+SingleSource/UnitTests/Vectorizer/argmin-argmax-fp.cpp
+SingleSource/UnitTests/Vectorizer/argmin-argmax-int.cpp
+SingleSource/UnitTests/Vectorizer/early-exit.cpp
+SingleSource/UnitTests/Vectorizer/find-last.cpp
+SingleSource/UnitTests/Vectorizer/fmax-reduction.cpp
+SingleSource/UnitTests/Vectorizer/gcc-loops.cpp
+SingleSource/UnitTests/Vectorizer/recurrences.cpp
+SingleSource/UnitTests/Vectorizer/runtime-checks.cpp
+SingleSource/UnitTests/X86/dyn_stack_alloc_realign.cpp
+SingleSource/UnitTests/X86/dyn_stack_alloc_realign2.cpp
+SingleSource/UnitTests/block-byref-cxxobj-test.cpp
+SingleSource/UnitTests/block-call-r7674133.cpp
+SingleSource/UnitTests/block-copied-in-cxxobj-1.cpp
+SingleSource/UnitTests/block-copied-in-cxxobj.cpp
+SingleSource/UnitTests/conditional-gnu-ext-cxx.cpp
+SingleSource/UnitTests/initp1.cpp
+SingleSource/UnitTests/matrix-types-spec.cpp
+SingleSource/UnitTests/member-function-pointers.cpp
+SingleSource/UnitTests/stmtexpr.cpp
