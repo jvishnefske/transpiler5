@@ -36,6 +36,22 @@ jobs:
           purge-created: 0
           purge-primary-key: never
 
+      # binding_eval.py builds nix/clippy-eval/binding-probe (a syn-based
+      # Rust parser) with `cargo build --offline`; on a cold runner that
+      # cannot resolve proc-macro2/syn/quote and the evaluator exits 2
+      # (measured on this workflow's first dispatch). Same disease and
+      # same cure as ci.yml's FR-62 tokio warm step: cache the registry
+      # and fetch exactly the manifest the probe declares.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: cargo-registry-${{ runner.os }}-binding-probe-${{ hashFiles('nix/clippy-eval/binding-probe/Cargo.lock') }}
+
+      - name: Warm the cargo registry for binding-probe
+        run: nix develop -c cargo fetch --manifest-path nix/clippy-eval/binding-probe/Cargo.toml
+
       - name: Configure
         run: nix develop -c meson setup build
 
