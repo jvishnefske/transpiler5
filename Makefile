@@ -1,12 +1,11 @@
-# Thin routing layer to the project's REAL oracle (this is a CMake/meson +
-# lit project, not a cargo one): `make verify` must run the full
-# check-emitrust lit suite -- EndToEnd byte-diffs, both conformance
-# ledgers (CTestSuite and Cpp17Suite), dialect round-trips, Driver
-# goldens. `cargo build` success alone cannot see a miscompile.
+# Thin routing layer to the project's REAL oracle (this is a meson + lit
+# project, not a cargo one): `make verify` must run the full lit suite --
+# EndToEnd byte-diffs, the conformance ledgers (CTestSuite, Cpp17Suite,
+# CppStdSuite), dialect round-trips, Driver goldens. `cargo build`
+# success alone cannot see a miscompile.
 #
 # The checked-out build/ directory is meson-configured (tools land in
-# build/tools/); `meson test` runs the same lit suite as the CMake
-# check-emitrust target.
+# build/tools/).
 
 .PHONY: verify build
 build:

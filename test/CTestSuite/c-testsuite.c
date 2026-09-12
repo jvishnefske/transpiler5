@@ -22,6 +22,6 @@
 // successfully transpiled test with wrong runtime behavior is a MISCOMPILE
 // and fails the run unless explicitly quarantined in known-miscompiles.txt.
 // After extending the transpiler, regenerate the ledger with:
-//   python3 test/CTestSuite/run_c_testsuite.py --emitrust-cc build/bin/emitrust-cc \
+//   python3 test/CTestSuite/run_c_testsuite.py --emitrust-cc build/tools/emitrust-cc \
 //     --suite third_party/c-testsuite --manifest test/CTestSuite/expected-pass.txt \
 //     --workdir /tmp/ctestsuite-work --update

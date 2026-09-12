@@ -10,8 +10,10 @@
 #   meson compile -C build-meson
 #   meson test -C build-meson --verbose    # runs the full lit suite
 #
-# The PDLL showcase (CMake's EMITRUST_ENABLE_PDLL, default OFF) is not
-# mirrored here; the C++ patterns are the shipping baseline.
+# The PDLL showcase (the old CMake build's EMITRUST_ENABLE_PDLL, default
+# OFF) was deleted with that build (FR-245); the C++ patterns are the
+# shipping baseline, and the #ifdef EMITRUST_ENABLE_PDLL seams in the
+# arith/ub conversions remain as the documented (never-defined) hook.
 # b_ndebug=if-release matches CMake's Release -DNDEBUG: clang/LLVM inline
 # header assertions must be compiled out, or C++ inputs whose decls have
 # non-identifier names abort the importer instead of being rejected.

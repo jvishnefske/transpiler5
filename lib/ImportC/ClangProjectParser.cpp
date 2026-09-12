@@ -16,7 +16,7 @@
 ///
 /// It stays inside MLIREmitRustImportC rather than becoming its own library
 /// for one concrete reason: the `EMITRUST_CLANG_RESOURCE_DIR` compile
-/// definition is set on that target by lib/ImportC/CMakeLists.txt's
+/// definition is set on that target by lib/meson.build's
 /// configure-time `clang -print-resource-dir` probe. Moving this file
 /// elsewhere would either duplicate that probe or silently drop the
 /// resource dir, breaking `<stdint.h>` and friends.
@@ -88,7 +88,7 @@ std::optional<std::string> clangResourceDirArg() {
 /// system `xcrun` failed to resolve `-sdk macosx` and printed its error
 /// text to stdout, which then got parsed as if it were the path. Baking
 /// the SDK path in at CONFIGURE time — the same trick `clangResourceDirArg`
-/// already uses for the resource dir, in the CMakeLists.txt/meson.build
+/// already uses for the resource dir, in the meson.build
 /// probes next to this file — sidesteps the whole problem: it runs inside
 /// the real nix dev shell, once, and the answer is immune to whatever
 /// environment a later test invocation happens to have. `EMITRUST_SYSROOT`

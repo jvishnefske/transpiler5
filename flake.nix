@@ -19,16 +19,11 @@
         libclang = llvmPackages.libclang;
         llvm = llvmPackages.llvm;
 
-        # nixpkgs' mlir package ships neither mlir-tblgen nor mlir-pdll;
-        # the synthetic llvmPackages.tblgen package provides mlir-tblgen
-        # (binary-cached). mlir-pdll must be added by override, which
-        # builds from source — kept out of the default shell so entering
-        # it stays a pure cache download.
-        tblgenWithPdll = llvmPackages.tblgen.overrideAttrs (old: {
-          targets = old.targets ++ [ "mlir-pdll" ];
-          ninjaFlags = old.targets ++ [ "mlir-pdll" ];
-        });
-
+        # nixpkgs' mlir package ships no mlir-tblgen; the synthetic
+        # llvmPackages.tblgen package provides it (binary-cached). The
+        # tblgenWithPdll override and the .#pdll shell that built
+        # mlir-pdll from source were deleted with the PDLL showcase
+        # (FR-245); git history preserves both.
         mkMlirShell = tblgen:
           # Default (gcc) stdenv: linking gcc-built objects against the
           # clang/MLIR libs is fine (same libstdc++ ABI), and this nixpkgs
@@ -38,10 +33,12 @@
             packages = [
               llvmPackages.clang
 
-              # Build tooling. Meson drives the parallel build defined by
-              # the meson.build files (CMake stays canonical for CI); it is
-              # pinned here so `nix develop -c meson ...` cannot silently
-              # fall through to a host meson of unknown version.
+              # Build tooling. Meson is the build system (the CMake build
+              # was deleted in FR-245); meson is pinned here so
+              # `nix develop -c meson ...` cannot silently fall through to
+              # a host meson of unknown version. cmake stays NOT for this
+              # repo's build but for the TRACTOR corpus configure step
+              # (tractor-eval.py drives cmake-based corpus projects).
               pkgs.cmake
               pkgs.meson
               pkgs.ninja
@@ -115,9 +112,6 @@
       {
         devShells = {
           default = mkMlirShell llvmPackages.tblgen;
-          # `nix develop .#pdll` — adds mlir-pdll for PDLL pattern
-          # development; first entry compiles tblgen+pdll from source.
-          pdll = mkMlirShell tblgenWithPdll;
         };
 
         packages =
@@ -155,7 +149,6 @@
           {
             default = emitrust;
             inherit emitrust;
-            tblgen-with-pdll = tblgenWithPdll;
           } // corpus;
       });
 }

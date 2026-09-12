@@ -29,7 +29,7 @@
 // is never diffed against a native build, and the outcome claims only that
 // the project translates and type-checks. It ranks between REJECTED and
 // TRANSPILED, and losing it is a regression exactly as losing TRANSPILED is.
-//   python3 test/RealWorld/run_realworld.py --emitrust-cc build/bin/emitrust-cc \
+//   python3 test/RealWorld/run_realworld.py --emitrust-cc build/tools/emitrust-cc \
 //     --clang clang++ --corpus-kind cpp --manifest-format outcomes \
 //     --corpus test/RealWorld/Cpp/Inputs \
 //     --manifest test/RealWorld/Cpp/expected-outcomes.txt \

@@ -68,7 +68,6 @@ llvm_config.use_default_substitutions()
 # excludes: A list of directories/files to exclude from the testsuite.
 config.excludes = [
     "Inputs",
-    "CMakeLists.txt",
     "README.txt",
     "LICENSE.txt",
     "lit.cfg.py",
