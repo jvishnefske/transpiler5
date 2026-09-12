@@ -175,8 +175,8 @@ byte-diff as proof of soundness for these classes:
 - `nix develop -c meson test -C build` is the pre-commit gate.
   `meson test --suite fast` (everything except EndToEnd, ~24% of wall time)
   is the inner loop.
-- CMakeLists.txt files are NO LONGER CANONICAL and are scheduled for deletion
-  (FR-164). Do not add sources to them.
+- The CMake build is DELETED (FR-164/FR-245). Meson only; `pkgs.cmake` in
+  the flake exists for the TRACTOR corpus configure step, not this repo.
 - Adding a tool dir: an `executable()` in `tools/meson.build`. New
   lit-visible tools go in `test/lit.cfg.py`.
 

@@ -104,8 +104,7 @@ if clang_exe.found()
   endif
 endif
 
-# Same trick for Darwin's SDK sysroot (see the CMakeLists.txt probe next to
-# this file for why it must be baked in at configure time rather than read
+# Same trick for Darwin's SDK sysroot (baked in at configure time rather than read
 # from $SDKROOT/xcrun at run time: lit sandboxes the test environment and
 # doesn't forward SDKROOT). $SDKROOT from the configuring shell (e.g. the
 # nix dev shell) is tried first; `xcrun --show-sdk-path` covers a plain
@@ -119,8 +118,7 @@ if host_machine.system() == 'darwin'
     importc_resource_args += ['-DEMITRUST_CLANG_SYSROOT="' + emitrust_sysroot + '"']
   endif
 
-  # Same trick again for libc++'s headers (see CMakeLists.txt's probe next
-  # to this file for why: the nix clang wrapper injects this path
+  # Same trick again for libc++'s headers (the nix clang wrapper injects this path
   # unconditionally, but FixedCompilationDatabase/ClangTool never run that
   # wrapper). Discovered by asking the wrapped compiler what it would
   # search, rather than hardcoding a nix store path.

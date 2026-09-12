@@ -43,7 +43,7 @@ no cleverness.
 
 ```sh
 nix develop                                            # LLVM/MLIR/Clang 21.1.8 + cargo, pinned
-cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLVM_EXTERNAL_LIT=$(which lit) && ninja -C build
+meson setup build && meson compile -C build
 build/tools/emitrust-cc --emit=crate src/*.c -Iinclude -o mycrate --build
 ```
 
@@ -198,19 +198,16 @@ round-trips, driver goldens, the conformance ledgers) and 241 EndToEnd tests, wh
 the byte-diff oracle and account for most of the wall time. `check-emitrust` is the
 pre-commit gate.
 
-A parallel Meson build exists for faster iteration; CMake remains canonical for CI. It
-links the monolithic libMLIR/libclang-cpp dylibs instead of static archives and runs the
-same lit suite:
+Meson is the build system (the CMake build was deleted in FR-245). It links the
+monolithic libMLIR/libclang-cpp dylibs and runs the lit suite:
 
 ```sh
-meson setup build-meson && meson compile -C build-meson
-meson test -C build-meson --suite fast   # fast tier only
-meson test -C build-meson                # both tiers — the same gate as check-emitrust
+meson setup build && meson compile -C build
+meson test -C build --suite fast   # fast tier only
+meson test -C build                # both tiers — the pre-commit gate
 ```
 
-New tools and sources must be added to *both* the CMake and Meson build files. The PDLL
-twins of the arith/ub conversion patterns live behind `-DEMITRUST_ENABLE_PDLL=ON` (needs
-`nix develop .#pdll`, CMake only); the C++ patterns are the shipping default.
+New tools and sources are added to the meson.build files only.
 
 ## Design
 

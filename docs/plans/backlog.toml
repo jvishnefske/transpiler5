@@ -607,7 +607,7 @@ anchor = "FR-163 DEFECT (found 2026-08-29 by an agent diagnosing a nix build"
 id = "FR-164"
 rank = 40
 kind = "tooling"
-status = "open"
+status = "landed"
 size = "M"
 title = "Migrate the build from CMake to meson (owner decided; phase 1 landed, CMakeLists deletion pending)"
 summary = "OWNER DECIDED 2026-08-30: everything is meson forever. Phase 1 LANDED -- install:true on the five executables in tools/meson.build (meson installed nothing before), flake.nix swapping cmake for meson plus llvm.dev for llvm-config, CI switched to meson setup/compile/test with the c-testsuite ledger repointed at build/tools/emitrust-cc, and CLAUDE.md rewritten so the CMakeLists are explicitly non-canonical. VALIDATED: nix build .#emitrust through the meson derivation exits 0 and installs all five tools under the same names (nix/corpus contract holds, binary runs); full gate 944/944, zero failures. REMAINING: delete the 27 CMakeLists.txt after CI is green a few days; decide PDLL explicitly (EMITRUST_ENABLE_PDLL is CMake-only, default OFF, dies with them unless ported); sweep residual build/bin defaults in test/Fuzz, nix/explore, nix/clippy-eval (all env-overridable). Kept open until the deletion lands."
@@ -1609,7 +1609,7 @@ anchor = "FR-244 (opened 2026-09-11, blocked by FR-243): **CppStdSuite:"
 [[items]]
 id = "FR-245"
 kind = "tooling"
-status = "open"
+status = "landed"
 rank = 54
 size = "M"
 title = "FR-164 phase 2: CMakeLists deletion + PDLL decision"

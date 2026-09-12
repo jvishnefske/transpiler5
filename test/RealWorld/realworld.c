@@ -16,7 +16,7 @@
 // dynamic memory). Programs that already transpile are pinned as regression
 // guards (and runtime perf workloads). After a deep-design wave lets a program
 // transpile, regenerate the ledger with:
-//   python3 test/RealWorld/run_realworld.py --emitrust-cc build/bin/emitrust-cc \
+//   python3 test/RealWorld/run_realworld.py --emitrust-cc build/tools/emitrust-cc \
 //     --clang clang --corpus test/RealWorld/Inputs \
 //     --manifest test/RealWorld/expected-transpile.txt \
 //     --known-miscompiles test/RealWorld/known-miscompiles.txt \
