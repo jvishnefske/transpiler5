@@ -243,8 +243,10 @@ byte-diff as proof of soundness for these classes:
 - **Spike/agent worktrees**: run `scripts/spike-worktree-setup.sh` **TWICE**.
   It rewrites itself mid-run, so the first invocation writes a corrupt
   `build-native.ini`; the second, with HEAD already correct, produces a clean
-  pin. Then `git submodule update --init third_party/c-testsuite`, or the
-  CTestSuite ratchet fails on that alone.
+  pin. Then `git submodule update --init third_party/c-testsuite
+  third_party/llvm-test-suite` (add `--reference /home/j/transpiler5` to
+  dedupe the ~2G llvm-test-suite checkout), or the CTestSuite/CppStdSuite
+  ratchets fail on that alone.
 - **`/tmp` is tmpfs**, not on `/`. Scratch there costs RAM, not disk. Disk
   pressure comes from `/nix/store` and `~/.cache`; each agent worktree build
   is ~475M.
