@@ -44,6 +44,13 @@ config.substitutions.append((
 
 llvm_config.with_system_environment(["HOME", "INCLUDE", "LIB", "TMP", "TEMP"])
 
+# The conformance-ledger runners tee their report into
+# $EMITRUST_LEDGER_SUMMARY_DIR/<suite>.txt when the variable is set (CI
+# reads the files into its step summary, since lit swallows passing-test
+# stdout). lit's child environment is curated, so the variable must be
+# forwarded explicitly or the runners never see it.
+llvm_config.with_system_environment(["EMITRUST_LEDGER_SUMMARY_DIR"])
+
 # The EndToEnd --build tests have cargo invoke rustc, whose Darwin linker
 # step resolves the SDK from $SDKROOT and otherwise shells out to
 # `xcrun --show-sdk-path`, which fails inside the sandboxed test
@@ -65,6 +72,10 @@ config.excludes = [
     "README.txt",
     "LICENSE.txt",
     "lit.cfg.py",
+    # test/harness holds shared runner modules, not tests. lit would not
+    # discover .py files anyway (see config.suffixes); this documents the
+    # intent and stays correct if a .c/.cpp fixture ever lands there.
+    "harness",
 ]
 
 # Tweak the PATH to include the tool directories.
