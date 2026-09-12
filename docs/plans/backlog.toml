@@ -1,14 +1,19 @@
-# Machine-readable backlog index over design.md.
+# Machine-readable backlog index over the evidence ledger.
 #
-# design.md remains the AUTHORITATIVE evidence ledger: every item here has a
-# prose entry there (checkbox + spike verdict + measured evidence), found via
-# `anchor`. This file is the QUEUE: status, rank, and dependency edges, cheap
-# to query (`docs/plans/plan.py next`) instead of reading 12k lines.
+# The ledger remains AUTHORITATIVE: every item here has a prose entry
+# (checkbox + spike verdict + measured evidence), found via `anchor`. Since
+# FR-242 the ledger is design.md (preamble) + docs/plans/entries/<ID>.md
+# (one file per entry, checkbox on line 1) + docs/design/*.md chapters,
+# joined in docs/plans/ledger.manifest order (`plan.py join`). This file is
+# the QUEUE: status, rank, and dependency edges, cheap to query
+# (`docs/plans/plan.py next`) instead of reading 25k lines.
 #
 # SYNC RULE (enforced by `plan.py check`, run by test/Driver/backlog-check.c
-# in the fast lit tier): every unchecked `- [ ] FR-*/W2.*` box in design.md
+# in the fast lit tier): every unchecked `- [ ] FR-*/W2.*` box in the ledger
 # must have an entry here whose status is not landed/no-go, and vice versa.
-# Update BOTH files in the same commit.
+# The anchor must resolve inside docs/plans/entries/<id>.md; items that
+# share a parent entry instead name it explicitly via `anchor_file`.
+# Update the ledger and this index in the same commit.
 #
 # status: open      = not started (spike still required if kind != tooling)
 #         spiked    = spike verdict recorded in design.md; ready to implement
@@ -1571,7 +1576,7 @@ anchor = "FR-241 (opened and LANDED 2026-09-10, a MECHANICAL AUDIT commissioned 
 [[items]]
 id = "FR-242"
 kind = "tooling"
-status = "open"
+status = "landed"
 rank = 51
 size = "L"
 title = "Restructure the evidence ledger: file-per-entry + plan.py migration"
