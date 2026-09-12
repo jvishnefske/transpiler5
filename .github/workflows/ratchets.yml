@@ -51,7 +51,7 @@ jobs:
           nix develop -c python3 nix/clippy-eval/clippy_eval.py
           --json "$RUNNER_TEMP/clippy-report.json"
 
-      - name: Binding ratchet (Pareto: neither axis may rise)
+      - name: "Binding ratchet (Pareto: neither axis may rise)"
         if: always()
         run: >
           nix develop -c python3 nix/clippy-eval/binding_eval.py
