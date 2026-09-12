@@ -1,0 +1,68 @@
+name: Ratchets
+
+# The slow quality ratchets (FR-246): clippy debt and binding hygiene over
+# the epoch-pinned corpus. Both are two-way ratchets with Result-style
+# exits (0 = at/below baseline, 1 = ratchet fired, 2 = comparison invalid
+# -- epoch drift, unpinned baseline). They are too slow for the per-push
+# gate, so they run weekly and on demand; a red run here is a visibility
+# signal, not a PR blocker. TRACTOR is the only evaluator that stays out
+# of CI entirely: it needs the private corpus.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  workflow_dispatch:
+
+jobs:
+  ratchets:
+    name: Clippy + binding ratchets (epoch-pinned)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # No submodules: the epoch-pinned corpus both evaluators measure is
+      # in-repo (test/EndToEnd), and skipping the ~2G llvm-test-suite
+      # checkout keeps this job's preamble cheap.
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-
+          purge-created: 0
+          purge-primary-key: never
+
+      - name: Configure
+        run: nix develop -c meson setup build
+
+      - name: Build
+        run: nix develop -c meson compile -C build
+
+      # Exit 1 (debt rose) or 2 (invalid comparison) fails the step and
+      # the workflow -- deliberately; that is the visibility this
+      # workflow exists for. `if: always()` on the second ratchet so one
+      # firing does not hide the other's number.
+      - name: Clippy ratchet (total_warnings must not rise)
+        run: >
+          nix develop -c python3 nix/clippy-eval/clippy_eval.py
+          --json "$RUNNER_TEMP/clippy-report.json"
+
+      - name: Binding ratchet (Pareto: neither axis may rise)
+        if: always()
+        run: >
+          nix develop -c python3 nix/clippy-eval/binding_eval.py
+          --json "$RUNNER_TEMP/binding-report.json"
+
+      - name: Upload ratchet reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ratchet-reports
+          path: |
+            ${{ runner.temp }}/clippy-report.json
+            ${{ runner.temp }}/binding-report.json
+          if-no-files-found: warn

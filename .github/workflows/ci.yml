@@ -4,26 +4,57 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual dispatch exists so a branch's CI can be verified before merge
+  # (used to validate this workflow itself when FR-246 rewrote it).
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Build and regression suite
+  gate:
+    name: Build and tiered regression gate
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      # third_party/c-testsuite is a submodule and is required by the
-      # conformance ledger step below.
+      # Submodules: third_party/c-testsuite (CTestSuite ledger) and
+      # third_party/llvm-test-suite (CppStdSuite ledger, FR-244).
+      # .gitmodules marks llvm-test-suite shallow=true, which bounds the
+      # checkout; watch this step's time on the first runs after a pin
+      # bump (FR-246 recorded it as the known soft spot).
       - uses: actions/checkout@v4
         with:
           submodules: true
 
       - uses: DeterminateSystems/nix-installer-action@v16
 
-      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      # cache-nix-action replaces magic-nix-cache-action (FR-246): the
+      # free Magic Nix Cache service was EOL'd 2025-02-01 and the action
+      # survived only via a reverse-engineered unpublished GitHub API.
+      # This one is plain actions/cache over /nix/store: no external
+      # service, keyed on flake.lock, with built-in GC so the saved store
+      # stays under the runner cache quota. The first run after this
+      # switch is cold (full LLVM/MLIR closure) and slow ONCE; after
+      # that, restores are keyed on the flake.lock hash.
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-
+          purge-created: 0
+          purge-primary-key: never
+
+      # The emitted async-actor crates resolve tokio offline (FR-62);
+      # cache the registry so the warm step below is near-free.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: cargo-registry-${{ runner.os }}-tokio-v1
 
       # The dev shell pins LLVM/MLIR/Clang 21.1.8 and the Rust toolchain,
       # and exports the MLIR_DIR / Clang_DIR / LIBCLANG_PATH that
@@ -62,16 +93,41 @@ jobs:
           echo 'fn main() {}' > "$d/src/main.rs"
           nix develop -c cargo fetch --manifest-path "$d/Cargo.toml"
 
-      # Full lit suite, both tiers: dialect round-trips, conversions,
-      # importer, driver, differential end-to-end tests, and the
-      # c-testsuite ledger driver (test/CTestSuite/c-testsuite.c). This is
-      # the same suite the CMake `check-emitrust` target ran.
-      # --print-errorlogs: without it meson reports only "Fail: 1" and keeps
-      # the failing test's output in build/meson-logs/testlog.txt, which is
-      # not otherwise visible from the job log. A red slow tier was
-      # undiagnosable from CI output alone until this was added.
-      - name: Regression suite (lit, both tiers)
-        run: nix develop -c meson test -C build --print-errorlogs
+      # Fail-fast tier ordering (FR-246): the fast tier (~25% of wall
+      # time -- importer goldens, dialect round-trips, driver goldens,
+      # plan.py check, all three conformance ledgers) runs first so a
+      # cheap failure never waits behind the EndToEnd byte-diff tier.
+      # EMITRUST_LEDGER_SUMMARY_DIR makes the ledger runners tee their
+      # reports (FR-243); lit.cfg.py forwards the variable into lit's
+      # curated child environment. This replaces the old duplicate
+      # c-testsuite step that existed only because lit swallows
+      # passing-test stdout.
+      # --print-errorlogs: without it meson reports only "Fail: 1" and
+      # keeps the failing test's output in build/meson-logs/testlog.txt,
+      # which is not otherwise visible from the job log.
+      - name: Fast tier (everything but EndToEnd)
+        run: >
+          EMITRUST_LEDGER_SUMMARY_DIR=$RUNNER_TEMP/ledgers
+          nix develop -c meson test -C build --suite fast --print-errorlogs
+
+      - name: Slow tier (EndToEnd byte-diff oracle)
+        run: nix develop -c meson test -C build --suite slow --print-errorlogs
+
+      # Surface the conformance-ledger numbers (pass/miscompile/
+      # unsupported per suite) in the run summary even on green runs.
+      - name: Ledger summaries
+        if: always()
+        run: |
+          if ls "$RUNNER_TEMP"/ledgers/*.txt >/dev/null 2>&1; then
+            for f in "$RUNNER_TEMP"/ledgers/*.txt; do
+              echo "## $(basename "$f" .txt)" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              cat "$f" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+            done
+          else
+            echo "no ledger summaries produced" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # The full log, for when --print-errorlogs is truncated or the failure
       # is in a test lit did not report inline.
@@ -82,20 +138,3 @@ jobs:
           name: meson-testlog
           path: build/meson-logs/testlog.txt
           if-no-files-found: warn
-
-      # Explicit conformance gate against the required-pass list.  Every
-      # test named in test/CTestSuite/expected-pass.txt must transpile,
-      # build with cargo, and produce byte-identical stdout and a zero
-      # exit against the recorded expected output.  The manifest ratchets
-      # in both directions: a regression of a listed test fails, and a
-      # newly passing unlisted test also fails until the list is
-      # regenerated with --update.  Any MISCOMPILE is fatal unless
-      # quarantined in known-miscompiles.txt.
-      - name: c-testsuite required-pass ledger
-        run: |
-          nix develop -c python3 test/CTestSuite/run_c_testsuite.py \
-            --emitrust-cc build/tools/emitrust-cc \
-            --suite third_party/c-testsuite \
-            --manifest test/CTestSuite/expected-pass.txt \
-            --known-miscompiles test/CTestSuite/known-miscompiles.txt \
-            --workdir "$RUNNER_TEMP/ctestsuite"
