@@ -916,6 +916,7 @@ title = "Virtual methods on values only (static dispatch)"
 summary = "Landed 2026-08-22: class gate deleted, soundness-critical pointer fence (the no-fence build measured a silent this->virtual miscompile), Box-path fence copy, pure virtual as-is. Cpp17Suite 31 -> 32; 00901 awaits W2.19b."
 blocked_by = []
 anchor = "W2.19"
+anchor_file = "docs/plans/entries/FR-120.md"
 
 [[items]]
 id = "W2.19b"
@@ -926,6 +927,7 @@ title = "Devirtualized single-object base pointer (flipped 00901)"
 summary = "Landed 2026-08-22: 00901 UNSUPPORTED -> PASS, the first frontier marker to fall. Devirt gated on the single-object region fact; JOIN/MULTIOBJ floors pinned; the new test caught a double-hop bug pre-green."
 blocked_by = ["FR-120"]
 anchor = "W2.19"
+anchor_file = "docs/plans/entries/FR-120.md"
 
 [[items]]
 id = "FR-110"
@@ -1019,6 +1021,7 @@ title = "Trait objects (the only image reaching the shapes corpus)"
 summary = "Needs a user-trait verifier contract, a real trait-def op with &self + default bodies, an upcast op, and __base_<Root> + forwarding synthesis (whose omission is the measured 33-9 silent miscompile)."
 blocked_by = ["FR-120", "W2.19b"]
 anchor = "W2.19"
+anchor_file = "docs/plans/entries/FR-120.md"
 
 [[items]]
 id = "T-EPOCH4"
@@ -1030,6 +1033,7 @@ title = "Harness epoch 4: freeze the union corpus (grown C + first C++)"
 summary = "epoch-3 froze 144 EndToEnd .c files; there are now 167 plus 52 measurable C++ crates no epoch covers."
 blocked_by = []
 anchor = "epoch 4"
+anchor_file = "docs/plans/entries/FR-144.md"
 
 # ---- FR-61f remainders, re-ranked by ONLY-OFFENDER measurement (2026-08-26).
 # A first-failure rejection count is an UPPER BOUND on a clause's yield, not
@@ -1047,6 +1051,7 @@ title = "Range-for: structured control flow in the body, and descending -> .rev(
 summary = "The `if` leg LANDED as 61f-12 (82 first-failure rejections, realized yield +7 -- about 8%, the third confirmation of the upper-bound lesson); the nested-loop leg landed in 61f-6. What REMAINS is `?:`/&&/||/StmtExpr/switch and every jump. break/continue/goto/return STAY FENCED -- emitrust.for has no exit edge, so admitting them is an op-design change, not a widening. Descending (12) is a SEPARATE and smaller item, and is NOT the self-contained importer change earlier entries called it: it needs a new emitrust.for attribute plus emitter support, because (lo..hi).rev() is NOT hi..lo -- C's `i > LO; i -= K` is ((LO+1)..=HI).rev().step_by(K), and that LO+1 risks overflow at the type max."
 blocked_by = ["FR-61f-c"]
 anchor = "STILL OUT after 61f-10"
+anchor_file = "docs/plans/entries/FR-61.md"
 
 [[items]]
 id = "FR-61f-c"
@@ -1058,6 +1063,7 @@ title = "Range-for: pointer body -- slices 1+2 LANDED; slice 3 (place conversion
 summary = "Biggest remainder by a wide margin: 201 of the 400 first-failure rejections on the post-61f-10 tree (121 body-touches-a-pointer + 80 non-comparison conditions, which are the pointer-walking heads `for (p = head; p; p = p->next)` and need a truthiness condition and a `p = p->next` step besides). A CHECKPOINT, not a foregone conclusion, and the ONE remainder where the cell-story-never-applied argument that carried 61f-6 and 61f-10 is genuinely FALSE -- here the cells are real. A pointer local never reaches the place/cell decision: emitLocalVar diverts to emitPointerLocal, which allocates raw memref cells on every arm, held as PointerLocalInfo::cursorCell, so placeBackedScalars is never consulted and CANNOT be (the cursor is a synthesized cell whose type is unrelated to the variable's mapped type). Liftability means teaching the pointer-region model to emit its cursor, its nullable discriminant and the CTS-P7 enum-of-bases discriminant as emitrust.variable places, then auditing every memref.load/store consumer. Core machinery: design pass before any code."
 blocked_by = []
 anchor = "STILL OUT after 61f-10"
+anchor_file = "docs/plans/entries/FR-61.md"
 
 [[items]]
 id = "FR-193"
