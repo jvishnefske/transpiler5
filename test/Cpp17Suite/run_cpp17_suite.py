@@ -37,9 +37,8 @@ SPEC = SuiteSpec(
         "# Cpp17Suite conformance ledger for emitrust-cc.\n"
         "# One passing corpus filename per line.  Regenerated via:\n"
         "#   run_cpp17_suite.py ... --update\n"
-        "# Every feature task in docs/plans/tasks.toml flips named\n"
-        "# corpus entries UNSUPPORTED->PASS and ratchets this ledger\n"
-        "# forward in the same commit.\n"
+        "# Feature work flips named corpus entries UNSUPPORTED->PASS\n"
+        "# and ratchets this ledger forward in the same commit.\n"
     ),
 )
 

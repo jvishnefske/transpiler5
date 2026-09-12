@@ -18,10 +18,12 @@ What makes it different from the usual C-to-Rust story:
   diagnostic tied to a source location and a failed translation. The subset boundary is
   a feature, not an accident.
 - **Differentially tested.** End-to-end programs are compiled by both clang and cargo,
-  and the two binaries must produce byte-identical stdout. The
-  [c-testsuite](https://github.com/c-testsuite/c-testsuite) conformance ledger and the
-  in-repo C++17 feature corpus run the same way, with a two-way ratchet: a regression
-  fails the build, and so does an unrecorded pass.
+  and the two binaries must produce byte-identical stdout. Three conformance ledgers run
+  the same way — the [c-testsuite](https://github.com/c-testsuite/c-testsuite) ledger,
+  the in-repo C++17 feature corpus, and a curated slice of
+  [llvm-test-suite](https://github.com/llvm/llvm-test-suite)'s standard-C++ programs —
+  each with a two-way ratchet: a regression fails the build, and so does an unrecorded
+  pass.
 - **Real structured output.** C control flow is recovered into structured Rust — `switch`
   becomes `match`, C enums become `#[repr(i32)]` Rust enums, loops become loops — rather
   than a goto-emulating state machine. C++ classes become `struct` + `impl`, destructors
@@ -116,6 +118,9 @@ friends), a curated `string.h`/`stdlib.h`/`math.h` libc subset, the `<ctype.h>` 
 in boolean context, and `FILE*` I/O (`fopen`/`fread`/`fwrite`/`fgetc`/`fgets`/`fclose`).
 
 The c-testsuite ledger is complete: 220 total, 220 passed, 0 miscompiled, 0 unsupported.
+The standard-C++ frontier ledger (`test/CppStdSuite/`, 65 curated llvm-test-suite
+programs) stands at 11 passed, 0 miscompiled, 54 unsupported as of 2026-09 — that one is
+the open frontier, not a finished checklist.
 
 ### C++17
 
@@ -185,29 +190,27 @@ inlining (every value is a named `let` binding).
 ## Building and testing
 
 Build only inside `nix develop` — the flake pins LLVM/MLIR/Clang 21.1.8 plus a matching
-cargo and rustc. The explicit `-DLLVM_EXTERNAL_LIT=$(which lit)` is required because the
-nixpkgs LLVM ships no `llvm-lit`; lit comes from the shell's Python environment.
-
-```sh
-ninja -C build check-emitrust        # full suite: 817 lit tests; EndToEnd gates on cargo
-ninja -C build check-emitrust-fast   # inner loop: everything except the EndToEnd tier
-```
-
-The suite splits into two complementary tiers: 576 fast tests (importer goldens, dialect
-round-trips, driver goldens, the conformance ledgers) and 241 EndToEnd tests, which are
-the byte-diff oracle and account for most of the wall time. `check-emitrust` is the
-pre-commit gate.
-
-Meson is the build system (the CMake build was deleted in FR-245). It links the
-monolithic libMLIR/libclang-cpp dylibs and runs the lit suite:
+cargo and rustc; lit comes from the same shell's Python environment. Meson is the build
+system (the CMake build was deleted in FR-245); it links the monolithic
+libMLIR/libclang-cpp dylibs and runs the lit suite:
 
 ```sh
 meson setup build && meson compile -C build
-meson test -C build --suite fast   # fast tier only
+meson test -C build --suite fast   # inner loop: everything except the EndToEnd tier
 meson test -C build                # both tiers — the pre-commit gate
 ```
 
-New tools and sources are added to the meson.build files only.
+The suite is ~1094 lit tests as of 2026-09, split into two complementary tiers: 740 fast
+tests (importer goldens, dialect round-trips, driver goldens, `plan.py check`, and the
+three conformance ledgers) and 354 EndToEnd tests, which are the byte-diff oracle and
+account for most of the wall time. New tools and sources are added to the meson.build
+files only.
+
+CI (`.github/workflows/ci.yml`) runs the same gate on every push and pull request, fast
+tier first so a cheap failure never waits behind the EndToEnd tier, and surfaces the
+conformance-ledger numbers in the run summary. The slow quality ratchets — clippy debt
+and binding hygiene over the epoch-pinned corpus — run weekly and on demand in
+`.github/workflows/ratchets.yml`.
 
 ## Design
 
