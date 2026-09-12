@@ -1598,7 +1598,7 @@ anchor = "FR-243 (opened 2026-09-11): **ONE LEDGER RUNNER FOR THREE SUITES"
 [[items]]
 id = "FR-244"
 kind = "tooling"
-status = "open"
+status = "landed"
 rank = 53
 size = "L"
 title = "CppStdSuite: llvm-test-suite submodule + standard-C++ conformance ledger"

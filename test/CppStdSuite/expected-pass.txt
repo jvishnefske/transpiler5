@@ -1,0 +1,17 @@
+# CppStdSuite conformance ledger for emitrust-cc over the pinned
+# llvm-test-suite submodule (candidates.txt is the corpus).
+# One passing suite-relative path per line.  Regenerated via:
+#   run_cppstd_suite.py ... --update
+# Advance ONLY together with the submodule pin procedure in
+# cppstd-suite.cpp (re-curate, regenerate expected/, re---update).
+SingleSource/Benchmarks/Misc-C++/mandel-text.cpp
+SingleSource/Regression/C++/2003-05-14-array-init.cpp
+SingleSource/Regression/C++/2003-06-13-Crasher.cpp
+SingleSource/Regression/C++/2003-08-20-EnumSizeProblem.cpp
+SingleSource/Regression/C++/2011-03-28-Bitfield.cpp
+SingleSource/Regression/C++/global_type.cpp
+SingleSource/UnitTests/block-byref-cxxobj-test.cpp
+SingleSource/UnitTests/block-call-r7674133.cpp
+SingleSource/UnitTests/block-copied-in-cxxobj-1.cpp
+SingleSource/UnitTests/block-copied-in-cxxobj.cpp
+SingleSource/UnitTests/matrix-types-spec.cpp
