@@ -15811,6 +15811,259 @@ piece and becomes FR-45.
   So the tag has NO gate consumer at all and these fixes moved zero baselines.
   Three passes over "who consumes this tag", each correcting the last.
 
+- [ ] FR-242 (opened 2026-09-11, first of the plan/tests/CI rewrite wave
+  FR-242..FR-247, and it executes FIRST so the later five land as clean
+  per-entry files): **RESTRUCTURE THE EVIDENCE LEDGER: FILE-PER-ENTRY +
+  plan.py MIGRATION.** design.md is 25,474 lines and single-file range edits
+  have silently deleted FR entries before (the FR-113..115 deletion is the
+  recorded instance); the cure is to make the editable unit a small file.
+  MEASURED FACTS THAT SHAPE THE DESIGN (verified against the live file
+  2026-09-11, each a splitter assertion, and per §2 each is a LEAD the
+  splitter has permission to refute): the 241 FR checkbox LINES are 238
+  unique ids (FR-37 has three staged entries, FR-38 two); six backlog items
+  have no own entry (W2.19a/b/c share one box; T-EPOCH4 and FR-61f-c/-d live
+  inside other entries); for all 142 items that DO have an own entry the
+  anchor already resolves inside that entry (zero exceptions -- enabling a
+  strictly stronger per-file check); zero delimiter-lookalike lines exist
+  inside code fences; three entries deliberately carry prose verdicts
+  diverging from backlog status (FR-157/171/233) and must NOT be normalized.
+  TWO DELIBERATE DECISIONS: (1) CHECKBOXES STAY -- ~100 pre-index landed FRs
+  have no backlog record so the box is their only status, the box line is
+  the delimiter everything keys on, and the redundancy IS the tripwire: the
+  two-way sync caught the FR-113..115 deletion because two records
+  disagreed. After the split, flipping a box is a one-character edit in a
+  small file that cannot clobber a neighbour. (2) HYBRID LAYOUT, DEFINED AS
+  AN ORDERED PARTITION OF THE ORIGINAL BYTE STREAM: file-per-entry where
+  edits happen (docs/plans/entries/, ~270 files: FR-1.md..FR-241.md with
+  duplicate ids suffixed --2/--3, dot-free so they cannot collide with W2
+  names; W2.0.md..W2.28.md; T-SYSTEMD.md; one underscore-prefixed
+  interstitial), chapter files for the frozen back half (docs/design/, 11
+  files), and design.md slimmed to original lines 1-213 byte-identical (no
+  anchors point into those lines, verified). docs/plans/ledger.manifest
+  lists members in original order and plan.py JOINS them, so every existing
+  regex semantic (delimiters, sync sets, first-match on FR-37's duplicates,
+  heading fallback) is preserved BY CONSTRUCTION.
+  LANDS AS THREE COMMITS. (a) MECHANISM, ZERO BEHAVIOR CHANGE: plan.py grows
+  ledger_files()/ledger_text() (dual-mode -- falls back to plain design.md
+  when no manifest exists, so the commit gates green unchanged), a `join`
+  subcommand (stdout = the joined ledger, for grep archaeology and merge
+  replay), and manifest-mode checks that stay inert until the manifest
+  appears: manifest hygiene (every listed file exists, every entries/ and
+  docs/design/ .md is listed, no orphans or duplicates, design.md is member
+  #1), entry-file first-line-matches-its-id, no-FR-box-outside-entries
+  containment, and per-file anchor resolution (anchor must be a substring of
+  anchor_file or entries/<id>.md -- strictly stronger than today's
+  whole-file substring). Plus scripts/split-ledger.py committed PERMANENTLY
+  as the merge-replay tool. (b) THE ATOMIC SPLIT: the splitter reads bytes
+  (assert UTF-8, LF-only, trailing newline; record sha256), segments on
+  plan.py's own delimiter regex LIFTED BY IMPORT so they cannot drift,
+  aborts if any delimiter-lookalike appears inside a code fence, assigns
+  files by an ordered boundary table keyed on exact heading text +
+  occurrence index (the `### Types` heading occurs twice), and asserts the
+  full inventory (241 FR segments / 238 ids, 28 W2, T-SYSTEMD, 44 headings,
+  all 148 anchors resolving in their assigned file). One commit carries the
+  split output + backlog.toml anchor_file additions (the six own-entry-less
+  items get an explicit anchor_file, e.g. FR-61f-c -> entries/FR-61.md) +
+  the reworded test/Driver/backlog-check.c comment. (c) PROTOCOL TEXT:
+  CLAUDE.md §1 rewrite (edit one entry file, never range-edit; new-entry
+  procedure = create entries/FR-N.md + manifest line + backlog item in one
+  commit; merge-replay recipe: `plan.py join` -> apply the pre-split
+  branch's design.md patch -> re-run the splitter; `plan.py join | grep`
+  for whole-ledger search), backlog.toml header comments, README's ledger
+  paragraph. Immediately after landing: notify the peer factory session and
+  reconcile /home/j/mainwt and the systemd-probe worktree, which hold
+  pre-split copies.
+  GIT HISTORY: plain `git add` -- git cannot follow a 1->282 split and
+  `git mv` theater buys nothing; `git log -S`/blame on pre-split design.md
+  keeps working via history, and per-entry `git log
+  docs/plans/entries/FR-226.md` becomes BETTER archaeology than today.
+  ACCEPTANCE, the lossless proof, recorded as evidence when landed:
+  sha256(concat of manifest members) == sha256(original design.md);
+  plan.py check green with identical summary counts; behavioral oracle --
+  `plan.py brief ID` byte-identical before/after for all 148 ids and
+  `plan.py json` identical.
+
+- [ ] FR-243 (opened 2026-09-11): **ONE LEDGER RUNNER FOR THREE SUITES:
+  SHARED MODULE + A CI SUMMARY SIDE-CHANNEL.**
+  test/CTestSuite/run_c_testsuite.py and test/Cpp17Suite/run_cpp17_suite.py
+  are byte-identical clones apart from a handful of constants, about to
+  become three with CppStdSuite (FR-244). run_realworld.py LOOKS like a
+  third clone but is a DIFFERENT SPECIES -- scripts/check-rejection-ledger.py
+  (fast tier, FR-241) asserts against its classifier tables -- and stays OUT
+  of this refactor.
+  DESIGN: new test/harness/ledger_runner.py, the runner body parameterized
+  by a frozen SuiteSpec(name, source_suffix, suite_subdir, uses_candidates,
+  uses_expected_dir, suite_help, missing_suite_hint, manifest_header).
+  uses_candidates adds a --candidates flag (enumerate from a committed
+  relative-path list instead of globbing --suite); uses_expected_dir adds
+  --expected-dir (<dir>/<relpath>.expected instead of source-adjacent). ALL
+  internals lifted VERBATIM: resolve_tool, sanitize_crate_binary_name,
+  load_name_list, the process-group-killing run_command, run_single_test
+  (per-crate target dirs, the 5.5x comment kept), the two-way ratchet,
+  --update, the min(8, cpu_count) pool, exact CLI flags and output wording.
+  The two existing runners become ~20-line wrappers AT THEIR EXISTING PATHS
+  so lit RUN lines and documented invocations stay byte-stable.
+  SUMMARY SIDE-CHANNEL: when EMITRUST_LEDGER_SUMMARY_DIR is set, main also
+  writes its report (per-miscompile lines, summary: line, FAIL: lines) to
+  $EMITRUST_LEDGER_SUMMARY_DIR/<name>.txt. lit swallows passing-test stdout
+  -- that is WHY CI duplicates the c-testsuite ledger run today -- and lit's
+  curated child environment drops the var unless test/lit.cfg.py forwards it
+  via llvm_config.with_system_environment. Also add "harness" to lit
+  config.excludes (defensive documentation of intent).
+  ACCEPTANCE, bit-identity recorded as evidence: pre/post --update into
+  scratch copies byte-identical (headers included -- Cpp17's tasks.toml
+  header sentence stays VERBATIM until FR-247); non-update stdout diff clean
+  (pool.map preserves input order, output is deterministic); repo manifests
+  untouched; full gate green.
+
+- [ ] FR-244 (opened 2026-09-11, blocked by FR-243): **CppStdSuite:
+  llvm-test-suite AS A SUBMODULE + A STANDARD-C++ CONFORMANCE LEDGER.**
+  Both existing conformance ledgers are SATURATED, measured 2026-09-11:
+  CTestSuite lists all 220 of the submodule's single-exec programs and
+  Cpp17Suite is 35/35 -- neither ratchet has headroom, so a new suite is the
+  only open frontier. User decision (2026-09-11): llvm-test-suite as a git
+  submodule, the C++ analog of third_party/c-testsuite, NOT a vendored
+  subset.
+  LANDS AS TWO COMMITS because lit auto-discovery is a hair trigger: any
+  .cpp under test/ is live in the fast tier the commit it appears.
+  (a) CORPUS, NO LIT TEST YET: `git submodule add
+  https://github.com/llvm/llvm-test-suite third_party/llvm-test-suite` at a
+  pinned SHA, shallow = true in .gitmodules (honored by `git submodule
+  update`; confirm actions/checkout gets depth-1 on the first CI run --
+  known soft spot). Curation script committed as
+  test/CppStdSuite/curate_candidates.py (reproducible, never run by
+  lit/CI): enumerate SingleSource/Regression/C++/**,
+  SingleSource/UnitTests/**, SingleSource/Benchmarks/Misc-C++/**; require
+  .cpp suffix (emitrust-cc selects C++ by extension; excluding .cc/.C is
+  simpler than special-casing); drop files whose sibling CMakeLists/Makefile
+  declares RUN_OPTIONS, stdin, extra sources, required defines, or
+  HASH_PROGRAM_OUTPUT (the ledger contract is bare main, no args); require a
+  standalone clang++ -std=c++17 build; run natively TWICE in different
+  cwds: exit 0, byte-identical stdout, native runtime under ~2s (headroom
+  under the runner's 10s RUN_TIMEOUT on a slow CI runner), no files written
+  outside cwd. Target 100-300 survivors, committed as
+  test/CppStdSuite/candidates.txt -- paths relative to the submodule root;
+  ledger names ARE these relative paths, unique by construction; per-crate
+  workdirs keyed on the sanitized relative path since basenames collide
+  across dirs. .expected files generated ONCE from the pinned dev-shell
+  clang++ -std=c++17 (clang 21.1.8) and committed under
+  test/CppStdSuite/expected/<relpath>.expected -- NOT llvm-test-suite's
+  *.reference_output (missing for some programs, may carry harness-appended
+  exit/timing lines, upstream compares with fpcmp tolerances; none of it
+  matches the byte-exact-stdout + exit-0 oracle). Pin-advance procedure
+  recorded in the driver header: moving the submodule SHA requires
+  re-running curation, regenerating expected/, and re-`--update`ing the
+  manifest in the same commit.
+  (b) LEDGER GOES LIVE: test/CppStdSuite/run_cppstd_suite.py, a thin wrapper
+  (SuiteSpec(name="cppstd", source_suffix=".cpp", uses_candidates=True,
+  uses_expected_dir=True, missing_suite_hint=<submodule init hint>));
+  test/CppStdSuite/cppstd-suite.cpp, a house-pattern lit driver
+  (`// REQUIRES: cargo` + one RUN line + the intent-comment header with the
+  tool-substitution note, outcome model, regen and pin-advance procedures);
+  test/CppStdSuite/lit.local.cfg with config.parallelism_group =
+  "heavy-harness" -- MANDATORY and in the SAME commit; without it the fast
+  tier can OOM an 8GB host, misreported as MISCOMPILEs (observed exit-137
+  cascade shape). expected-pass.txt day-one MEASURED via --update --
+  possibly small or zero; a from-zero ratchet is valid. Any day-one
+  MISCOMPILE goes into known-miscompiles.txt AND gets a defect FR in the
+  same commit (silent quarantine loses the signal). MISSING SUBMODULE =
+  HARD FAIL with the init hint, same doctrine as CTestSuite; the lit
+  UNSUPPORTED-skip alternative is REJECTED because an uninitialized
+  submodule would drop the whole ledger while the gate stayed green,
+  exactly the hole the two-way ratchet closes. Same commit: CLAUDE.md
+  worktree rule becomes `git submodule update --init
+  third_party/c-testsuite third_party/llvm-test-suite` (note --reference to
+  the main checkout to dedupe the per-worktree cost); update
+  scripts/spike-worktree-setup.sh identically if it inits submodules.
+  TIER: auto-joins fast (deliberate, matches the other ledgers).
+  ACCEPTANCE: day-one manifest is measured, wall-time delta of the fast
+  tier recorded, with the tripwire -- if CppStdSuite dominates, a third
+  tier must preserve test/meson.build's single-regex
+  no-dir-in-neither-tier invariant.
+
+- [ ] FR-245 (opened 2026-09-11, FR-164 phase 2, closes FR-164): **DELETE
+  THE CMAKE BUILD; DECIDE PDLL.**
+  FR-164 phase 1 landed meson as canonical; 27 CMakeLists.txt and
+  test/lit.site.cfg.py.in are still in-tree and README still claims CMake
+  is canonical. DELETE: all 27 CMakeLists.txt (`find . -name CMakeLists.txt
+  -not -path './third_party/*' -not -path './.claude/*' -not -path
+  './build/*'`) + test/lit.site.cfg.py.in; drop "CMakeLists.txt" from lit
+  excludes. PDLL DECISION, recorded here: delete the two .pdll showcase
+  files, the .#pdll shell, and the tblgenWithPdll override -- but KEEP the
+  plain tblgen override (the default shell's meson tablegen needs it); git
+  history preserves the showcase. KEEP pkgs.cmake in flake.nix with a
+  comment: the TRACTOR corpus configure step needs cmake, not this repo's
+  build. Same-commit reference sweep (grep excluding .claude/worktrees,
+  build/, third_party/, and ledger prose): README's cmake commands and
+  "CMake remains canonical / add to both" paragraphs (surgical fix only;
+  the full README pass is FR-247), the Makefile header comment, CLAUDE.md's
+  "scheduled for deletion" line. Verify FR-164's residual build/bin sweep
+  is done (grep, record the result).
+  ACCEPTANCE: fresh `meson setup && compile` from clean; `nix build
+  .#emitrust` exit 0; full gate green; case-insensitive cmakelists grep
+  empty outside the exclusions; FR-164 flipped to landed with appended
+  evidence.
+
+- [ ] FR-246 (opened 2026-09-11): **CI REWRITE: FAIL-FAST TIERS, A CACHE
+  THAT IS NOT DEAD, AND A SCHEDULED RATCHET WORKFLOW.**
+  Today's CI is one ~90-minute job that runs both lit tiers unordered,
+  duplicates the c-testsuite ledger run (because lit swallows passing-test
+  stdout -- cured by FR-243's side-channel), never runs the clippy/binding
+  ratchets, and stands on a dead service: the free Magic Nix Cache was
+  EOL'd 2025-02-01 and magic-nix-cache-action@v8 works only via a
+  reverse-engineered unpublished GitHub API. Replacement:
+  nix-community/cache-nix-action@v6 -- native actions/cache over
+  /nix/store, no external account, built-in GC.
+  DESIGN -- ONE GATE JOB, ORDERED STEPS (deliberately NOT multi-job: the
+  nix-store cache restore is a per-job fixed cost and both lit tiers are
+  serialized is_parallel:false invocations, so parallel jobs buy setup
+  duplication, not wall time). .github/workflows/ci.yml: (1) checkout with
+  submodules: true -- now pulls llvm-test-suite too; shallow = true keeps
+  it bounded; watch the first runs' checkout time; (2)
+  nix-installer-action@v16 then cache-nix-action@v6 (primary key on the
+  flake.lock hash, gc-max-store-size-linux: 8G, purge old prefixes); (3)
+  actions/cache on ~/.cargo/registry, keeping the FR-62 tokio warm step
+  verbatim (near-free on cache hit); (4) meson setup -> meson compile; (5)
+  FAST tier with EMITRUST_LEDGER_SUMMARY_DIR=$RUNNER_TEMP/ledgers, then
+  SLOW tier, both --print-errorlogs -- fail-fast ordering; (6) a ledger
+  summaries step (if: always()) cat-ing the side-channel files into
+  $GITHUB_STEP_SUMMARY, REPLACING the duplicate c-testsuite step; (7)
+  upload testlog.txt on failure.
+  NEW .github/workflows/ratchets.yml: weekly cron + workflow_dispatch; same
+  preamble; runs clippy_eval.py (epoch-pinned baseline) and
+  binding_eval.py, uploads the JSON reports; exit 1/2 fails the workflow --
+  visibility without gating PRs. The clippy/binding ratchets ARE
+  CI-runnable (their epoch-pinned corpus is in-repo); only TRACTOR needs
+  private data and stays out of CI. macOS: EXPLICITLY OUT OF SCOPE,
+  recorded here.
+  ACCEPTANCE: YAML cannot be tested by the local gate -- push the branch
+  and record green `gh` runs of BOTH workflows (dispatch ratchets.yml once)
+  before merge. EXPECTED AND NOT A DEFECT: the first run after the cache
+  switch is cold (full LLVM closure); one long run, then keyed on
+  flake.lock. FlakeHub Cache is the escape hatch if restores thrash.
+
+- [ ] FR-247 (opened 2026-09-11, blocked by FR-245 and FR-246):
+  **PLANNING-DOC REWRITE: REGENERATE THE ROADMAP, DELETE THE DEAD DOCS,
+  FULL README PASS.**
+  Measured rot (2026-09-11): docs/plans/roadmap.md is 14 commits stale with
+  ZERO mechanical consumers; docs/plans/tasks.toml is 7/7 done with ZERO
+  mechanical consumers; AGENTIC_HARNESS.md describes a superseded ranking
+  system (cites a clippy baseline of 961 vs the real 94); README.md still
+  claims CMake is canonical and cites 817 lit tests (reality ~1093,
+  meson-only CI).
+  WORK: regenerate docs/plans/roadmap.md from `plan.py stats`/`json` +
+  current census figures, keeping the precedence note ("design.md and
+  backlog.toml win") VERBATIM; delete docs/plans/tasks.toml (7/7 done, no
+  consumers) and fix the tasks.toml mention then living in the Cpp17
+  SuiteSpec.manifest_header -- no manifest regen needed, load_name_list
+  strips comments; delete AGENTIC_HARNESS.md (superseded; referenced only
+  from historical ledger prose, which stays as history); README full pass:
+  meson-canonical instructions, current suite counts (~1093 lit tests, 354
+  EndToEnd, three conformance ledgers) dated "as of 2026-09", CI
+  description matching the new workflows.
+  ACCEPTANCE: FR-242..FR-247 statuses flipped as landed; final `plan.py
+  check` green and in sync.
+
 - [x] FR-228 (opened 2026-09-09 and LANDED 2026-09-10, found by the FR-224 implementation's own
   byte-diff oracle while trying to admit `abort`): **EVERY EMITTED CRATE HAS
   THE WRONG STDOUT BUFFERING MODEL, AND EXACTLY ONE CONSTRUCT MAKES IT
