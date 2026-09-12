@@ -1587,7 +1587,7 @@ anchor = "FR-242 (opened 2026-09-11, first of the plan/tests/CI rewrite wave"
 [[items]]
 id = "FR-243"
 kind = "tooling"
-status = "open"
+status = "landed"
 rank = 52
 size = "M"
 title = "Shared ledger-runner module + CI summary side-channel"
