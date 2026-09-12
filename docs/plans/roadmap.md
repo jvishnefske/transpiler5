@@ -1,9 +1,20 @@
 # TRACTOR roadmap
 
-State at `7892c90`, 2026-09-10. Census re-run at 60/252. This is the human-readable companion to the
-two authoritative files: `design.md` is the prose evidence ledger, and
-`docs/plans/backlog.toml` is the machine index. **Where they disagree with
-this document, they win** — this one summarises, they record.
+State at `b92e7a2`, 2026-09-11. Census re-run at 60/252 (2026-09-10; no
+compiler change has landed since). This is the human-readable companion to
+the two authoritative files: the evidence ledger (design.md +
+docs/plans/entries/, joined via docs/plans/ledger.manifest — FR-242) is the
+prose record, and `docs/plans/backlog.toml` is the machine index. **Where
+they disagree with this document, they win** — this one summarises, they
+record.
+
+Infrastructure wave FR-242..FR-247 (2026-09-11, +0 TRACTOR by design): the
+ledger split to file-per-entry, one shared conformance-ledger runner, the
+CppStdSuite standard-C++ frontier ledger over an llvm-test-suite submodule
+(day one: 11/65 PASS, 0 MISCOMPILE), the CMake build deleted (FR-164
+closed), CI rewritten fail-fast with a live nix cache and a weekly ratchet
+workflow, and this document's planning-layer siblings pruned
+(tasks.toml and AGENTIC_HARNESS.md deleted).
 
 ## Where the score is
 

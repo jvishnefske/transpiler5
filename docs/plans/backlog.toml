@@ -1620,7 +1620,7 @@ anchor = "FR-245 (opened 2026-09-11, FR-164 phase 2, closes FR-164)"
 [[items]]
 id = "FR-246"
 kind = "tooling"
-status = "open"
+status = "landed"
 rank = 55
 size = "M"
 title = "CI rewrite: fail-fast tiers, live cache, scheduled ratchet workflow"
@@ -1631,7 +1631,7 @@ anchor = "FR-246 (opened 2026-09-11): **CI REWRITE: FAIL-FAST TIERS"
 [[items]]
 id = "FR-247"
 kind = "tooling"
-status = "open"
+status = "landed"
 rank = 56
 size = "S"
 title = "Planning-doc rewrite: roadmap regen, delete tasks.toml + AGENTIC_HARNESS.md, README pass"
