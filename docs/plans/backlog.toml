@@ -1638,3 +1638,14 @@ title = "Planning-doc rewrite: roadmap regen, delete tasks.toml + AGENTIC_HARNES
 summary = "Opened 2026-09-11; blocked by FR-245 and FR-246 (README must describe the post-CMake, post-CI-rewrite reality). Measured rot: docs/plans/roadmap.md 14 commits stale with zero mechanical consumers; docs/plans/tasks.toml 7/7 done with zero mechanical consumers; AGENTIC_HARNESS.md describes a superseded ranking system (cites clippy baseline 961 vs the real 94); README claims CMake canonical and 817 lit tests (reality ~1093, meson-only CI). WORK: regenerate roadmap.md from plan.py stats/json + current census figures keeping the precedence note verbatim; delete tasks.toml and fix the tasks.toml mention in the Cpp17 SuiteSpec.manifest_header (no manifest regen needed, load_name_list strips comments); delete AGENTIC_HARNESS.md; README full pass (meson-canonical instructions, ~1093 lit / 354 EndToEnd / three conformance ledgers dated as-of 2026-09, CI description matching the new workflows). ACCEPTANCE: FR-242..FR-247 flipped landed; final plan.py check green."
 blocked_by = ["FR-245", "FR-246"]
 anchor = "FR-247 (opened 2026-09-11, blocked by FR-245 and FR-246)"
+
+[[items]]
+id = "FR-248"
+kind = "defect"
+status = "open"
+rank = 57
+size = "S"
+title = "Clippy debt count is environment-sensitive by exactly one needless_late_init (CI 58 vs local 57)"
+summary = "Opened 2026-09-12, found by ratchets.yml's first dispatch. Same commit 703cf85, same flake.lock, same epoch pin, same 294-crate corpus, 0 skipped both sides: GitHub runner counts 58 total warnings, local counts 57, and the whole delta is clippy::needless_late_init 8 vs 7 with every other lint identical (json report diff retained). Local is stable at 57 across days (FR-241 recorded 57 +0). Ratchet fires on CI, passes locally, baseline itself was measured locally. Hypotheses, untested: (a) a caching asymmetry in clippy_eval's cargo clippy invocation suppressing one repeat warning locally (58 would be the truth and local UNDERCOUNTS); (b) genuine clippy nondeterminism on one crate; (c) an environment-dependent difference in one emitted crate, which would violate the byte-identity doctrine and outrank the lint question entirely. First diagnostic is cheap and decisive: emit the corpus in both environments and hash the crates -- identical hashes kill (c); a per-crate warning dump then names the crate. ACCEPTANCE: crate identified, correct count established, the wrong instrument fixed so CI and local agree, baseline re-pinned only if 58 is the truth. Until then ratchets.yml is EXPECTED RED on the clippy step."
+blocked_by = []
+anchor = "FR-248 (opened 2026-09-12, found by ratchets.yml's FIRST dispatch"
