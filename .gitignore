@@ -72,3 +72,6 @@ __pycache__/
 # systemd probe (branch probe/systemd): read-only copies of the main tree's
 # built tools, used to measure a third-party project without building here
 probe-tools/
+
+# Coverage report (CI coverage job / local gcovr runs)
+coverage/

@@ -1,0 +1,35 @@
+---
+# Conservative starting set: every check listed here passes on the current
+# tree. Checks that fire today are disabled individually below (count at the
+# time this file was added in brackets) so they can be re-enabled one at a
+# time as the findings are fixed.
+Checks: >
+  -*,
+  clang-analyzer-*,
+  -clang-analyzer-core.CallAndMessage,
+  -clang-analyzer-core.StackAddressEscape,
+  -clang-analyzer-core.uninitialized.Assign,
+  -clang-analyzer-optin.core.EnumCastOutOfRange,
+  -clang-analyzer-optin.performance.Padding,
+  bugprone-*,
+  -bugprone-unchecked-optional-access,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-unused-return-value,
+  -bugprone-branch-clone,
+  -bugprone-assignment-in-if-condition,
+  -bugprone-narrowing-conversions,
+  -bugprone-use-after-move,
+  -bugprone-switch-missing-default-case,
+  -bugprone-optional-value-conversion,
+  performance-*,
+  -performance-enum-size,
+  -performance-inefficient-string-concatenation,
+  -performance-inefficient-vector-operation,
+  -performance-unnecessary-copy-initialization,
+  portability-*
+WarningsAsErrors: '*'
+# Project headers only: LLVM/MLIR/Clang headers come from the nix store and
+# TableGen'd .inc files are generated.
+HeaderFilterRegex: '.*'
+ExcludeHeaderFilterRegex: '^/nix/store/|\.inc$'
+...
