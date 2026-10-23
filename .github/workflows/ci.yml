@@ -99,3 +99,100 @@ jobs:
             --manifest test/CTestSuite/expected-pass.txt \
             --known-miscompiles test/CTestSuite/known-miscompiles.txt \
             --workdir "$RUNNER_TEMP/ctestsuite"
+
+  # gcov line/branch coverage of the fast lit tier (everything except the
+  # cargo-heavy EndToEnd/ byte-diff tests, which the test job above still
+  # runs in full). Same nix toolchain as the test job, separate build dir
+  # with -Db_coverage=true. The HTML + lcov report is uploaded as an
+  # artifact; the job fails if line coverage drops below the floor.
+  coverage:
+    name: Coverage (fast tier)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+
+      - name: Configure (coverage)
+        run: nix develop -c meson setup build-cov -Db_coverage=true
+
+      - name: Build (coverage)
+        run: nix develop -c meson compile -C build-cov
+
+      - name: Regression suite (lit, fast tier)
+        run: nix develop -c meson test -C build-cov --suite fast --print-errorlogs
+
+      # The dev shell's gcc is 15.x; Ubuntu's packaged gcovr is too old to
+      # parse its gcov output, so take a current gcovr from PyPI. It runs
+      # inside the dev shell so it picks up the matching gcov.
+      - name: Install gcovr
+        run: pipx install gcovr
+
+      # Floor measured locally at 86.9% lines for this tier; set just under.
+      - name: Coverage report
+        run: |
+          mkdir -p coverage
+          nix develop -c gcovr -r . build-cov \
+            --filter 'include/' --filter 'lib/' --filter 'tools/' \
+            -j "$(nproc)" \
+            --print-summary \
+            --html-details coverage/index.html \
+            --lcov coverage/coverage.info \
+            --fail-under-line 85
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: warn
+
+  lint:
+    name: Lint (clang-format, clang-tidy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # Full history so the clang-format step can diff against the base.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+
+      # Changed lines only: the tree predates .clang-format and is not
+      # reformatted wholesale. Uses the dev shell's clang-format (LLVM 21).
+      - name: clang-format (changed lines)
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = 0000000000000000000000000000000000000000 ]; then
+            echo "No base commit to diff against; skipping."
+            exit 0
+          fi
+          nix develop -c git clang-format --diff "$BASE_SHA" -- include lib tools
+
+      # clang-tidy needs compile_commands.json and the TableGen'd .inc
+      # headers, but not a full build.
+      - name: Configure
+        run: nix develop -c meson setup build
+
+      - name: Generate TableGen headers
+        run: |
+          nix develop -c sh -c \
+            "ninja -C build -t targets all | sed -n 's/^\(.*\.inc\): .*/\1/p' | xargs ninja -C build"
+
+      # Check set in .clang-tidy. The nix gcc wrapper injects the LLVM
+      # include dir via NIX_CFLAGS_COMPILE, which clang-tidy does not see,
+      # so it is passed explicitly.
+      - name: clang-tidy
+        run: |
+          nix develop -c sh -c \
+            'run-clang-tidy -quiet -p build -j "$(nproc)" -extra-arg=-isystem"$(llvm-config --includedir)" "/(lib|tools)/"'

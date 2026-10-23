@@ -1,0 +1,7 @@
+---
+# The sources already follow LLVM style closely (this is MLIR/Clang code),
+# but not exactly. CI checks only the lines a change touches
+# (`git clang-format --diff <base>`), so the existing tree is not
+# reformatted wholesale.
+BasedOnStyle: LLVM
+...
