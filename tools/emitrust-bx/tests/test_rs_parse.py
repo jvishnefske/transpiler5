@@ -49,10 +49,15 @@ def test_unsigned_wrapping_compound_is_canonical():
 @pytest.mark.parametrize("src,expected", [
     ("fn main() {\n    let x = 5;\n}\n",
      [("2:11", "unsupported: `let` without a type annotation (every declaration is explicitly typed)")]),
-    ("fn main() {\n    let mut v: Vec<i32> = Vec::new();\n}\n", [("2:16", "unsupported: type `Vec`")]),
+    # FR-251 moved this pin forward: `Vec<T>` is in the subset, other std
+    # containers are its nearest out-of-subset neighbour
+    ("fn main() {\n    let mut m: HashMap<i32, i32> = HashMap::new();\n}\n", [("2:16", "unsupported: type `HashMap`")]),
     ("fn main() {\n    loop {}\n}\n",
      [("2:5", "unsupported: `loop` (C++ has no direct canonical spelling; use `while`)")]),
-    ("fn f(x: &i32) {}\n", [("1:9", "unsupported: reference type")]),
+    # FR-251 moved this pin forward: `&T` / `&mut T` parameters are in the
+    # subset; a reference to a reference and a returned reference are not
+    ("fn f(x: &&i32) {}\n", [("1:9", "unsupported: reference to a reference")]),
+    ("fn f(x: &i32) -> &i32 {\n    return x;\n}\n", [("1:1", "unsupported: function returning a reference")]),
     ("fn main() {\n    let x: u32 = 1u32 + 2u32;\n}\n",
      [("2:23", "unsupported: unsigned `+` (panics on overflow in debug builds); "
                "the subset spells it `.wrapping_add(..)`")]),
@@ -64,7 +69,12 @@ def test_unsigned_wrapping_compound_is_canonical():
      [("3:5", "redeclaration of 'x' in the same scope")]),
     ('fn main() {\n    print!("{:x}", 5);\n}\n', [("2:12", "unsupported: print! placeholder `{:x}`")]),
     ('fn main() {\n    print!("{}", 1.5);\n}\n', [("2:18", "printf integer conversion of a f64 argument")]),
-    ("fn main() {\n    let s: i32 = x.len();\n}\n", [("2:20", "unsupported: method call `.len()`")]),
+    # FR-251 moved this pin forward: `.len()` is in the subset; methods
+    # outside the rows (and iterator adaptors outside `for`) are not
+    ("fn main() {\n    let v: Vec<i32> = Vec::new();\n    let s: usize = v.capacity();\n}\n",
+     [("3:22", "unsupported: method call `.capacity()`")]),
+    ("fn main() {\n    let v: Vec<i32> = vec![1, 2];\n    let n: usize = v.iter().count();\n}\n",
+     [("3:29", "unsupported: method call `.count()`")]),
     # rustc would type these literals from the cast target (i64 / i8), not i32
     ("fn main() {\n    let s: i64 = (1 << 40i32) as i64;\n}\n",
      [("2:19", "unsupported: unsuffixed integer literal in the operand of `as` (rustc infers its "

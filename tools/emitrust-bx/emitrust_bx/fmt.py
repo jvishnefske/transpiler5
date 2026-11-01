@@ -74,8 +74,35 @@ BX_HELPERS = {
         "        b as char\n"
         "    }\n"
     ),
+    # FR-251.  The String ASCII invariant: every byte pushed is < 0x80, so
+    # byte slicing (substr) never splits a UTF-8 character and
+    # `s.as_bytes()[i] as i8` is exactly C++'s (signed) char.
+    "push_byte": (
+        "    pub fn push_byte(s: &mut String, c: i8) {\n"
+        "        let b: u8 = c as u8;\n"
+        "        assert!(b < 128, \"bx::push_byte: a byte >= 0x80 would break the String ASCII invariant\");\n"
+        "        s.push(b as char);\n"
+        "    }\n"
+    ),
+    # std::string::substr(pos, n): n is clamped to size() - pos; pos >
+    # size() throws std::out_of_range in C++ (an uncaught exception
+    # terminates, exit 134) -- the helper panics (exit 101): both loud,
+    # and the subset's tests keep away from it.
+    "substr": (
+        "    pub fn substr(s: &str, pos: usize, n: usize) -> String {\n"
+        "        assert!(pos <= s.len(), \"bx::substr: position past the end (std::out_of_range in C++)\");\n"
+        "        let end: usize = pos + std::cmp::min(n, s.len() - pos);\n"
+        "        String::from(&s[pos..end])\n"
+        "    }\n"
+    ),
+    "substr_from": (
+        "    pub fn substr_from(s: &str, pos: usize) -> String {\n"
+        "        assert!(pos <= s.len(), \"bx::substr_from: position past the end (std::out_of_range in C++)\");\n"
+        "        String::from(&s[pos..])\n"
+        "    }\n"
+    ),
 }
-BX_ORDER = ("fmt_f", "chr")
+BX_ORDER = ("fmt_f", "chr", "push_byte", "substr", "substr_from")
 
 
 def bx_module(used):

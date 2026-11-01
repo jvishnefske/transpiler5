@@ -15,8 +15,18 @@ Design rules:
   ``field(compare=False)`` so they never take part in equality.
 * The Kernel has NO implicit conversions: every C++ implicit conversion is
   an explicit ``Cast``.  It has no Paren node: printers parenthesize.
-* Types are a CLOSED SUM (``Ty``).  FR-250 only has ``Prim``; later FRs add
-  vectors/strings/closures as new variants of the same sum.
+* Types are a CLOSED SUM (``Ty``).  FR-250 has ``Prim``; FR-251 adds
+  ``VecT`` (std::vector <=> Vec), ``StrT`` (std::string <=> String) and
+  ``RefT`` (a reference PARAMETER or range-for variable: `const T&` <=>
+  `&T`, `T&` <=> `&mut T`).  A ``Var`` of a RefT-declared name has the
+  REFERENT type in expressions, exactly like a C++ reference.
+* FR-251 value semantics are Rust's: a bare ``Var`` of a non-Copy type
+  (Vec/String) in a CONSUMING position (let/assign value, by-value
+  argument, return, push value) is a MOVE (C++ `std::move(x)`); a copy is
+  an explicit ``Clone`` (C++ copy construction, Rust `.clone()`).  In a
+  COPIED position (vec literal elements, vec-fill value, resize value --
+  C++ takes `const T&` and copies) a place is written bare and the Rust
+  printer adds `.clone()` for non-Copy element types.
 * ``Residual*`` nodes are the Surface-IR seam: cxx_import keeps going past an
   unsupported construct and leaves a located Residual in its place, so a
   program's distance from the subset is a COUNT, not a first failure
@@ -56,7 +66,42 @@ class Prim:
         return self.name
 
 
-Ty = Union[Prim]  # the closed sum; extended by later FRs
+@dataclass(frozen=True)
+class VecT:
+    """std::vector<T> <=> Vec<T>; T is a non-bool Prim, String or a VecT."""
+
+    elem: "Ty"
+
+    def __str__(self):
+        return "Vec<%s>" % self.elem
+
+
+@dataclass(frozen=True)
+class StrT:
+    """std::string <=> String.  INVARIANT: every String is ASCII."""
+
+    def __str__(self):
+        return "String"
+
+
+@dataclass(frozen=True)
+class RefT:
+    """A reference: `const T&` <=> `&T`, `T&` <=> `&mut T` (FR-251).
+
+    Only parameters and range-for variables have reference type; nothing
+    returns or stores a reference.
+    """
+
+    inner: "Ty"
+    mutable: bool
+
+    def __str__(self):
+        return "&%s%s" % ("mut " if self.mutable else "", self.inner)
+
+
+Ty = Union[Prim, VecT, StrT, RefT]  # the closed sum
+TYPE_CLASSES = (Prim, VecT, StrT, RefT)
+STRING = StrT()
 
 I8 = Prim("i8")
 U8 = Prim("u8")
@@ -93,6 +138,32 @@ PRIM_BY_NAME = {p.name: p for p in ALL_PRIMS + (UNIT,)}
 
 def is_int(t):
     return t in INT_TYPES
+
+
+def is_copy(t):
+    """Copy types are the scalars; Vec and String are move-only."""
+    return isinstance(t, Prim)
+
+
+def is_owned_nc(t):
+    """An owned non-Copy value type (Vec or String)."""
+    return isinstance(t, (VecT, StrT))
+
+
+def deref(t):
+    return t.inner if isinstance(t, RefT) else t
+
+
+def elem_ok(t):
+    """May ``t`` be a vector element type?  (std::vector<bool> is a bit-
+    packed specialization whose operator[] returns a proxy, not a bool&.)"""
+    if isinstance(t, Prim):
+        return t in ALL_PRIMS and t != BOOL
+    if isinstance(t, StrT):
+        return True
+    if isinstance(t, VecT):
+        return elem_ok(t.elem)
+    return False
 
 
 def is_unsigned(t):
@@ -150,6 +221,8 @@ class StrLit:
 class Var:
     name: str
     loc: Optional[Loc] = _loc()
+    # Rust input only: 'deref' for `*x` (x a reference).
+    spelling: str = field(default="", compare=False, repr=False)
 
 
 # Unary ops: 'neg' (arithmetic negation; wrapping on unsigned), 'not'
@@ -218,8 +291,124 @@ class ResidualExpr:
     cascade: bool = field(default=False, compare=False, repr=False)
 
 
+# ---------------------------------------------------------------- FR-251 exprs
+
+@dataclass(frozen=True)
+class Clone:
+    """An explicit copy of a non-Copy PLACE (Var or Index): C++ copy
+    construction / copy assignment, Rust `x.clone()`."""
+
+    operand: "Expr"
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class Index:
+    """`v[i]` on a vector place; ``index`` is usize."""
+
+    base: "Expr"
+    index: "Expr"
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class ByteAt:
+    """Read-only `s[i]` on a std::string (char, i8) <=> `s.as_bytes()[i] as i8`.
+
+    C++ defines `s[s.size()]` as '\\0'; Rust panics there (a LOUD
+    divergence, never a silent one) -- tests keep indices below size().
+    A write through `s[i]` is not in the subset (no safe String byte write).
+    """
+
+    base: "Expr"
+    index: "Expr"
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class Len:
+    """`x.size()` / `x.length()` <=> `x.len()` (Vec or String), usize."""
+
+    base: "Expr"
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class IsEmpty:
+    """`x.empty()` <=> `x.is_empty()`."""
+
+    base: "Expr"
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class VecLit:
+    """`{a, b}` / `std::vector<T>{a, b}` / `std::vector<T>()` <=>
+    `vec![a, b]` / `Vec::new()`.  ``elem`` is the element type (needed for
+    the empty literal); rs_parse leaves it None and normalize fills it."""
+
+    elem: Optional["Ty"]
+    elems: Tuple["Expr", ...]
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class VecFill:
+    """`std::vector<T>(n, x)` <=> `vec![x; n]` (n usize; x copied n times)."""
+
+    value: "Expr"
+    count: "Expr"
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class StrNew:
+    """`std::string()` <=> `String::new()`."""
+
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class StrFrom:
+    """`std::string("lit")` <=> `String::from("lit")` (ASCII only)."""
+
+    value: str
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class Substr:
+    """`s.substr(p, n)` <=> `bx::substr(&s, p, n)`; `s.substr(p)` (count
+    None) <=> `bx::substr_from(&s, p)`.  Both clamp n like C++."""
+
+    base: "Expr"
+    pos: "Expr"
+    count: Optional["Expr"]
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class ToStr:
+    """`std::to_string(x)` <=> `x.to_string()` for integer x."""
+
+    operand: "Expr"
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class Borrow:
+    """SURFACE-ONLY (rs_parse): Rust `&e` / `&mut e`.  The borrow is a
+    spelling the printer derives from types, so normalize removes it; the
+    Kernel proper never contains one."""
+
+    operand: "Expr"
+    mutable: bool
+    loc: Optional[Loc] = _loc()
+
+
 Expr = Union[IntLit, FloatLit, BoolLit, StrLit, Var, Unary, Binary, Cast, Call,
-             ResidualExpr]
+             ResidualExpr, Clone, Index, ByteAt, Len, IsEmpty, VecLit, VecFill,
+             StrNew, StrFrom, Substr, ToStr]
 
 
 # ---------------------------------------------------------------- printf
@@ -350,8 +539,102 @@ class ResidualStmt:
     loc: Optional[Loc] = _loc()
 
 
+# ---------------------------------------------------------------- FR-251 stmts
+
+@dataclass(frozen=True)
+class Store:
+    """`v[i] = e;` (target an Index place)."""
+
+    target: Index
+    value: Expr
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class CompoundStore:
+    """`v[i] op= e;` (`++v[i];` for += 1)."""
+
+    op: str
+    target: Index
+    value: Expr
+    loc: Optional[Loc] = _loc()
+    spelling: str = field(default="", compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class Push:
+    """`v.push_back(e);` <=> `v.push(e);` -- e is CONSUMED."""
+
+    target: Expr
+    value: Expr
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class Pop:
+    """`v.pop_back();` <=> `v.pop();` (pop on empty is UB in C++: excluded)."""
+
+    target: Expr
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class Clear:
+    """`x.clear();` (Vec or String)."""
+
+    target: Expr
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class Resize:
+    """`v.resize(n, x);` (x COPIED into new slots)."""
+
+    target: Expr
+    count: Expr
+    value: Expr
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class PushStr:
+    """`s += t;` <=> `s.push_str(&t);` (t a String or a literal)."""
+
+    target: Expr
+    value: Expr
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class PushByte:
+    """`s.push_back(c);` / `s += c;` <=> `bx::push_byte(&mut s, c);`."""
+
+    target: Expr
+    value: Expr
+    loc: Optional[Loc] = _loc()
+
+
+# Range-for modes: 'copy' `for (T x : v)` <=> `for x in v.iter().copied()`
+# (`.cloned()` for non-Copy T), 'ref' `for (const T& x : v)` <=>
+# `for x in v.iter()`, 'mut' `for (T& x : v)` <=> `for x in v.iter_mut()`.
+FOREACH_MODES = ("copy", "ref", "mut")
+
+
+@dataclass(frozen=True)
+class ForEach:
+    var: str
+    mutable: bool  # 'copy' only: `T x` (mut) vs `const T x`
+    mode: str
+    iterable: Expr
+    body: Block
+    loc: Optional[Loc] = _loc()
+
+
 Stmt = Union[Block, Let, Assign, CompoundAssign, ExprStmt, Print, If, While,
-             For, Break, Continue, Return, ResidualStmt]
+             For, Break, Continue, Return, ResidualStmt, Store, CompoundStore,
+             Push, Pop, Clear, Resize, PushStr, PushByte, ForEach]
+
+MUTATING_STMTS = (Push, Pop, Clear, Resize, PushStr, PushByte)
 
 
 # ---------------------------------------------------------------- items
@@ -404,15 +687,15 @@ def walk(node):
         if isinstance(n, (tuple, list)):
             stack.extend(reversed(n))
             continue
-        if not is_dataclass(n) or isinstance(n, (Loc, Prim)):
+        if not is_dataclass(n) or isinstance(n, (Loc,) + TYPE_CLASSES):
             continue
         yield n
         kids = []
         for f in fields(n):
-            if f.name in ("loc", "spelling", "ty"):
+            if f.name in ("loc", "spelling", "ty", "elem"):
                 continue
             v = getattr(n, f.name)
-            if isinstance(v, (tuple, list)) or (is_dataclass(v) and not isinstance(v, (Loc, Prim))):
+            if isinstance(v, (tuple, list)) or (is_dataclass(v) and not isinstance(v, (Loc,) + TYPE_CLASSES)):
                 kids.append(v)
         stack.extend(reversed(kids))
 
@@ -478,6 +761,25 @@ def dump(node, indent=0):
         return pad + "continue\n"
     if isinstance(node, Return):
         return pad + "return" + ("" if node.value is None else " " + dump_expr(node.value)) + "\n"
+    if isinstance(node, Store):
+        return "%sstore %s = %s\n" % (pad, dump_expr(node.target), dump_expr(node.value))
+    if isinstance(node, CompoundStore):
+        return "%sstore %s %s= %s\n" % (pad, dump_expr(node.target), node.op, dump_expr(node.value))
+    if isinstance(node, Push):
+        return "%spush %s %s\n" % (pad, dump_expr(node.target), dump_expr(node.value))
+    if isinstance(node, Pop):
+        return "%spop %s\n" % (pad, dump_expr(node.target))
+    if isinstance(node, Clear):
+        return "%sclear %s\n" % (pad, dump_expr(node.target))
+    if isinstance(node, Resize):
+        return "%sresize %s %s %s\n" % (pad, dump_expr(node.target), dump_expr(node.count), dump_expr(node.value))
+    if isinstance(node, PushStr):
+        return "%spush_str %s %s\n" % (pad, dump_expr(node.target), dump_expr(node.value))
+    if isinstance(node, PushByte):
+        return "%spush_byte %s %s\n" % (pad, dump_expr(node.target), dump_expr(node.value))
+    if isinstance(node, ForEach):
+        return "%sforeach %s%s %s in %s\n" % (pad, "mut " if node.mutable else "", node.var, node.mode,
+                                              dump_expr(node.iterable)) + dump(node.body, indent + 1)
     if isinstance(node, (ResidualStmt, ResidualItem)):
         return "%sresidual %r\n" % (pad, node.reason)
     raise TypeError("dump: %r" % (node,))
@@ -502,6 +804,31 @@ def dump_expr(e):
         return "(cast %s %s)" % (e.ty, dump_expr(e.operand))
     if isinstance(e, Call):
         return "(call %s%s)" % (e.name, "".join(" " + dump_expr(a) for a in e.args))
+    if isinstance(e, Clone):
+        return "(clone %s)" % dump_expr(e.operand)
+    if isinstance(e, Index):
+        return "(index %s %s)" % (dump_expr(e.base), dump_expr(e.index))
+    if isinstance(e, ByteAt):
+        return "(byte %s %s)" % (dump_expr(e.base), dump_expr(e.index))
+    if isinstance(e, Len):
+        return "(len %s)" % dump_expr(e.base)
+    if isinstance(e, IsEmpty):
+        return "(is_empty %s)" % dump_expr(e.base)
+    if isinstance(e, VecLit):
+        return "(vec %s [%s])" % (e.elem, ", ".join(dump_expr(x) for x in e.elems))
+    if isinstance(e, VecFill):
+        return "(vec_fill %s %s)" % (dump_expr(e.value), dump_expr(e.count))
+    if isinstance(e, StrNew):
+        return "(string_new)"
+    if isinstance(e, StrFrom):
+        return "(string_from %r)" % e.value
+    if isinstance(e, Substr):
+        return "(substr %s %s%s)" % (dump_expr(e.base), dump_expr(e.pos),
+                                     "" if e.count is None else " " + dump_expr(e.count))
+    if isinstance(e, ToStr):
+        return "(to_string %s)" % dump_expr(e.operand)
+    if isinstance(e, Borrow):
+        return "(borrow%s %s)" % (" mut" if e.mutable else "", dump_expr(e.operand))
     if isinstance(e, ResidualExpr):
         return "(residual %r)" % e.reason
     raise TypeError("dump_expr: %r" % (e,))

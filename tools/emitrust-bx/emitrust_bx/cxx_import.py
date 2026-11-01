@@ -22,6 +22,29 @@ Measured facts this module is built on (FR-249 spike, Clang 21.1.8):
 
 Unsupported constructs do not stop the import: each becomes a located
 Residual node and the walk continues, so every blocker is counted.
+
+FR-251 (std::vector / std::string), measured on the same clang:
+
+* COPY vs MOVE is read from the AST, never guessed: a CXXConstructExpr
+  whose ctorType is `void (const vector<int> &)` is a copy (Kernel Clone),
+  `void (vector<int> &&) noexcept` a move; `return v;` of a local is the
+  move ctor over an xvalue NoOp (C++17 implicit move).  Overloaded
+  operators (`=`, `push_back`, `+`) pick copy vs move by the argument's
+  value category: an lvalue binds `const T&` (copy), `std::move(x)` (a
+  CallExpr to std's builtin `move`) or a temporary binds `T&&`.
+* types arrive in many spellings (`std::string`, `basic_string<char>`,
+  `basic_string<char, std::char_traits<char>, std::allocator<char>>`,
+  `value_type` desugaring to `int`, `std::vector<int, std::allocator<int>>`);
+  ``parse_cxx_type`` reads all of them.
+* `std::vector<T> v;` is init "call" with a zero-argument CXXConstructExpr;
+  `= {..}` an initializer_list ctor over CXXStdInitializerListExpr /
+  InitListExpr; `(n, x)` the (size_type, const value_type &) ctor.
+* CXXForRangeStmt carries the desugared __range/__begin/__end decls; only
+  the range initializer and the loop VarDecl are read.
+* import-side desugarings (C++ spellings, not Kernel normal forms):
+  `v.front()` -> `v[0]`, `v.back()` -> `v[v.size() - 1]` (both UB on an
+  empty vector; the Rust index panics), `s.length()` -> `s.size()`,
+  `s += c` (char) -> `s.push_back(c)`, `"lit" + s` -> `std::string("lit") + s`.
 """
 
 import bisect
@@ -36,6 +59,70 @@ from . import typecheck as TC
 
 class ClangError(Exception):
     pass
+
+
+def _split_targs(s):
+    """'a, b<c, d>, e' -> ['a', 'b<c, d>', 'e'] (top-level commas)."""
+    out, depth, cur = [], 0, []
+    for ch in s:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        out.append("".join(cur).strip())
+    return out
+
+
+_STRING_SPELLINGS = (
+    "string", "basic_string<char>",
+    "basic_string<char, char_traits<char>, allocator<char>>",
+    "basic_string<char, char_traits<char>, allocator<char> >",
+)
+
+
+def parse_cxx_type(q):
+    """A clang type spelling -> (Kernel type or None, top-level const).
+
+    References become RefT; `const` under a reference makes it shared.
+    """
+    if q is None:
+        return None, False
+    q = q.strip()
+    if q.endswith("&&"):
+        return None, False
+    if q.endswith("&"):
+        inner, const = parse_cxx_type(q[:-1])
+        if inner is None or isinstance(inner, K.RefT):
+            return None, False
+        return K.RefT(inner, not const), False
+    const = False
+    if q.startswith("const "):
+        const = True
+        q = q[len("const "):].strip()
+    if "volatile" in q:
+        return None, const
+    if q in TYPE_MAP:
+        return TYPE_MAP[q], const
+    plain = q.replace("std::", "").replace("__cxx11::", "")
+    if plain in _STRING_SPELLINGS:
+        return K.STRING, const
+    if plain.startswith("vector<") and plain.endswith(">"):
+        args = _split_targs(plain[len("vector<"):-1])
+        if len(args) == 2 and args[1].replace(" ", "") != ("allocator<%s>" % args[0]).replace(" ", ""):
+            return None, const
+        if len(args) not in (1, 2):
+            return None, const
+        el, econst = parse_cxx_type(args[0])
+        if el is None or econst or isinstance(el, K.RefT):
+            return None, const
+        return K.VecT(el), const
+    return None, const
 
 
 def run_clang(path, clang="clang++"):
@@ -226,6 +313,13 @@ class CxxImporter:
                 d = d[len("const "):]
             if d in TYPE_MAP and "volatile" not in q:
                 return TYPE_MAP[d], const, q
+        # FR-251: vectors, strings, references
+        kt, c2 = parse_cxx_type(q)
+        if kt is None and d:
+            kt, c3 = parse_cxx_type(d)
+            c2 = c2 or c3
+        if kt is not None:
+            return kt, const or c2, q
         return None, const, q
 
     def ty_of(self, e):
@@ -312,7 +406,7 @@ class CxxImporter:
             if p.get("kind") == "ParmVarDecl":
                 ptys.append(self.map_type(p.get("type"))[0])
         rs = self.ret_type_str(n)
-        ret = TYPE_MAP.get(rs)
+        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs)[0]
         return tuple(ptys), ret
 
     # -------------------------------------------------------------- funcs
@@ -342,17 +436,22 @@ class CxxImporter:
             if not pname:
                 pre.append(K.ResidualStmt("unnamed parameter", pl))
                 pname = "unnamed_param_%d" % len(params)
-            if ty is None or ty == K.UNIT:
+            if ty is None or ty == K.UNIT or (isinstance(K.deref(ty), K.VecT) and not K.elem_ok(K.deref(ty).elem)):
                 pre.append(K.ResidualStmt("parameter of type '%s'" % spelled, pl))
                 ty = K.I32
             if p.get("init") or p.get("inner"):
                 pre.append(K.ResidualStmt("default argument", pl))
-            params.append(K.Param(pname, ty, not const, pl))
-            self.scope.declare(pname, ty, not const)
+            mut = not const and not isinstance(ty, K.RefT)
+            params.append(K.Param(pname, ty, mut, pl))
+            self.scope.declare(pname, ty, mut)
             self.locals[p["id"]] = pname
         rs = self.ret_type_str(n)
-        ret = TYPE_MAP.get(rs)
-        if ret is None:
+        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs)[0]
+        self.ret_ref = isinstance(ret, K.RefT)
+        if isinstance(ret, K.RefT):
+            pre.append(K.ResidualStmt("function returning a reference", floc))
+            ret = ret.inner  # its returns become cascades, not more reports
+        elif ret is None or (isinstance(ret, K.VecT) and not K.elem_ok(ret.elem)):
             pre.append(K.ResidualStmt("return type '%s'" % rs, floc))
             ret = K.UNIT
         self.ret = ret
@@ -420,6 +519,10 @@ class CxxImporter:
             if self.in_main:
                 return [self.rstmt(n, "return inside main other than the final `return 0;`")]
             v = (n.get("inner") or [None])[0]
+            if v is not None and getattr(self, "ret_ref", False):
+                return [K.Return(K.ResidualExpr("returned reference", L, cascade=True), L)]
+            if v is not None and K.is_owned_nc(self.ret):
+                return [K.Return(self.consume(v, self.ret), L)]
             return [K.Return(None if v is None else self.expr(v), L)]
         if k == "BreakStmt":
             return [K.Break(L)]
@@ -442,11 +545,22 @@ class CxxImporter:
             return [K.While(self.truthy(self.expr(inner[0])), self.as_block(inner[1]), L)]
         if k == "ForStmt":
             return [self.for_(n)]
-        if k in ("ExprWithCleanups", "ParenExpr"):
+        if k == "CXXForRangeStmt":
+            return [self.range_for(n)]
+        if k == "CXXMemberCallExpr":
+            return [self.member_stmt(n)]
+        if k == "CXXOperatorCallExpr":
+            return [self.operator_stmt(n)]
+        if k in ("ExprWithCleanups", "ParenExpr", "CXXBindTemporaryExpr", "MaterializeTemporaryExpr"):
             return self.stmt(n["inner"][0])
         if k == "BinaryOperator" and n.get("opcode") == "=":
             name = self.local_ref(n["inner"][0])
             if name is None:
+                tgt = self.elem_target(n["inner"][0])
+                if isinstance(tgt, K.Index):
+                    return [K.Store(tgt, self.expr(n["inner"][1]), L)]
+                if isinstance(tgt, K.ResidualStmt):
+                    return [tgt]
                 return [self.rstmt(n, "assignment to something other than a local variable")]
             return [K.Assign(name, self.expr(n["inner"][1]), L)]
         if k == "CompoundAssignOperator":
@@ -496,12 +610,27 @@ class CxxImporter:
             return K.ResidualStmt("%s local variable" % d["storageClass"], L)
         if d.get("constexpr"):
             return K.ResidualStmt("constexpr variable", L)
-        if ty is None or ty == K.UNIT:
+        if ty is None or ty == K.UNIT or isinstance(ty, K.RefT):
             return K.ResidualStmt("variable of type '%s'" % spelled, L)
+        if isinstance(ty, K.VecT) and not K.elem_ok(ty.elem):
+            return K.ResidualStmt("variable of type '%s' (std::vector<bool> is a bit-packed proxy "
+                                  "container)" % spelled if ty.elem == K.BOOL else "variable of type '%s'" % spelled, L)
+        if K.is_owned_nc(ty) and d.get("init") == "call":
+            init = self.class_direct_init(d, ty)
+            if isinstance(init, K.ResidualStmt):
+                return init
+            self.scope.declare(name, ty, not const)
+            self.locals[d["id"]] = name
+            return K.Let(name, ty, not const, init, L)
         if "init" not in d:
             return K.ResidualStmt("declaration without an initializer", L)
         if d.get("init") != "c":
             return K.ResidualStmt("%s-initialization (the subset spells it `T x = e;`)" % d.get("init"), L)
+        if K.is_owned_nc(ty):
+            init = self.consume(d["inner"][0], ty)
+            self.scope.declare(name, ty, not const)
+            self.locals[d["id"]] = name
+            return K.Let(name, ty, not const, init, L)
         init = self.expr(d["inner"][0])
         if ty == K.BOOL:
             init = self.truthy(init)
@@ -513,12 +642,17 @@ class CxxImporter:
         L = self.loc(n)
         name = self.local_ref(n["inner"][0])
         if name is None:
+            tgt = self.elem_target(n["inner"][0])
+            if isinstance(tgt, K.ResidualStmt):
+                return tgt
+            if isinstance(tgt, K.Index):
+                return self.compound_elem(n, tgt)
             return self.rstmt(n, "compound assignment to something other than a local variable")
         op = COMPOUND_OPCODES.get(n.get("opcode"))
         if op is None:
             return self.rstmt(n, "operator '%s'" % n.get("opcode"))
         v = self.scope.lookup(name)
-        T = v[0] if v else None
+        T = K.deref(v[0]) if v else None
         CL = self.map_type(n.get("computeLHSType"))[0]
         rhs = self.expr(n["inner"][1])
         if T == K.BOOL:
@@ -529,14 +663,41 @@ class CxxImporter:
             return K.CompoundAssign(op, name, rhs, L)
         return K.Assign(name, K.Cast(T, K.Binary(op, K.Cast(CL, K.Var(name, L), L), rhs, L), L), L)
 
+    def compound_elem(self, n, tgt):
+        L = self.loc(n)
+        op = COMPOUND_OPCODES.get(n.get("opcode"))
+        if op is None:
+            return self.rstmt(n, "operator '%s'" % n.get("opcode"))
+        T = self.ty_of(tgt)
+        CL = self.map_type(n.get("computeLHSType"))[0]
+        rhs = self.expr(n["inner"][1])
+        if T == K.BOOL:
+            return self.rstmt(n, "compound assignment to bool")
+        if CL is None:
+            return self.rstmt(n, "compound assignment computed in type '%s'" % self.qual(n.get("computeLHSType")))
+        if CL == T:
+            return K.CompoundStore(op, tgt, rhs, L)
+        return K.Store(tgt, K.Cast(T, K.Binary(op, K.Cast(CL, tgt, L), rhs, L), L), L)
+
     def incdec(self, n):
         L = self.loc(n)
         name = self.local_ref(n["inner"][0])
-        if name is None:
-            return self.rstmt(n, "increment of something other than a local variable")
         op = "add" if n.get("opcode") == "++" else "sub"
+        if name is None:
+            tgt = self.elem_target(n["inner"][0])
+            if isinstance(tgt, K.ResidualStmt):
+                return tgt
+            if isinstance(tgt, K.Index):
+                T = self.ty_of(tgt)
+                if T in K.ARITH_INT:
+                    return K.CompoundStore(op, tgt, K.IntLit(1, T, L), L)
+                if T == K.F64:
+                    return K.CompoundStore(op, tgt, K.FloatLit("1.0", L), L)
+                if T in (K.I8, K.U8):
+                    return K.Store(tgt, K.Cast(T, K.Binary(op, K.Cast(K.I32, tgt, L), K.IntLit(1, K.I32, L), L), L), L)
+            return self.rstmt(n, "increment of something other than a local variable")
         v = self.scope.lookup(name)
-        T = v[0] if v else None
+        T = K.deref(v[0]) if v else None
         if T in K.ARITH_INT:
             return K.CompoundAssign(op, name, K.IntLit(1, T, L), L)
         if T == K.F64:
@@ -653,6 +814,10 @@ class CxxImporter:
             spelled = "%" + flags + ("" if width is None else str(width)) + length + conv
             if conv == "s":
                 sl = self.string_lit(a)
+                cs = self.c_str_base(a)
+                if sl is None and cs is not None:
+                    segs.append(K.Spec("s", self.borrowed(cs)))
+                    continue
                 if sl is None:
                     return self.rstmt(a, "printf %s of something other than a string literal")
                 try:
@@ -717,6 +882,10 @@ class CxxImporter:
             return self.rexpr(n, "implicit conversion (%s)" % ck)
         if k in ("CXXStaticCastExpr", "CStyleCastExpr", "CXXFunctionalCastExpr"):
             T, _, spelled = self.map_type(n.get("type"))
+            if K.is_owned_nc(T):
+                if k == "CXXFunctionalCastExpr" and n.get("castKind") == "ConstructorConversion":
+                    return self.class_expr(n["inner"][0])
+                return self.rexpr(n, "cast to '%s'" % spelled)
             if n.get("castKind") == "ToVoid":
                 return self.rexpr(n, "cast to void")
             if T is None or T == K.UNIT:
@@ -810,14 +979,528 @@ class CxxImporter:
             rd = c.get("referencedDecl", {})
             fname = self.user_funcs.get(rd.get("id"))
             if fname is None:
+                if rd.get("name") == "move":
+                    return self.rexpr(n, "std::move outside an initializer, assignment, by-value argument, "
+                                         "push_back or return")
+                if rd.get("name") == "to_string" and len(n["inner"]) == 2:
+                    return self.to_string(n)
                 return self.rexpr(n, "call to library function '%s'" % rd.get("name"))
+            ptys = self.sigs.get(fname, ((), None))[0]
             args = []
-            for a in n["inner"][1:]:
+            for i, a in enumerate(n["inner"][1:]):
                 if a.get("kind") == "CXXDefaultArgExpr":
                     return self.rexpr(a, "default argument")
-                args.append(self.expr(a))
+                pt = ptys[i] if i < len(ptys) else None
+                if isinstance(pt, K.RefT):
+                    name = self.local_ref(a)
+                    if name is not None:
+                        args.append(K.Var(name, self.loc(a)))
+                        continue
+                    tgt = self.elem_target(a)
+                    if isinstance(tgt, K.Index):
+                        args.append(tgt)
+                        continue
+                    if pt.mutable:
+                        return self.rexpr(a, "argument %d of '%s' binds a non-const reference to something "
+                                             "other than a variable or element" % (i + 1, fname))
+                    args.append(self.borrowed(a) if K.is_owned_nc(pt.inner) else self.expr(a))
+                elif K.is_owned_nc(pt):
+                    args.append(self.consume(a, pt))
+                else:
+                    args.append(self.expr(a))
             return K.Call(fname, tuple(args), L)
+        if k == "CXXMemberCallExpr":
+            return self.member_expr(n)
+        if k == "CXXOperatorCallExpr":
+            return self.operator_expr(n)
+        if k in ("CXXConstructExpr", "CXXTemporaryObjectExpr", "CXXBindTemporaryExpr",
+                 "MaterializeTemporaryExpr"):
+            T = self.map_type(n.get("type"))[0]
+            if K.is_owned_nc(T) or k in ("CXXBindTemporaryExpr", "MaterializeTemporaryExpr"):
+                return self.class_expr(n)
         return self.rexpr(n, friendly(k))
+
+    # ================================================== FR-251: vector/string
+    TMP_KINDS = ("ParenExpr", "ExprWithCleanups", "ConstantExpr", "CXXBindTemporaryExpr",
+                 "MaterializeTemporaryExpr")
+
+    def strip_tmp(self, n):
+        """See through temporaries, parens and NoOp/LValueToRValue casts."""
+        while isinstance(n, dict):
+            k = n.get("kind")
+            if k in self.TMP_KINDS or (k == "ImplicitCastExpr" and n.get("castKind") in ("LValueToRValue", "NoOp")):
+                n = n["inner"][0]
+            else:
+                return n
+        return n
+
+    def callee_decl(self, n):
+        c = self.strip(n["inner"][0])
+        while isinstance(c, dict) and c.get("kind") == "ImplicitCastExpr" and c.get("castKind") in (
+                "FunctionToPointerDecay", "BuiltinFnToFnPtr"):
+            c = self.strip(c["inner"][0])
+        if isinstance(c, dict) and c.get("kind") == "DeclRefExpr":
+            return c.get("referencedDecl", {})
+        return {}
+
+    def std_move_arg(self, n):
+        """The argument of a `std::move(x)` call, or None."""
+        n = self.strip_tmp(n)
+        if not isinstance(n, dict) or n.get("kind") != "CallExpr" or len(n.get("inner", [])) != 2:
+            return None
+        rd = self.callee_decl(n)
+        if rd.get("name") == "move" and rd.get("id") not in self.user_funcs:
+            return n["inner"][1]
+        return None
+
+    @staticmethod
+    def real_args(n):
+        return [a for a in n.get("inner", []) if isinstance(a, dict) and a.get("kind") != "CXXDefaultArgExpr"]
+
+    def ctor_kind(self, n):
+        args = self.real_args(n)
+        ct = (n.get("ctorType") or {}).get("qualType", "")
+        if not args:
+            return "default", args
+        if len(args) == 1 and self.strip_tmp(args[0]).get("kind") == "CXXStdInitializerListExpr":
+            return "ilist", args
+        params = ct[ct.find("(") + 1:ct.rfind(")")] if "(" in ct else ""
+        if len(args) == 1 and "&&" in params and "," not in params:
+            return "move", args
+        if len(args) == 1 and params.startswith("const ") and params.endswith("&") and "," not in params:
+            return "copy", args
+        if len(args) == 1 and params.startswith("const char *"):
+            return "cstr", args
+        if len(args) == 2 and params.startswith("size_type, const value_type &"):
+            return "fill", args
+        return "other", args
+
+    def unwrap_ctor(self, n):
+        """Strip temporaries and constructor-conversion wrappers."""
+        while True:
+            n = self.strip_tmp(n)
+            k = n.get("kind")
+            if k == "ImplicitCastExpr" and n.get("castKind") == "ConstructorConversion":
+                n = n["inner"][0]
+            elif k == "CXXFunctionalCastExpr" and n.get("castKind") == "ConstructorConversion":
+                n = n["inner"][0]
+            else:
+                return n
+
+    def literal_value(self, n):
+        """(text, None) for an ASCII string literal node, (None, residual) or (None, None)."""
+        sl = self.string_lit(n)
+        if sl is None:
+            return None, None
+        try:
+            v = fmt.c_unescape_literal(sl.get("value", ""))
+        except fmt.FormatError as ex:
+            return None, self.rexpr(n, str(ex))
+        if any(not (1 <= ord(c) <= 0x7F) for c in v):
+            return None, self.rexpr(n, "non-ASCII string literal (every String is ASCII so byte indexing "
+                                       "never splits a character)")
+        return v, None
+
+    def class_expr(self, n):
+        """A FRESH vector/string value (constructor, call, operator result)."""
+        L = self.loc(n)
+        n = self.unwrap_ctor(n)
+        k = n.get("kind")
+        if k in ("CXXConstructExpr", "CXXTemporaryObjectExpr"):
+            T, _, spelled = self.map_type(n.get("type"))
+            if not K.is_owned_nc(T):
+                return self.rexpr(n, "construction of '%s'" % spelled)
+            kind, args = self.ctor_kind(n)
+            if kind == "default":
+                return K.VecLit(T.elem, (), L) if isinstance(T, K.VecT) else K.StrNew(L)
+            if kind == "ilist" and isinstance(T, K.VecT):
+                il = self.strip_tmp(self.strip_tmp(args[0])["inner"][0])
+                if il.get("kind") != "InitListExpr":
+                    return self.rexpr(n, "initializer list")
+                return K.VecLit(T.elem, tuple(self.copied(x, T.elem) for x in il.get("inner", [])), L)
+            if kind == "fill" and isinstance(T, K.VecT):
+                return K.VecFill(self.copied(args[1], T.elem), self.expr(args[0]), L)
+            if kind == "cstr" and T == K.STRING:
+                v, bad = self.literal_value(args[0])
+                if bad is not None:
+                    return bad
+                if v is None:
+                    return self.rexpr(n, "std::string from something other than a string literal")
+                return K.StrFrom(v, L)
+            if kind == "copy":
+                return K.Clone(self.place(args[0]), L)
+            if kind == "move":
+                return self.moved(args[0])
+            return self.rexpr(n, "%s constructor" % ("std::string" if T == K.STRING else "std::vector"))
+        return self.expr(n)
+
+    def moved(self, a):
+        L = self.loc(a)
+        inner = self.std_move_arg(a)
+        if inner is None:
+            s = self.strip_tmp(a)
+            if s.get("kind") == "DeclRefExpr" and s.get("valueCategory") == "lvalue":
+                inner = s  # `return v;`: C++17 implicit move (xvalue NoOp over the DeclRefExpr)
+            else:
+                return self.class_expr(a)  # moving from a temporary is the temporary
+        name = self.local_ref(inner)
+        if name is None:
+            return self.rexpr(a, "std::move of something other than a variable")
+        return K.Var(name, L)
+
+    def consume(self, n, ty=None):
+        """A CONSUMING position for a non-Copy value: copy -> Clone, move ->
+        bare Var, temporary -> itself."""
+        u = self.unwrap_ctor(n)
+        k = u.get("kind")
+        if k in ("CXXConstructExpr", "CXXTemporaryObjectExpr"):
+            kind, args = self.ctor_kind(u)
+            if kind == "copy":
+                if self.std_move_arg(args[0]) is not None:
+                    return self.rexpr(args[0], "std::move of a const object (it copies)")
+                return K.Clone(self.place(args[0]), self.loc(n))
+            if kind == "move":
+                return self.moved(args[0])
+            return self.class_expr(u)
+        if self.std_move_arg(n) is not None:
+            return self.moved(n)
+        if u.get("valueCategory") == "lvalue":
+            return K.Clone(self.place(u), self.loc(n))
+        return self.class_expr(u)
+
+    def copied(self, n, ty):
+        """A COPIED position (C++ takes `const T&` and copies): a place stays bare."""
+        if K.is_copy(ty):
+            return self.expr(n)
+        u = self.unwrap_ctor(n)
+        if u.get("kind") in ("CXXConstructExpr", "CXXTemporaryObjectExpr"):
+            kind, args = self.ctor_kind(u)
+            if kind == "copy":
+                return self.place(args[0])
+            return self.class_expr(u)
+        if u.get("valueCategory") == "lvalue":
+            return self.place(u)
+        return self.class_expr(u)
+
+    def borrowed(self, n):
+        """A position that only READS a vector/string (receiver, operand)."""
+        u = self.strip_tmp(n)
+        if u.get("valueCategory") == "lvalue":
+            return self.place(u)
+        return self.class_expr(u)
+
+    def place(self, n):
+        """A local variable, `v[i]`, `v.front()` / `v.back()` (desugared)."""
+        u = self.strip_tmp(n)
+        L = self.loc(u)
+        name = self.local_ref(u)
+        if name is not None:
+            return K.Var(name, L)
+        k = u.get("kind")
+        if k == "DeclRefExpr":
+            return self.expr(u)
+        if k == "CXXOperatorCallExpr" and self.op_name(u) == "operator[]":
+            e = self.operator_expr(u)
+            if isinstance(e, K.ByteAt):
+                return self.rexpr(u, "reference to a std::string element")
+            return e
+        if k == "CXXMemberCallExpr":
+            me = self.strip(u["inner"][0])
+            if me.get("kind") == "MemberExpr" and me.get("name") in ("front", "back"):
+                return self.member_expr(u)
+        return self.rexpr(u, "copy of something other than a variable or element")
+
+    def op_name(self, n):
+        return self.callee_decl(n).get("name", "")
+
+    def to_string(self, n):
+        a = self.expr(n["inner"][1])
+        t = self.ty_of(a)
+        if t is not None and t not in K.ARITH_INT:
+            return self.rexpr(n, "std::to_string of '%s' (only int, long long, unsigned, unsigned long long, "
+                                 "std::size_t)" % (self.qual(self.strip(n["inner"][1]).get("type")) or t))
+        return K.ToStr(a, self.loc(n))
+
+    def c_str_base(self, n):
+        u = self.strip_tmp(n)
+        if u.get("kind") != "CXXMemberCallExpr":
+            return None
+        me = self.strip(u["inner"][0])
+        if me.get("kind") == "MemberExpr" and me.get("name") == "c_str" and not me.get("isArrow"):
+            return me["inner"][0]
+        return None
+
+    def back_front(self, recv, which, n):
+        L = self.loc(n)
+        if not TC.is_place(recv) or any(isinstance(x, K.Call) for x in K.walk(recv)):
+            return self.rexpr(n, "%s() of something other than a variable or element" % which)
+        if which == "front":
+            return K.Index(recv, K.IntLit(0, K.USIZE, L), L)
+        return K.Index(recv, K.Binary("sub", K.Len(recv, L), K.IntLit(1, K.USIZE, L), L), L)
+
+    def member_call_parts(self, n):
+        me = self.strip(n["inner"][0])
+        if me.get("kind") != "MemberExpr":
+            return None, None, None, self.rexpr(n, "member function call")
+        if me.get("isArrow"):
+            return None, None, None, self.rexpr(n, "member access through a pointer")
+        recv = self.borrowed(me["inner"][0])
+        if isinstance(recv, K.ResidualExpr):
+            return None, None, None, recv
+        return me.get("name"), recv, self.real_args(n)[1:], None
+
+    def member_expr(self, n):
+        L = self.loc(n)
+        name, recv, args, bad = self.member_call_parts(n)
+        if bad is not None:
+            return bad
+        rt = self.ty_of(recv)
+        if isinstance(rt, K.VecT):
+            if name == "size" and not args:
+                return K.Len(recv, L)
+            if name == "empty" and not args:
+                return K.IsEmpty(recv, L)
+            if name in ("front", "back") and not args:
+                return self.back_front(recv, name, n)
+            if name == "at":
+                return self.rexpr(n, "std::vector::at (bounds-checked access that throws; the subset has "
+                                     "operator[])")
+            if name in ("begin", "end", "cbegin", "cend", "rbegin", "rend", "data", "insert", "erase"):
+                return self.rexpr(n, "std::vector::%s (iterators and pointers are outside the subset)" % name)
+            if name in ("push_back", "pop_back", "clear", "resize"):
+                return self.rexpr(n, "std::vector::%s used as a value" % name)
+            return self.rexpr(n, "std::vector::%s" % name)
+        if rt == K.STRING:
+            if name in ("size", "length") and not args:
+                return K.Len(recv, L)
+            if name == "empty" and not args:
+                return K.IsEmpty(recv, L)
+            if name == "substr" and len(args) in (1, 2):
+                return K.Substr(recv, self.expr(args[0]), self.expr(args[1]) if len(args) == 2 else None, L)
+            if name == "c_str":
+                return self.rexpr(n, "std::string::c_str outside a printf %s argument")
+            return self.rexpr(n, "std::string::%s" % name)
+        return self.rexpr(n, "member function call")
+
+    def member_stmt(self, n):
+        L = self.loc(n)
+        name, recv, args, bad = self.member_call_parts(n)
+        if bad is not None:
+            return K.ResidualStmt(bad.reason, bad.loc)
+        rt = self.ty_of(recv)
+        if isinstance(rt, K.VecT):
+            if name == "push_back" and len(args) == 1:
+                v = self.copied(args[0], rt.elem) if K.is_copy(rt.elem) else self.consume(args[0], rt.elem)
+                return K.Push(recv, v, L)
+            if name == "pop_back" and not args:
+                return K.Pop(recv, L)
+            if name == "clear" and not args:
+                return K.Clear(recv, L)
+            if name == "resize":
+                if len(args) != 2:
+                    return self.rstmt(n, "std::vector::resize without a fill value")
+                return K.Resize(recv, self.expr(args[0]), self.copied(args[1], rt.elem), L)
+        if rt == K.STRING:
+            if name == "push_back" and len(args) == 1:
+                return K.PushByte(recv, self.expr(args[0]), L)
+            if name == "clear" and not args:
+                return K.Clear(recv, L)
+        e = self.member_expr(n)
+        if isinstance(e, K.ResidualExpr):
+            return K.ResidualStmt(e.reason, e.loc)
+        return self.rstmt(n, "expression statement without effect")
+
+    def str_operand(self, a, allow_lit):
+        v, bad = self.literal_value(a)
+        if bad is not None:
+            return bad
+        if v is not None:
+            if not allow_lit:
+                return self.rexpr(a, "ordering comparison of a std::string with a string literal")
+            return K.StrLit(v, self.loc(a))
+        return self.borrowed(a)
+
+    CMP_OPS = {"operator==": "eq", "operator!=": "ne", "operator<": "lt", "operator<=": "le",
+               "operator>": "gt", "operator>=": "ge"}
+
+    def operator_expr(self, n):
+        L = self.loc(n)
+        name = self.op_name(n)
+        args = n.get("inner", [])[1:]
+        if name == "operator[]" and len(args) == 2:
+            base = self.borrowed(args[0])
+            bt = self.ty_of(base)
+            if isinstance(base, K.ResidualExpr):
+                return base
+            if isinstance(bt, K.VecT):
+                return K.Index(base, self.expr(args[1]), L)
+            if bt == K.STRING:
+                return K.ByteAt(base, self.expr(args[1]), L)
+            return self.rexpr(n, "overloaded operator call")
+        if name in self.CMP_OPS and len(args) == 2:
+            op = self.CMP_OPS[name]
+            a = self.str_operand(args[0], op in ("eq", "ne"))
+            b = self.str_operand(args[1], op in ("eq", "ne"))
+            for x in (a, b):
+                if isinstance(x, K.ResidualExpr):
+                    return x
+            ta, tb = self.ty_of(a), self.ty_of(b)
+            if isinstance(ta, K.VecT) and op not in ("eq", "ne"):
+                return self.rexpr(n, "ordering comparison of vectors")
+            if ta == K.STR and tb == K.STR:
+                return self.rexpr(n, "comparison of two string literals")
+            return K.Binary(op, a, b, L)
+        if name == "operator+" and len(args) == 2:
+            v, bad = self.literal_value(args[0])
+            if bad is not None:
+                return bad
+            if v is not None:
+                lhs = K.StrFrom(v, self.loc(args[0]))
+            else:
+                if self.map_type(self.strip_tmp(args[0]).get("type"))[0] == K.I8:
+                    return self.rexpr(n, "char + std::string")
+                lhs = self.consume(args[0], K.STRING)
+            if self.map_type(self.strip_tmp(args[1]).get("type"))[0] == K.I8:
+                return self.rexpr(n, "std::string + char")
+            rhs = self.str_operand(args[1], True)
+            for x in (lhs, rhs):
+                if isinstance(x, K.ResidualExpr):
+                    return x
+            return K.Binary("add", lhs, rhs, L)
+        if name in ("operator=", "operator+="):
+            return self.rexpr(n, "assignment used as a value")
+        for a in args:
+            # name the out-of-subset operand (an iterator from v.begin()) rather than the operator
+            u = self.strip_tmp(a)
+            if u.get("kind") == "CXXMemberCallExpr":
+                e = self.member_expr(u)
+                if isinstance(e, K.ResidualExpr):
+                    return e
+        return self.rexpr(n, "overloaded operator call")
+
+    def elem_target(self, n):
+        """Index for an assignable `v[i]` / `v.back()`, a ResidualStmt, or None."""
+        u = self.strip_tmp(n)
+        k = u.get("kind")
+        if k == "CXXOperatorCallExpr" and self.op_name(u) == "operator[]":
+            e = self.operator_expr(u)
+            if isinstance(e, K.ByteAt):
+                return self.rstmt(u, "assignment to a std::string element (Rust has no safe String byte "
+                                     "write)")
+            if isinstance(e, K.ResidualExpr):
+                return K.ResidualStmt(e.reason, e.loc)
+            return e
+        if k == "CXXMemberCallExpr":
+            e = self.member_expr(u)  # front()/back() desugar to an Index; v.at(i) is named
+            if isinstance(e, K.ResidualExpr):
+                return K.ResidualStmt(e.reason, e.loc)
+            if isinstance(e, K.Index):
+                return e
+        return None
+
+    def operator_stmt(self, n):
+        L = self.loc(n)
+        name = self.op_name(n)
+        args = n.get("inner", [])[1:]
+        if name in ("operator=", "operator+=") and len(args) == 2:
+            lname = self.local_ref(args[0])
+            tgt = K.Var(lname, self.loc(args[0])) if lname is not None else self.elem_target(args[0])
+            if isinstance(tgt, K.ResidualStmt):
+                return tgt
+            if tgt is None:
+                return self.rstmt(n, "assignment to something other than a local variable")
+            tt = self.ty_of(tgt)
+            if name == "operator=":
+                v, bad = self.literal_value(args[1])
+                if bad is not None:
+                    return K.ResidualStmt(bad.reason, bad.loc)
+                val = K.StrFrom(v, self.loc(args[1])) if v is not None else self.consume(args[1], tt)
+                if isinstance(tgt, K.Var):
+                    return K.Assign(tgt.name, val, L)
+                return K.Store(tgt, val, L)
+            if tt != K.STRING:
+                return self.rstmt(n, "overloaded operator call")
+            if self.map_type(self.strip_tmp(args[1]).get("type"))[0] == K.I8:
+                return K.PushByte(tgt, self.expr(args[1]), L)
+            val = self.str_operand(args[1], True)
+            if isinstance(val, K.ResidualExpr):
+                return K.ResidualStmt(val.reason, val.loc)
+            return K.PushStr(tgt, val, L)
+        e = self.operator_expr(n)
+        if isinstance(e, K.ResidualExpr):
+            return K.ResidualStmt(e.reason, e.loc)
+        return self.rstmt(n, "expression statement without effect")
+
+    def class_direct_init(self, d, ty):
+        """`std::vector<T> v;` / `std::vector<T> v(n, x);` / `std::string s;`."""
+        L = self.loc(d)
+        c = self.unwrap_ctor((d.get("inner") or [{}])[0])
+        if c.get("kind") != "CXXConstructExpr":
+            return K.ResidualStmt("call-initialization (the subset spells it `T x = e;`)", L)
+        kind, args = self.ctor_kind(c)
+        if kind == "default" or (kind == "fill" and isinstance(ty, K.VecT)):
+            e = self.class_expr(c)
+            return e
+        if isinstance(ty, K.VecT) and len(args) == 1 and kind == "other":
+            return K.ResidualStmt("std::vector(n) without a fill value", L)
+        return K.ResidualStmt("call-initialization (the subset spells it `T x = e;`)", L)
+
+    def range_for(self, n):
+        L = self.loc(n)
+        inner = n.get("inner", [])
+        if len(inner) < 3:
+            return self.rstmt(n, "range-based for loop")
+        if inner[0] and inner[0].get("kind"):
+            return self.rstmt(n, "range-based for with an init-statement")
+        rng = None
+        for c in inner:
+            if c.get("kind") == "DeclStmt":
+                vd = c.get("inner", [{}])[0]
+                if (vd.get("name") or "").startswith("__range"):
+                    rng = vd
+                    break
+        lv_stmt, body = inner[-2], inner[-1]
+        if rng is None or lv_stmt.get("kind") != "DeclStmt":
+            return self.rstmt(n, "range-based for loop")
+        vd = lv_stmt["inner"][0]
+        head = self.text_at(vd).lstrip()
+        if head.startswith("const "):
+            head = head[len("const "):].lstrip()
+        if head.startswith("auto") and (len(head) == 4 or not (head[4].isalnum() or head[4] == "_")):
+            return K.ResidualStmt("auto-typed declaration", self.loc(vd))
+        it = self.borrowed(rng["inner"][0])
+        if isinstance(it, K.ResidualExpr):
+            return K.ResidualStmt(it.reason, it.loc)
+        if not TC.is_place(it):
+            return self.rstmt(n, "range-based for over something other than a variable or element")
+        t = self.ty_of(it)
+        if t == K.STRING:
+            return self.rstmt(n, "range-based for over a std::string")
+        if not isinstance(t, K.VecT):
+            return self.rstmt(n, "range-based for loop")
+        vt, const, spelled = self.map_type(vd.get("type"))
+        name = vd.get("name")
+        if isinstance(vt, K.RefT):
+            mode, mutable = ("mut" if vt.mutable else "ref"), False
+        else:
+            mode, mutable = "copy", not const
+        if vt is None or K.deref(vt) != t.elem:
+            return K.ResidualStmt("range-for variable of type '%s' over a %s" % (spelled, t), self.loc(vd))
+        saved = self.scope
+        self.scope = saved.child()
+        self.scope.declare(name, vt if mode != "copy" else t.elem, mutable)
+        self.locals[vd["id"]] = name
+        try:
+            if body.get("kind") == "CompoundStmt":
+                out = []
+                for st in body.get("inner", []):
+                    out.extend(self.stmt(st))
+                blk = K.Block(tuple(out), self.loc(body))
+            else:
+                blk = K.Block(tuple(self.stmt(body)), self.loc(body))
+        finally:
+            self.scope = saved
+        return K.ForEach(name, mutable, mode, it, blk, L)
 
 
 def cxx_import(path, clang="clang++"):
