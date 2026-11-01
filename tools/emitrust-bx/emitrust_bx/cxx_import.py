@@ -147,6 +147,7 @@ import subprocess
 
 from . import fmt
 from . import kernel as K
+from . import normalize as NZ
 from . import typecheck as TC
 
 
@@ -331,6 +332,8 @@ FRIENDLY = {
     "CXXReinterpretCastExpr": "reinterpret_cast", "CXXConstCastExpr": "const_cast",
 }
 
+FOR_BAD = "`for` loop outside the canonical counting form `for (int i = a; i < b; ++i)`"
+
 # FR-261 refusals (each names the pointer SHAPE; see the module docstring)
 R3_SIGNED = ("signed pointer offset (C++ allows a negative offset into the middle of an array; a Rust suffix "
              "slice cannot go backwards)")
@@ -450,6 +453,8 @@ class CxxImporter:
         self.fn_params = {}  # FR-252: template instantiation id -> (param index, RefT(FnT))
         self.bad_funcs = set()  # FR-252: decl ids of rejected function templates (pattern + instances)
         self._std = None  # FR-253: ids of the functions declared directly in namespace std
+        self.normalize = False  # FR-254: apply normalize.RULES instead of refusing their patterns
+        self.notes = []  # FR-254: (loc, "normalized: <rule>") per applied rule
 
     # -------------------------------------------------------------- utils
     def is_main(self, f):
@@ -1184,7 +1189,12 @@ class CxxImporter:
             inner = n["inner"]
             return [K.While(self.truthy(self.expr(inner[0])), self.as_block(inner[1]), L)]
         if k == "ForStmt":
-            return [self.for_(n)]
+            s = self.for_(n)
+            if self.normalize and isinstance(s, K.ResidualStmt) and s.reason == FOR_BAD:
+                return self.rewrite(n, NZ.FOR_TO_WHILE)
+            return [s]
+        if k == "DoStmt" and self.normalize:
+            return self.rewrite(n, NZ.DO_WHILE)
         if k == "CXXForRangeStmt":
             return [self.range_for(n)]
         if k == "CXXMemberCallExpr":
@@ -1232,6 +1242,18 @@ class CxxImporter:
                 return [K.ResidualStmt(e.reason, e.loc)]
             return [self.rstmt(n, "expression statement without effect")]
         return [self.rstmt(n, friendly(k))]
+
+    def rewrite(self, n, rule):
+        """FR-254: import ``rule``'s rewrite of ``n`` (or its guard's
+        located refusal)."""
+        why = rule.guard(n)
+        if why is not None:
+            return [self.rstmt(n, why)]
+        self.notes.append((self.loc(n), "normalized: " + rule.name))
+        out = []
+        for s in rule.apply(n):
+            out.extend(self.stmt(s))
+        return out
 
     def decl(self, d):
         r = self.decl_inner(d)
@@ -1391,7 +1413,7 @@ class CxxImporter:
 
     def for_(self, n):
         L = self.loc(n)
-        bad = "`for` loop outside the canonical counting form `for (int i = a; i < b; ++i)`"
+        bad = FOR_BAD
         inner = n.get("inner", [])
         if len(inner) != 5:
             return self.rstmt(n, bad)
@@ -3085,9 +3107,17 @@ def _split_captures(text):
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
 
 
-def cxx_import(path, clang="clang++"):
-    """Surface IR for the C++ file at ``path`` (may contain Residuals)."""
+def cxx_import(path, clang="clang++", normalize=False, notes=None):
+    """Surface IR for the C++ file at ``path`` (may contain Residuals).
+
+    FR-254: ``normalize`` applies normalize.RULES; each applied rule is
+    appended to ``notes`` as (loc, "normalized: <rule>")."""
     ast = run_clang(path, clang)
     with open(path, "rb") as f:
         source = f.read()
-    return CxxImporter(path, ast, source).run()
+    imp = CxxImporter(path, ast, source)
+    imp.normalize = normalize
+    prog = imp.run()
+    if notes is not None:
+        notes.extend(imp.notes)
+    return prog

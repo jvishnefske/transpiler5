@@ -316,6 +316,9 @@ RULES = [
     (r"^(closure '.*' (is not spelled the canonical way|may reach its end|modifies its capture of immutable)"
      r"|call to void closure|call of a callable object other than)", "closure: form", "generic"),
     (r"^the body of a range-for over '.*' modifies", "range-for: body modifies its container", None),
+    # FR-254 normalizer guards (only under --normalize)
+    (r"^(`for` loop|do-while loop) with a `continue` bound to it", "normalize: continue blocks loop rewrite", None),
+    (r"^`for` loop with a condition variable", "normalize: for with condition variable", None),
     # FR-263
     (r"^two calls that may print in one statement", "sequencing: two printing calls (normalizer)", None),
     (r"^identifier '.*' is reserved by the canonical Rust spelling", "identifier: reserved by canonical spelling", None),

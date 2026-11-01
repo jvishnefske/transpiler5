@@ -1,12 +1,18 @@
 """emitrust-bx command line (FR-250).
 
     emitrust-bx [--from=cpp|rust] [--emit=kernel|rust|cpp|crate] [-o OUT]
-                [--build] [--check-roundtrip] [--clang=clang++] SRC
+                [--build] [--check-roundtrip] [--normalize] [--clang=clang++] SRC
 
 Every construct outside the subset is reported as one located line
 `SRC:line:col: error: unsupported: <construct>` on stderr (ALL of them,
 sorted by location -- not the first), exit 1.  A program with any
 residual never reaches a printer.
+
+FR-254: ``--normalize`` (C++ input only, opt-in) applies the normalizer's
+rewrite rules (normalize.RULES) instead of refusing their patterns; each
+applied rule is a located `SRC:line:col: note: normalized: <rule>` line on
+stderr.  The output is canonical subset C++/Rust: ``--emit=cpp`` prints
+the rewritten program, which re-imports WITHOUT --normalize.
 """
 
 import argparse
@@ -29,9 +35,10 @@ def _key(item):
     return (loc is None, loc.line if loc else 0, loc.col if loc else 0, item[1])
 
 
-def load_cpp(path, clang):
-    """(normalized program or None, [(loc, msg)])."""
-    surf = cxx_import(path, clang)
+def load_cpp(path, clang, normalize=False, notes=None):
+    """(normalized program or None, [(loc, msg)]).  FR-254: ``normalize``
+    applies the rewrite rules, appending each application to ``notes``."""
+    surf = cxx_import(path, clang, normalize, notes)
     errs = [(r.loc, "unsupported: " + r.reason) for r in K.residuals(surf)]
     prog = TC.normalize(surf)
     for loc, msg in TC.check(prog):
@@ -48,6 +55,13 @@ def load_rust(path):
         src = f.read()
     prog, errs = RP.rs_parse_all(src)
     return prog, sorted(errs, key=_key)
+
+
+def report_notes(path, notes):
+    for loc, msg in sorted(set(notes), key=lambda x: (x[0] is None, x[0].line if x[0] else 0,
+                                                 x[0].col if x[0] else 0)):
+        where = "%s:%d:%d" % (path, loc.line, loc.col) if loc else "%s:1:1" % path
+        sys.stderr.write("%s: note: %s\n" % (where, msg))
 
 
 def report(path, errs):
@@ -101,6 +115,7 @@ def main(argv=None):
     ap.add_argument("-o", dest="out")
     ap.add_argument("--build", action="store_true")
     ap.add_argument("--check-roundtrip", action="store_true")
+    ap.add_argument("--normalize", action="store_true")
     ap.add_argument("--clang", default="clang++")
     ap.add_argument("src")
     a = ap.parse_args(argv)
@@ -112,13 +127,17 @@ def main(argv=None):
     if a.build and emit != "crate":
         sys.stderr.write("error: --build is only valid with --emit=crate\n")
         return 1
+    if a.normalize and lang != "cpp":
+        sys.stderr.write("error: --normalize applies to C++ input only\n")
+        return 1
     if emit == "crate" and not a.out:
         sys.stderr.write("error: --emit=crate needs -o DIR\n")
         return 1
 
+    notes = []
     try:
         if lang == "cpp":
-            prog, errs = load_cpp(a.src, a.clang)
+            prog, errs = load_cpp(a.src, a.clang, a.normalize, notes)
         else:
             prog, errs = load_rust(a.src)
     except ClangError as ex:
@@ -128,6 +147,7 @@ def main(argv=None):
     except OSError as ex:
         sys.stderr.write("error: %s\n" % ex)
         return 1
+    report_notes(a.src, notes)
     if errs:
         report(a.src, errs)
         return 1
