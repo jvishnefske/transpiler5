@@ -31,6 +31,14 @@ Design rules:
   suffix slice of an allocation) for parameters and locals, and two
   pointer-VALUE nodes, ``Offset`` (`p + k`, `v.data()`) and ``AddrOf``
   (`&x`); `*p` / `p[i]` / `p->f` are the existing Index / Field.
+* FR-259 adds ``Prim('i16')`` / ``Prim('u16')`` (`short` / `unsigned short`,
+  arithmetic only after an explicit promotion, like i8/u8) and two value
+  nodes: ``Cond`` (`c ? a : b` <=> `if c { a } else { b }`, scalar arms of
+  ONE type -- clang's usual arithmetic conversions are explicit Casts) and
+  ``IncDec`` (`++x` / `x++` / `--x` / `x--` USED AS A VALUE on an integer
+  variable of an arithmetic type <=> a canonical Rust block `{ x += 1; x }`
+  / `{ x += 1; x - 1 }`, wrapping for unsigned).  A statement `++x;` stays a
+  CompoundAssign.
 * ``Residual*`` nodes are the Surface-IR seam: cxx_import keeps going past an
   unsupported construct and leaves a located Residual in its place, so a
   program's distance from the subset is a COUNT, not a first failure
@@ -146,6 +154,8 @@ STRING = StrT()
 
 I8 = Prim("i8")
 U8 = Prim("u8")
+I16 = Prim("i16")  # FR-259
+U16 = Prim("u16")  # FR-259
 I32 = Prim("i32")
 I64 = Prim("i64")
 U32 = Prim("u32")
@@ -156,17 +166,22 @@ BOOL = Prim("bool")
 UNIT = Prim("()")
 STR = Prim("&str")  # only the type of a printf %s string-literal argument
 
-ALL_PRIMS = (I8, U8, I32, I64, U32, U64, USIZE, F64, BOOL)
-INT_TYPES = (I8, U8, I32, I64, U32, U64, USIZE)
+ALL_PRIMS = (I8, U8, I32, I64, U32, U64, USIZE, F64, BOOL, I16, U16)
+INT_TYPES = (I8, U8, I32, I64, U32, U64, USIZE, I16, U16)
+# FR-259: the integer types C++ PROMOTES to int before any arithmetic (the
+# Kernel has no arithmetic on them: every operand is an explicit Cast)
+SMALL_INT = (I8, U8, I16, U16)
 # The types arithmetic happens in after C++ integer promotion.
 ARITH_INT = (I32, I64, U32, U64, USIZE)
 ARITH = ARITH_INT + (F64,)
-UNSIGNED = (U8, U32, U64, USIZE)
-SIGNED = (I8, I32, I64)
+UNSIGNED = (U8, U32, U64, USIZE, U16)
+SIGNED = (I8, I32, I64, I16)
 
 INT_RANGE = {
     "i8": (-(1 << 7), (1 << 7) - 1),
     "u8": (0, (1 << 8) - 1),
+    "i16": (-(1 << 15), (1 << 15) - 1),
+    "u16": (0, (1 << 16) - 1),
     "i32": (-(1 << 31), (1 << 31) - 1),
     "i64": (-(1 << 63), (1 << 63) - 1),
     "u32": (0, (1 << 32) - 1),
@@ -545,9 +560,44 @@ class AddrOf:
     spelling: str = field(default="", compare=False, repr=False)
 
 
+# ---------------------------------------------------------------- FR-259 exprs
+
+@dataclass(frozen=True)
+class Cond:
+    """`c ? a : b` <=> `if c { a } else { b }`.  ``cond`` is bool, ``then``
+    and ``els`` have ONE scalar type (the usual arithmetic conversions are
+    explicit Casts); only the chosen arm is evaluated, in both languages."""
+
+    cond: "Expr"
+    then: "Expr"
+    els: "Expr"
+    loc: Optional[Loc] = _loc()
+
+
+INCDEC_OPS = ("add", "sub")
+
+
+@dataclass(frozen=True)
+class IncDec:
+    """An increment / decrement USED AS A VALUE: `++x` (``post`` False, the
+    new value) / `x++` (the old value), ``op`` 'add' or 'sub'.  ``var`` is a
+    Var of an integer variable (or reference to one) of an ARITHMETIC type.
+    Rust: `{ x += 1; x }` / `{ x += 1; x - 1 }` (`{ x -= 1; x + 1 }` for
+    `x--`), unsigned `{ x = x.wrapping_add(1u32); x.wrapping_sub(1u32) }`.
+    ``spelling`` (compare=False) is the Rust surface: (wrapping?, literal
+    type), checked against the variable's type."""
+
+    var: "Var"
+    op: str
+    post: bool
+    loc: Optional[Loc] = _loc()
+    spelling: tuple = field(default=(), compare=False, repr=False)
+
+
 Expr = Union[IntLit, FloatLit, BoolLit, StrLit, Var, Unary, Binary, Cast, Call,
              ResidualExpr, Clone, Index, ByteAt, Len, IsEmpty, VecLit, VecFill,
-             StrNew, StrFrom, Substr, ToStr, Field, StructLit, MethodCall, Offset, AddrOf]
+             StrNew, StrFrom, Substr, ToStr, Field, StructLit, MethodCall, Offset, AddrOf,
+             Cond, IncDec]
 
 
 # ---------------------------------------------------------------- printf
@@ -1081,6 +1131,10 @@ def dump_expr(e):
         return "(offset %s%s)" % (dump_expr(e.base), "" if e.start is None else " " + dump_expr(e.start))
     if isinstance(e, AddrOf):
         return "(addr_of %s)" % dump_expr(e.place)
+    if isinstance(e, Cond):
+        return "(cond %s %s %s)" % (dump_expr(e.cond), dump_expr(e.then), dump_expr(e.els))
+    if isinstance(e, IncDec):
+        return "(%s%s %s)" % ("post" if e.post else "pre", "inc" if e.op == "add" else "dec", dump_expr(e.var))
     if isinstance(e, ResidualExpr):
         return "(residual %r)" % e.reason
     raise TypeError("dump_expr: %r" % (e,))

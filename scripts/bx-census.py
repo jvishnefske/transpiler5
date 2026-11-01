@@ -281,6 +281,16 @@ RULES = [
      r"|address of something other than|address of an element in the Kernel)", "pointer: expression form", "generic"),
     (r"^.* through '.*', a pointer to const$", "pointer: write through const", None),
     (r"^function returning a pointer$", "pointer: returned (R6)", None),
+    # FR-259 cheap syntax
+    (r"^conditional operator `\?:` of type '(.*)' \(", "?: of non-scalar type", "type"),
+    (r"^conditional operator `\?:` used as an lvalue$", "?: used as an lvalue", None),
+    (r"^auto-typed declaration of a lambda$", "auto: lambda", None),
+    (r"^increment/decrement of '.*' used as a value in a statement that also uses", "incdec: unsequenced", None),
+    (r"^unsigned compound assignment to an element whose index increments", "incdec: index double evaluation", None),
+    (r"^increment/decrement of (.*) used as a value$", "incdec: non-integer target", "generic"),
+    (r"^(increment of immutable|increment block)", "incdec: form", "generic"),
+    (r"^(condition of a conditional expression|arms of a conditional expression|conditional expression of type)",
+     "typing: conditional expression", "generic"),
     (r"^identifier '.*' is reserved by the canonical Rust spelling", "identifier: reserved by canonical spelling", None),
     # clang kinds with no FRIENDLY name (friendly() falls back to the kind)
     (r"^([A-Z][A-Za-z]*(Expr|Stmt|Decl|Operator|Literal))$", None, None),

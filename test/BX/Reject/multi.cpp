@@ -20,17 +20,22 @@ union Point {
     int x;
 };
 
+// FR-259 moved three pins forward: `auto b = a;` (normal form N22), `int c =
+// a++;` and `a > 0 ? c : a` are in the subset; their refused neighbours are an
+// `auto&` (a reference local), an increment beside another use of its
+// variable (unsequenced in C++) and a `?:` used as an lvalue.
 int f(int a) {
-    // CHECK-NEXT: multi.cpp:[[@LINE+1]]:5: error: unsupported: auto-typed declaration
-    auto b = a;
+    // CHECK-NEXT: multi.cpp:[[@LINE+1]]:5: error: unsupported: variable of type 'int &'
+    auto& b = a;
     // CHECK-NEXT: multi.cpp:[[@LINE+1]]:5: error: unsupported: switch statement
     switch (a) { default: break; }
-    // CHECK-NEXT: multi.cpp:[[@LINE+1]]:13: error: unsupported: increment/decrement used as a value
-    int c = a++;
+    // CHECK-NEXT: multi.cpp:[[@LINE+1]]:13: error: unsupported: increment/decrement of 'a' used as a value in a statement that also uses 'a' (C++ leaves the order unsequenced or unspecified)
+    int c = a++ + a;
     // CHECK-NEXT: multi.cpp:[[@LINE+1]]:5: error: unsupported: `for` loop outside the canonical counting form `for (int i = a; i < b; ++i)`
     for (int i = 10; i > 0; --i) {}
-    // CHECK-NEXT: multi.cpp:[[@LINE+1]]:12: error: unsupported: conditional operator `?:`
-    return a > 0 ? c : a;
+    // CHECK-NEXT: multi.cpp:[[@LINE+1]]:16: error: unsupported: conditional operator `?:` used as an lvalue
+    int* q = &(a > 0 ? c : a);
+    return a + *q;
 }
 
 int main() {

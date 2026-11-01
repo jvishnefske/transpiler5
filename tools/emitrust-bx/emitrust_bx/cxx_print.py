@@ -53,6 +53,16 @@ const after the star: `T* const p`); `p[i]` (a literal index bare: `p[2]`),
 (normal form N16), `p + k`, `v.data()`, `v.data() + k`, `&x`, `this` (the
 address of `*this`), `p += k;` / `++p;`.
 
+FR-259 rows: `short` / `unsigned short` (i16 / u16; literals
+`static_cast<short>(N)` / `static_cast<unsigned short>(N)`, folded back by
+N2 like u8's); `c ? a : b` (a nested `?:` operand and a `?:` operand of a
+unary or binary operator are parenthesized); `++x` / `x++` / `--x` / `x--`
+as a value (parenthesized as a unary operand: `-(--x)` must not lex as
+`---x`).  The typedef, `static` / `inline` and `auto` spellings clang reads
+are normal forms N20-N22: the canonical C++ spells the builtin type, no
+`static` / `inline` (an internal function is in `namespace {`), and every
+declared type.
+
 FR-257 rows (structs):
 
 * layout: forward declarations `struct S;` (only for a struct named before
@@ -79,6 +89,7 @@ CXX_TYPE = {
     "i8": "char", "u8": "unsigned char", "i32": "int", "i64": "long long",
     "u32": "unsigned", "u64": "unsigned long long", "usize": "std::size_t",
     "f64": "double", "bool": "bool", "()": "void",
+    "i16": "short", "u16": "unsigned short",
 }
 
 CXX_BINOP = {
@@ -130,6 +141,8 @@ def cxx_int_lit(e):
         return "static_cast<std::size_t>(%s)" % inner
     if t == "u8":
         return "static_cast<unsigned char>(%s)" % inner
+    if t in ("i16", "u16"):
+        return "static_cast<%s>(%s)" % (CXX_TYPE[t], inner)
     if t == "i8":
         c = chr(v)
         if 0x20 <= v <= 0x7E and c not in "'\\":
@@ -301,6 +314,14 @@ class _Printer:
             return self.nc_expr(e, scope)
         if isinstance(e, K.Cast):
             return "static_cast<%s>(%s)" % (CXX_TYPE[e.ty.name], self.expr(e.operand, scope))
+        if isinstance(e, K.Cond):
+            def arm(x):
+                s = self.expr(x, scope)
+                return "(" + s + ")" if isinstance(x, K.Cond) else s
+            return "%s ? %s : %s" % (arm(e.cond), arm(e.then), arm(e.els))
+        if isinstance(e, K.IncDec):
+            sym = "++" if e.op == "add" else "--"
+            return e.var.name + sym if e.post else sym + e.var.name
         if isinstance(e, K.Unary):
             t = self.ty(e.operand, scope)
             if e.op == "neg":
@@ -324,6 +345,8 @@ class _Printer:
 
     def operand(self, parent, child, scope, is_lhs, consume=False):
         s = self.consume(child, scope) if consume else self.expr(child, scope)
+        if isinstance(child, K.Cond):
+            return "(" + s + ")"
         if isinstance(child, K.Binary):
             same = child.op == parent.op and is_lhs and parent.op not in K.CMP_OPS
             return s if same else "(" + s + ")"

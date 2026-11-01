@@ -109,6 +109,36 @@ comparison and difference) to cxx_import, which never builds them.
       `static_cast<std::size_t>(e)` <=> `e as usize`; any other signed one
       is refused (R3: C++ defines a negative offset into the middle of an
       array, a Rust slice cannot go backwards).
+
+FR-259 (cheap syntactic breadth).  ``Cond`` (`c ? a : b` <=> `if c { a }
+else { b }`) has a bool condition and two arms of ONE scalar type; ``IncDec``
+(`++x` / `x++` / `--x` / `x--` used as a value <=> `{ x += 1; x }` /
+`{ x += 1; x - 1 }` / ..) acts on an integer variable of an arithmetic type,
+and the checker refuses it when the same statement mentions the variable
+anywhere else (`i++ + i` is unsequenced -- undefined -- in C++, `f(i++, i)`
+unspecified; Rust fixes left to right), so the C++ program never depends on
+an evaluation order.  It counts as an assignment for every analysis
+(counting-loop variable and bound, range-for mutation, pointer roots).
+``Prim('i16')`` / ``Prim('u16')`` join i8/u8 as types with no arithmetic of
+their own (C++ promotes them to int first).  Three C++-side normal forms:
+
+  N20 (cxx_import) the <cstdint>/<cstddef> typedef names and `signed char`
+      are spellings of their LP64 builtin type: int8_t / signed char <=> i8
+      (canonical `char`; the subset already assumes a signed char),
+      uint8_t <=> u8, int16_t <=> i16 (`short`), uint16_t <=> u16 (`unsigned
+      short`), int32_t <=> i32, uint32_t <=> u32 (`unsigned`), int64_t /
+      ptrdiff_t / long <=> i64 (`long long`), uint64_t / size_t / unsigned
+      long <=> usize (`std::size_t`) -- FR-261 resolved them inside pointees
+      only; clang prints no desugared spelling for a reference's pointee or a
+      function's return type either, so they are resolved there too.
+  N21 (cxx_import) `inline` on a free function is dropped (it only relaxes
+      the one-definition rule); `static` at the root is dropped (N14: linkage
+      is unobservable in one TU), and `static` inside a named namespace is
+      the internal-linkage member it means -- the same term as a member of an
+      anonymous namespace (canonical C++ `namespace {`, Rust private `fn`).
+  N22 (cxx_import) `auto x = e;` / `const auto x = e;` is `T x = e;` with T
+      clang's DEDUCED type, when that is a Kernel type; the canonical C++
+      spells the type.
 """
 
 from . import kernel as K
@@ -628,6 +658,30 @@ def type_of(e, scope, sigs):
         return K.STRING
     if isinstance(e, K.Borrow):
         return type_of(e.operand, scope, sigs)
+    if isinstance(e, K.Cond):
+        c = type_of(e.cond, scope, sigs)
+        if c != K.BOOL:
+            raise KernelTypeError(getattr(e.cond, "loc", None) or e.loc,
+                                  "condition of a conditional expression has type %s" % c)
+        a = type_of(e.then, scope, sigs)
+        b = type_of(e.els, scope, sigs)
+        if a != b:
+            raise KernelTypeError(e.loc, "arms of a conditional expression have different types %s and %s" % (a, b))
+        if a not in K.ALL_PRIMS:
+            raise KernelTypeError(e.loc, "conditional expression of type %s (its arms must be scalars)" % a)
+        return a
+    if isinstance(e, K.IncDec):
+        if not isinstance(e.var, K.Var):
+            raise KernelTypeError(e.loc, "increment/decrement of something other than a variable")
+        v = scope.lookup(e.var.name)
+        if v is None:
+            raise KernelTypeError(e.var.loc or e.loc, "use of undeclared variable '%s'" % e.var.name)
+        t = K.deref(v[0])
+        if e.op not in K.INCDEC_OPS:
+            raise KernelTypeError(e.loc, "unknown increment op %r" % e.op)
+        if t not in K.ARITH_INT:
+            raise KernelTypeError(e.loc, "increment/decrement of %s used as a value" % t)
+        return t
     if isinstance(e, K.ResidualExpr):
         raise KernelTypeError(e.loc, "residual: " + e.reason)
     raise KernelTypeError(None, "not an expression: %r" % (e,))
@@ -779,6 +833,8 @@ def assigned_names(block, sigs=None):
     for n in K.walk(block):
         if isinstance(n, (K.Assign, K.CompoundAssign)):
             out.add(n.name)
+        elif isinstance(n, K.IncDec) and isinstance(n.var, K.Var):
+            out.add(n.var.name)  # FR-259: `x++` inside an expression assigns x
         elif isinstance(n, K.Call):
             out |= mut_ref_args(n, sigs)
         elif isinstance(n, K.MethodCall):
@@ -1086,6 +1142,32 @@ class _Checker:
                     self.wf(v, scope, self.consume_pos(fd.ty))
         elif isinstance(e, K.MethodCall):
             self.method_call(e, scope)
+        elif isinstance(e, K.Cond):
+            self.wf(e.cond, scope, "value")
+            self.wf(e.then, scope, "value")
+            self.wf(e.els, scope, "value")
+        elif isinstance(e, K.IncDec):
+            v = scope.lookup(e.var.name)
+            if v is not None:
+                ty, mut = v
+                if isinstance(ty, K.RefT):
+                    mut = ty.mutable
+                if not mut:
+                    self.err(L, "increment of immutable '%s'" % e.var.name)
+                if self.surface == "rust" and isinstance(ty, K.RefT) != (e.var.spelling == "deref"):
+                    self.err(L, "unsupported: increment block of '%s' not spelled the canonical way (`%s`)"
+                             % (e.var.name, "*" + e.var.name if isinstance(ty, K.RefT) else e.var.name))
+                if self.surface == "rust" and e.spelling:
+                    # `{ x += 1; x }` for signed, `{ x = x.wrapping_add(1u32); x }`
+                    # for unsigned, the literal of the variable's own type
+                    wrapping, lit_ty = e.spelling
+                    if wrapping != K.is_unsigned(t) or lit_ty != t:
+                        sym = "+" if e.op == "add" else "-"
+                        want = ("x = x.wrapping_%s(1%s)" % (e.op, t.name) if K.is_unsigned(t)
+                                else "x %s= 1%s" % (sym, "" if t == K.I32 else t.name))
+                        self.err(L, "unsupported: increment block not spelled the canonical way (`{ %s; .. }`)"
+                                 % want)
+            self.wf(e.var, scope, "value")
         elif isinstance(e, K.StrLit):
             pass
 
@@ -1736,6 +1818,16 @@ class _Checker:
         exprs = stmt_exprs(s)
         if not exprs:
             return
+        for n in (n for e in exprs for n in K.walk(e) if isinstance(n, K.IncDec)):
+            # FR-259: `i++ + i` is unsequenced (undefined) in C++, `f(i++, i)`
+            # unspecified, `x = x++` defined only since C++17 -- Rust fixes
+            # every one left to right; the subset needs no order at all
+            b = n.var.name
+            total = sum(1 for e in exprs for m in K.walk(e) if isinstance(m, K.Var) and m.name == b)
+            if total > 1:
+                self.err(n.loc, "unsupported: increment/decrement of '%s' used as a value in a statement that "
+                                "also uses '%s' (C++ leaves the order unsequenced or unspecified)" % (b, b))
+                return
         calls = [n for e in exprs for n in K.walk(e) if isinstance(n, (K.Call, K.MethodCall))]
         for c in calls:
             path, sig = call_sig(c, self.scope_now, self.sigs)
@@ -1829,6 +1921,12 @@ class _Checker:
                     # would be evaluated twice
                     self.err(s.loc, "unsupported: unsigned compound assignment to an element whose index "
                                     "calls a function")
+                elif (K.is_unsigned(ty) and s.op in K.WRAPPING_OPS
+                        and any(isinstance(n, K.IncDec) for n in K.walk(s.target))):
+                    # FR-259: likewise an index that increments (`v[i++] += 1u`
+                    # would increment i twice)
+                    self.err(s.loc, "unsupported: unsigned compound assignment to an element whose index "
+                                    "increments or decrements a variable")
         elif isinstance(s, K.Push):
             ty = self.place_ty(s.target, scope)
             if ty is None:
@@ -2223,6 +2321,10 @@ class _Normalizer:
                             e.loc, e.spelling)
         if isinstance(e, K.AddrOf):
             return K.AddrOf(self.expr(e.place, scope), e.loc, e.spelling)
+        if isinstance(e, K.Cond):
+            then = self.expr(e.then, scope, expect)
+            return K.Cond(self.expr(e.cond, scope), then,
+                          self.expr(e.els, scope, self.ty(then, scope) or expect), e.loc)
         if isinstance(e, K.StructLit):
             sd = structs_of(self.sigs).get(e.path)
             ftys = [f.ty for f in sd.fields] if sd is not None and len(sd.fields) == len(e.values) \
@@ -2298,7 +2400,7 @@ class _Normalizer:
             t = self.ty(tgt, scope)
             v = self.expr(s.value, scope, t)
             if (isinstance(v, K.Binary) and v.op in K.COMPOUND_OPS and v.lhs == tgt and isinstance(t, K.Prim)
-                    and not self.keep and not any(isinstance(n, K.Call) for n in K.walk(tgt))):
+                    and not self.keep and not any(isinstance(n, (K.Call, K.IncDec)) for n in K.walk(tgt))):
                 return K.CompoundStore(v.op, tgt, v.rhs, s.loc, v.spelling)  # N5 on an element
             return K.Store(tgt, v, s.loc)
         if isinstance(s, K.CompoundStore):

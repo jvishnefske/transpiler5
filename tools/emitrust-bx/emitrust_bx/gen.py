@@ -54,6 +54,13 @@ mentioned elsewhere in its statement; a MUTABLE pointer local hides its
 roots for the rest of its block, a CONST one freezes them (no write, no
 move, no mutable pointer); a mutable re-slice or slice never reads its own
 root.
+
+FR-259: with ``fr259`` (OFF by default, a SEPARATE population like FR-261's,
+test_fr259's ``fr259_programs``) the scalar types include i16 / u16 and
+expressions get EXTRA `c ? a : b` (Cond) and `x++` / `++x` / `x--` / `--x`
+used as a value (IncDec), drawn from a FIFTH stream.  The sequencing rule
+holds by construction: an incremented variable is one the statement has not
+mentioned yet, and it is hidden for the rest of the statement.
 """
 
 import contextlib
@@ -72,13 +79,21 @@ PTR_PARAM_RATE = 0.4
 PTR_STMT_RATE = 0.3
 NC_TYPES = (K.STRING, K.STRING, K.VecT(K.I32), K.VecT(K.I64), K.VecT(K.U8), K.VecT(K.F64), K.VecT(K.I8),
             K.VecT(K.USIZE), K.VecT(K.STRING), K.VecT(K.VecT(K.I32)))
-VALUE_TYPES = K.ALL_PRIMS + NC_TYPES
+# the scalar types of the FR-250..261 populations (FR-259's i16 / u16 are
+# drawn only in its own population, so these seeds keep their sequences)
+FR250_PRIMS = (K.I8, K.U8, K.I32, K.I64, K.U32, K.U64, K.USIZE, K.F64, K.BOOL)
+VALUE_TYPES = FR250_PRIMS + NC_TYPES
+# FR-259: the rate of an EXTRA `?:` / increment-as-a-value in an expression
+FR259_RATE = 0.12
 
 
 class Gen:
-    def __init__(self, seed, namespaces=True, structs=True, pointers=False):
+    def __init__(self, seed, namespaces=True, structs=True, pointers=False, fr259=False):
         self.r = random.Random(seed)
         self.pointers = pointers
+        self.fr259 = fr259
+        self.prims = K.ALL_PRIMS if fr259 else FR250_PRIMS
+        self.fr = random.Random(seed * 32452843 + 11)  # FR-259's own stream
         self.pr = random.Random(seed * 15485863 + 7)  # FR-261's own stream
         self.roots_of = {}  # FR-261: pointer local -> its (transitive) roots
         self.pcounter = 0
@@ -176,7 +191,7 @@ class Gen:
         r = r or self.r
         roll = r.random()
         if roll < 0.55:
-            return r.choice(K.ALL_PRIMS), r.random() < 0.6
+            return r.choice(self.prims), r.random() < 0.6
         sts = self.struct_types()
         if sts and roll < 0.65:
             if r.random() < 0.5:
@@ -192,7 +207,7 @@ class Gen:
         sts = self.struct_types()
         if sts and r.random() < 0.12:
             return r.choice(sts)
-        return r.choice(K.ALL_PRIMS + (K.UNIT, K.UNIT) + NC_TYPES[:4])
+        return r.choice(self.prims + (K.UNIT, K.UNIT) + NC_TYPES[:4])
 
     # ------------------------------------------------------------ FR-257
     def make_structs(self):
@@ -211,7 +226,7 @@ class Gen:
             for j in range(r.randint(1, 4)):
                 roll = r.random()
                 if roll < 0.4 or (roll >= 0.6 and not earlier and roll < 0.82):
-                    ty = r.choice(K.ALL_PRIMS)
+                    ty = r.choice(self.prims)
                 elif roll < 0.6:
                     ty = r.choice(NC_TYPES[:8])
                 elif roll < 0.82:
@@ -379,6 +394,11 @@ class Gen:
                     st = self.ptr_stmt(scope)
                     if st is not None:
                         out.append(st)
+                if self.fr259 and self.fr.random() < 0.3:
+                    # FR-259: an EXTRA increment-as-a-value statement
+                    self.begin_stmt()
+                    with self.fr259_stream():
+                        out.append(self.fr259_stmt(scope))
                 out.append(self.stmt(scope, depth, loop))
             if tail is not None:
                 out.append(tail())
@@ -414,7 +434,7 @@ class Gen:
             kinds += ["return"]
         k = self.choice(kinds)
         if k == "let":
-            t = self.choice(K.ALL_PRIMS)
+            t = self.choice(self.prims)
             e = self.expr(t, scope, 3)
             name = self.fresh()
             mut = r.random() < 0.7
@@ -1107,6 +1127,12 @@ class Gen:
 
     def expr(self, t, scope, depth):
         r = self.r
+        if self.fr259 and t in K.ALL_PRIMS and depth > 0 and self.fr.random() < FR259_RATE:
+            # FR-259: `c ? a : b` / an increment used as a value (own stream)
+            with self.fr259_stream():
+                e = self.fr259_expr(t, scope, depth - 1)
+                if e is not None:
+                    return e
         if self.pointers and t in K.ALL_PRIMS and self.pr.random() < 0.07:
             # FR-261: a read through a pointer, `*p` / `p[i]` / `p->f`
             with self.ptr_stream():
@@ -1155,7 +1181,7 @@ class Gen:
         if k == "cast":
             if t == K.BOOL:
                 return self.expr(t, scope, d)
-            srcs = [s for s in K.ALL_PRIMS if s != t and (s != K.BOOL or K.is_int(t))]
+            srcs = [s for s in self.prims if s != t and (s != K.BOOL or K.is_int(t))]
             return K.Cast(t, self.expr(self.choice(srcs), scope, d))
         if k == "call":
             fs = [s for s in self.callable_sigs() if s[2] == t]
@@ -1207,9 +1233,53 @@ class Gen:
         raise AssertionError(k)
 
 
+    # ------------------------------------------------ FR-259
+    @contextlib.contextmanager
+    def fr259_stream(self):
+        saved, self.r = self.r, self.fr
+        try:
+            yield
+        finally:
+            self.r = saved
+
+    def fr259_stmt(self, scope):
+        """`T y = <x++ / --x ..> op e;` on a writable integer variable, or (none
+        yet) a mutable counter `T c = lit;` for later statements to use."""
+        r = self.r
+        t = r.choice(K.ARITH_INT)
+        vs = [v for v in self.vars_of(scope, lambda tt, m: tt == t, write=True) if v[0] not in self.stmt_seen]
+        name = self.fresh()
+        if not vs:
+            self.declare(scope, name, t, True)
+            return K.Let(name, t, True, self.lit(t))
+        x = r.choice(vs)[0]
+        self.stmt_seen.add(x)
+        self.stmt_hidden.add(x)
+        e = K.IncDec(K.Var(x), r.choice(K.INCDEC_OPS), r.random() < 0.5)
+        if r.random() < 0.6:
+            e = K.Binary(r.choice(("add", "mul", "bxor")), e, self.expr(t, scope, 2))
+        mut = r.random() < 0.5
+        self.declare(scope, name, t, mut)
+        return K.Let(name, t, mut, e)
+
+    def fr259_expr(self, t, scope, d):
+        """A Cond of type ``t``, or (integer ``t``) an IncDec of a writable
+        variable the statement has not mentioned yet -- then hidden for the
+        rest of it -- or None."""
+        r = self.r
+        if t in K.ARITH_INT and r.random() < 0.8:
+            vs = [v for v in self.vars_of(scope, lambda tt, m: tt == t, write=True) if v[0] not in self.stmt_seen]
+            if vs:
+                name = r.choice(vs)[0]
+                self.stmt_seen.add(name)
+                self.stmt_hidden.add(name)
+                return K.IncDec(K.Var(name), r.choice(K.INCDEC_OPS), r.random() < 0.5)
+        return K.Cond(self.expr(K.BOOL, scope, d), self.expr(t, scope, d), self.expr(t, scope, d))
+
+
 class _NoCall(Exception):
     pass
 
 
-def gen_program(seed, nfuncs, prefix="f", namespaces=True, pointers=False):
-    return Gen(seed, namespaces, pointers=pointers).program(nfuncs, prefix)
+def gen_program(seed, nfuncs, prefix="f", namespaces=True, pointers=False, fr259=False):
+    return Gen(seed, namespaces, pointers=pointers, fr259=fr259).program(nfuncs, prefix)

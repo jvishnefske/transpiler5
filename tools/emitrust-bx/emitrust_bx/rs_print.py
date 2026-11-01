@@ -77,6 +77,16 @@ borrow-check for `&mut` parameters and locals alike on rustc 1.96 and
 bare (`&[T]` is Copy; `&mut [T]` is implicitly reborrowed at a coercion
 site).
 
+FR-259 rows: `i16` / `u16`; `c ? a : b` <=> `if c { a } else { b }` (a `?:`
+in the else arm is `else if`; parenthesized as an operand of a unary,
+binary, cast or method call, bare elsewhere -- measured on rustc 1.96 to
+parse and lint clean as a let/assign/return value, an argument, an index,
+an `if`/`while` condition and a range bound); `++x` / `x++` / `--x` / `x--`
+used as a value <=> `{ x += 1; x }` / `{ x += 1; x - 1 }` / `{ x -= 1; x }` /
+`{ x -= 1; x + 1 }` (`*x` for a reference; unsigned `{ x =
+x.wrapping_add(1u32); x.wrapping_sub(1u32) }`), the literal always of the
+variable's type, parenthesized exactly where a `?:` is.
+
 FR-260 rows (namespaces): a C++ named namespace is a `mod`, one block per
 namespace (N13), contents indented one level; a nested one is `pub mod`
 (a private nested module is unreachable from the root, E0603).  A function
@@ -225,6 +235,14 @@ class _Printer:
             finally:
                 self.in_cast -= 1
             return "%s as %s" % (self.paren_if(not self.atomic(e.operand, scope), inner), e.ty.name)
+        if isinstance(e, K.Cond):
+            return self.cond(e, scope)
+        if isinstance(e, K.IncDec):
+            saved, self.in_cast = self.in_cast, 0
+            try:
+                return self.incdec(e, scope)
+            finally:
+                self.in_cast = saved
         if isinstance(e, K.Unary):
             t = self.ty(e.operand, scope)
             inner = self.expr(e.operand, scope)
@@ -243,6 +261,34 @@ class _Printer:
             return "%s %s %s" % (self.operand(e, e.lhs, scope, True), RUST_BINOP[e.op],
                                  self.operand(e, e.rhs, scope, False))
         raise PrintError("cannot print %r" % (e,))
+
+    # ---------------------------------------------------- FR-259
+    def cond(self, e, scope):
+        """`if c { a } else { b }`; a Cond in the else arm is `else if`.  The
+        condition never sits in a cast operand (it is bool); the arms keep
+        the cast context (rustc types their literals from the cast)."""
+        saved, self.in_cast = self.in_cast, 0
+        try:
+            c = self.expr(e.cond, scope)
+        finally:
+            self.in_cast = saved
+        s = "if %s { %s }" % (c, self.expr(e.then, scope))
+        if isinstance(e.els, K.Cond):
+            return s + " else " + self.cond(e.els, scope)
+        return s + " else { %s }" % self.expr(e.els, scope)
+
+    def incdec(self, e, scope):
+        t = self.ty(e, scope)
+        x = self.expr(e.var, scope)
+        one = int_lit(K.IntLit(1, t))
+        inv = "sub" if e.op == "add" else "add"
+        if K.is_unsigned(t):
+            step = "%s = %s.wrapping_%s(%s)" % (x, self.paren_if(not self.atomic(e.var, scope), x), e.op, one)
+            tail = "%s.wrapping_%s(%s)" % (self.paren_if(not self.atomic(e.var, scope), x), inv, one) if e.post else x
+        else:
+            step = "%s %s= %s" % (x, RUST_BINOP[e.op], one)
+            tail = "%s %s %s" % (x, RUST_BINOP[inv], one) if e.post else x
+        return "{ %s; %s }" % (step, tail)
 
     # ---------------------------------------------------- FR-251 positions
     def recv(self, e, scope):
@@ -356,7 +402,7 @@ class _Printer:
 
     def operand(self, parent, child, scope, is_lhs, consume=False):
         s = self.expr(child, scope)
-        if isinstance(child, (K.Cast, K.ByteAt)):
+        if isinstance(child, (K.Cast, K.ByteAt, K.Cond, K.IncDec)):
             return "(" + s + ")"
         if isinstance(child, K.Binary) and not self.is_wrapping(child, scope):
             same = child.op == parent.op and is_lhs and parent.op not in K.CMP_OPS

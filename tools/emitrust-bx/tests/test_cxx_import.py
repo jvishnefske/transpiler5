@@ -78,11 +78,11 @@ def test_every_residual_is_reported_not_first_failure(tmp_path):
     src = ("#include <cstdio>\n"
            "int g = 3;\n"
            "int f(int x) {\n"
-           "    auto y = x;\n"
+           "    auto& y = x;\n"  # FR-259 accepts `auto y = x;` (N22); a reference stays out
            "    x = y;\n"
            "    int **p = nullptr;\n"  # FR-261 accepts `int *p = &x;`; a T** stays out
            "    do { x--; } while (x);\n"
-           "    return x > 0 ? x : -x;\n"
+           "    return x > 0 ? x++ : -x;\n"  # FR-259 accepts `?:`; `x++` beside `x` stays out
            "}\n"
            "int main() {\n"
            "    std::printf(\"%x\\n\", f(1));\n"
@@ -90,10 +90,11 @@ def test_every_residual_is_reported_not_first_failure(tmp_path):
            "}\n")
     assert errs(tmp_path, src) == [
         ("2:1", "unsupported: global variable"),
-        ("4:5", "unsupported: auto-typed declaration"),
+        ("4:5", "unsupported: variable of type 'int &'"),
         ("6:5", "unsupported: variable of type 'int **'"),
         ("7:5", "unsupported: do-while loop"),
-        ("8:12", "unsupported: conditional operator `?:`"),
+        ("8:20", "unsupported: increment/decrement of 'x' used as a value in a statement that also uses 'x' "
+                 "(C++ leaves the order unsequenced or unspecified)"),
         ("11:5", "unsupported: printf conversion '%x'"),
     ]
 

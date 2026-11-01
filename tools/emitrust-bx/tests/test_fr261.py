@@ -83,7 +83,10 @@ def test_pointer_spellings():
     # inside template arguments too (woff2's `std::vector<uint8_t>* out`)
     assert P("const std::vector<uint8_t> *") == (K.PtrT(K.VecT(K.U8), False), False)
     assert P("std::uint32_t *") == (K.PtrT(K.U32, True), False)
-    assert P("int8_t *")[0] is None and P("my_size_t *")[0] is None
+    # FR-259 moved this pin forward: int8_t (`signed char`) is an N20 spelling of
+    # i8; a look-alike name is still not a typedef
+    assert P("int8_t *") == (K.PtrT(K.I8, True), False)
+    assert P("my_size_t *")[0] is None and P("uint8_t_t *")[0] is None
     # outside the model: T**, void*, a function pointer, a reference to a pointer
     for q in ("int **", "const int *const *", "void *", "int (*)(int)", "int *&"):
         assert P(q)[0] is None, q
