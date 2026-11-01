@@ -1715,3 +1715,14 @@ title = "BX normalizer search: arbitrary C++ -> Kernel subset via validated rewr
 summary = "Design recorded; residual census first; A* over byte-diff-validated rules. Expected TRACTOR +0."
 blocked_by = ["FR-253"]
 anchor = "FR-254 (opened 2026-11-01, child of FR-249): **BX NORMALIZER SEARCH"
+
+[[items]]
+id = "FR-255"
+kind = "feature"
+status = "spiked"
+rank = 64
+size = "M"
+title = "bc.hpp: compile-time C++20 borrow discipline (unique lambda brands + captureless callbacks) mapping 1:1 onto Rust borrows"
+summary = "Prototype measured: 7 violation classes rejected at compile time; nested owners compose; documented unsoundness (intra-borrow aliasing, statics, side-channel stash, use-after-move). Expected TRACTOR +0."
+blocked_by = ["FR-250"]
+anchor = "FR-255 (opened 2026-11-01, child of FR-249): **BC.HPP"
