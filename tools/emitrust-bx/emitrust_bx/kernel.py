@@ -27,6 +27,10 @@ Design rules:
   COPIED position (vec literal elements, vec-fill value, resize value --
   C++ takes `const T&` and copies) a place is written bare and the Rust
   printer adds `.clone()` for non-Copy element types.
+* FR-261 adds ``PtrT`` (`const T*` <=> `&[T]`, `T*` <=> `&mut [T]`: the
+  suffix slice of an allocation) for parameters and locals, and two
+  pointer-VALUE nodes, ``Offset`` (`p + k`, `v.data()`) and ``AddrOf``
+  (`&x`); `*p` / `p[i]` / `p->f` are the existing Index / Field.
 * ``Residual*`` nodes are the Surface-IR seam: cxx_import keeps going past an
   unsupported construct and leaves a located Residual in its place, so a
   program's distance from the subset is a COUNT, not a first failure
@@ -115,8 +119,29 @@ class StructT:
         return self.path
 
 
-Ty = Union[Prim, VecT, StrT, RefT, StructT]  # the closed sum
-TYPE_CLASSES = (Prim, VecT, StrT, RefT, StructT)
+@dataclass(frozen=True)
+class PtrT:
+    """FR-261: a pointer is the SUFFIX SLICE of its allocation: `const T*`
+    <=> `&[T]`, `T*` <=> `&mut [T]`.
+
+    Only parameters and locals have pointer type (never a data member, a
+    vector element, a reference's referent or a return type), and a pointer
+    value is only ever made from a real allocation: `v.data()` (the vector's
+    elements), `&x` (a one-element slice), or a forward re-slice `p + k` of
+    another pointer.  Lengths stay ordinary integers -- there is NO bounds
+    proof: an index or offset outside the allocation panics in Rust where it
+    is undefined behaviour in C++, i.e. the two differ on UB input only.
+    """
+
+    inner: "Ty"
+    mutable: bool
+
+    def __str__(self):
+        return "&%s[%s]" % ("mut " if self.mutable else "", self.inner)
+
+
+Ty = Union[Prim, VecT, StrT, RefT, StructT, PtrT]  # the closed sum
+TYPE_CLASSES = (Prim, VecT, StrT, RefT, StructT, PtrT)
 STRING = StrT()
 
 I8 = Prim("i8")
@@ -157,8 +182,21 @@ def is_int(t):
 
 
 def is_copy(t):
-    """Copy types are the scalars; Vec and String are move-only."""
-    return isinstance(t, Prim)
+    """Copy types are the scalars; Vec and String are move-only.  FR-261: a
+    pointer value is copied in C++ and, in every position the subset allows
+    it (a typed `let`, an argument), copied (`&[T]`) or implicitly reborrowed
+    (`&mut [T]`) in Rust -- never moved."""
+    return isinstance(t, (Prim, PtrT))
+
+
+def ptr_fits(actual, expected):
+    """FR-261: may a value of type ``actual`` stand where ``expected`` is
+    wanted?  Equal types, or the qualification conversion `T*` -> `const
+    T*` (Rust: the `&mut [T]` -> `&[T]` coercion)."""
+    if actual == expected:
+        return True
+    return (isinstance(actual, PtrT) and isinstance(expected, PtrT) and actual.inner == expected.inner
+            and actual.mutable and not expected.mutable)
 
 
 def is_owned_nc(t):
@@ -478,9 +516,38 @@ class MethodCall:
     owner: str = field(default="", compare=False, repr=False)
 
 
+# ---------------------------------------------------------------- FR-261 exprs
+
+@dataclass(frozen=True)
+class Offset:
+    """A pointer made by RE-SLICING: `p + k` <=> `&p[k..]` / `&mut p[k..]`
+    (``base`` a pointer VARIABLE, ``start`` usize), `v.data()` <=> `&v[..]`
+    (``base`` a vector PLACE, ``start`` None) and `v.data() + k` <=>
+    `&v[k..]`.  Its pointee constness is the base's; the Rust `&` / `&mut`
+    is derived from the position's expected type (``spelling`` records the
+    Rust surface, compare=False)."""
+
+    base: "Expr"
+    start: Optional["Expr"]
+    loc: Optional[Loc] = _loc()
+    spelling: str = field(default="", compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class AddrOf:
+    """`&x` of a single object <=> `std::slice::from_ref(&x)` /
+    `std::slice::from_mut(&mut x)`: a one-element slice.  ``place`` is a
+    variable or a data member, never an element (`&v[i]` is the suffix
+    `v.data() + i`, normal form N17)."""
+
+    place: "Expr"
+    loc: Optional[Loc] = _loc()
+    spelling: str = field(default="", compare=False, repr=False)
+
+
 Expr = Union[IntLit, FloatLit, BoolLit, StrLit, Var, Unary, Binary, Cast, Call,
              ResidualExpr, Clone, Index, ByteAt, Len, IsEmpty, VecLit, VecFill,
-             StrNew, StrFrom, Substr, ToStr, Field, StructLit, MethodCall]
+             StrNew, StrFrom, Substr, ToStr, Field, StructLit, MethodCall, Offset, AddrOf]
 
 
 # ---------------------------------------------------------------- printf
@@ -1010,6 +1077,10 @@ def dump_expr(e):
         return "(struct %s [%s])" % (e.path, ", ".join(dump_expr(x) for x in e.values))
     if isinstance(e, MethodCall):
         return "(method %s %s%s)" % (dump_expr(e.recv), e.name, "".join(" " + dump_expr(a) for a in e.args))
+    if isinstance(e, Offset):
+        return "(offset %s%s)" % (dump_expr(e.base), "" if e.start is None else " " + dump_expr(e.start))
+    if isinstance(e, AddrOf):
+        return "(addr_of %s)" % dump_expr(e.place)
     if isinstance(e, ResidualExpr):
         return "(residual %r)" % e.reason
     raise TypeError("dump_expr: %r" % (e,))

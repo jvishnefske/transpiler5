@@ -29,6 +29,14 @@
 # `&mut`, struct returns, constructor and static calls, and a struct holding
 # a vector of itself all occur -- so laws 1-2 and the rustc subset (borrowck
 # over the receiver alias rules) cover them.
+# FR-261: pointers are a SEPARATE population (``ptr_programs``, its own seeds,
+# gen's pointer stream) so the programs -- and the near-threshold coverage
+# counts -- above stay exactly as they were.  The same laws and the rustc
+# subset run over it, and its coverage test pins that `const T*` / `T*`
+# parameters and locals, `*p` / `p[i]` / `p->f` / `p->m(..)` /
+# `p->push_back(..)` reads and writes, `p + k`, `v.data()`, `v.data() + k`,
+# `&x`, `this` and the re-slice `p += k` all occur; borrowck over them is what
+# makes the R1/R2 alias rules load-bearing.
 import collections
 import os
 import shutil
@@ -49,6 +57,14 @@ PER_TU = 50
 @pytest.fixture(scope="module")
 def programs():
     return [gen.gen_program(seed, PER_TU) for seed in SEEDS]
+
+
+PTR_SEEDS = range(2000, 2010)
+
+
+@pytest.fixture(scope="module")
+def ptr_programs():
+    return [gen.gen_program(seed, PER_TU, pointers=True) for seed in PTR_SEEDS]
 
 
 def test_generator_size_and_coverage(programs):
@@ -264,6 +280,98 @@ def test_printed_rust_typechecks_under_rustc(programs, tmp_path):
               "overflowing_literals, unconditional_recursion, while_true)]\n")
     for i, p in enumerate(programs[:4]):
         path = os.path.join(str(tmp_path), "g%d.rs" % i)
+        with open(path, "w") as f:
+            f.write(header + RSP.rs_print(p))
+        r = subprocess.run(["rustc", "--edition", "2021", "--emit=metadata", "--crate-type=lib",
+                            "-o", path + ".rmeta", path], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[:4000]
+
+
+# ------------------------------------------------------------------ FR-261
+
+def test_generator_covers_fr261(ptr_programs):
+    seen = collections.Counter()
+    for p in ptr_programs:
+        for f in p.all_funcs():
+            ptrs = {prm.name for prm in f.params if isinstance(prm.ty, K.PtrT)}
+            for prm in f.params:
+                if isinstance(prm.ty, K.PtrT):
+                    seen["param-ptr-" + ("mut" if prm.ty.mutable else "const")] += 1
+            for n in K.walk(f.body):
+                if isinstance(n, K.Let) and isinstance(n.ty, K.PtrT):
+                    ptrs.add(n.name)
+                    seen["let-ptr-" + ("mut" if n.ty.mutable else "const")] += 1
+
+            def through(e):
+                while isinstance(e, (K.Index, K.Field)):
+                    if isinstance(e, K.Index) and isinstance(e.base, K.Var) and e.base.name in ptrs:
+                        return True
+                    e = e.base
+                return False
+
+            for n in K.walk(f.body):
+                if isinstance(n, K.Offset):
+                    if isinstance(n.base, K.Var) and n.base.name in ptrs:
+                        seen["offset-ptr"] += 1
+                    else:
+                        seen["offset-vec-" + ("all" if n.start is None else "k")] += 1
+                if isinstance(n, K.AddrOf):
+                    seen["addr-self" if n.place == K.Var("self") else "addr"] += 1
+                if isinstance(n, K.Index) and isinstance(n.base, K.Var) and n.base.name in ptrs:
+                    seen["deref" if n.index == K.IntLit(0, K.USIZE) else "index-ptr"] += 1
+                if isinstance(n, K.Field) and through(n):
+                    seen["field-through-ptr"] += 1
+                if isinstance(n, (K.Store, K.CompoundStore)) and through(n.target):
+                    seen["store-through-ptr"] += 1
+                if isinstance(n, K.MethodCall) and through(n.recv):
+                    seen["mcall-through-ptr"] += 1
+                if isinstance(n, K.MUTATING_STMTS) and through(n.target):
+                    seen["vecop-through-ptr"] += 1
+                if isinstance(n, K.CompoundAssign) and n.name in ptrs:
+                    seen["reslice"] += 1
+                if isinstance(n, (K.Call, K.MethodCall)):
+                    for a in n.args:
+                        if isinstance(a, K.Var) and a.name in ptrs:
+                            seen["arg-ptr-var"] += 1
+    for k in ("param-ptr-const", "param-ptr-mut", "let-ptr-const", "let-ptr-mut", "offset-ptr", "offset-vec-all",
+              "offset-vec-k", "addr", "deref", "index-ptr", "field-through-ptr", "store-through-ptr",
+              "mcall-through-ptr", "vecop-through-ptr", "reslice", "arg-ptr-var"):
+        assert seen[k] >= 10, (k, seen[k])
+    # `this` as a pointer argument needs a member function calling something
+    # that takes a pointer to its own struct: rarer by construction
+    assert seen["addr-self"] >= 5, seen["addr-self"]
+
+
+def test_law1_and_law2_rust_pointers(ptr_programs):
+    for p in ptr_programs:
+        text = RSP.rs_print(p)
+        back = RP.rs_parse(text)
+        assert back == p
+        assert RSP.rs_print(back) == text
+
+
+@pytest.mark.skipif(shutil.which("clang++") is None, reason="clang++ not on PATH")
+def test_law1_and_law2_cxx_pointers(ptr_programs, tmp_path):
+    for i, p in enumerate(ptr_programs):
+        text = CP.cxx_print(p)
+        path = os.path.join(str(tmp_path), "ptu%d.cpp" % i)
+        with open(path, "w") as f:
+            f.write(text)
+        back, errs = cli.load_cpp(path, "clang++")
+        assert errs == [], (path, errs[:5])
+        assert back == p
+        assert CP.cxx_print(back) == text
+
+
+@pytest.mark.skipif(shutil.which("rustc") is None, reason="rustc not on PATH")
+def test_printed_pointer_rust_borrow_checks(ptr_programs, tmp_path):
+    # the alias rules R1/R2 are accepted-means-compiles claims: borrowck
+    # (`--emit=metadata` runs it) must accept every generated program
+    import subprocess
+    header = ("#![allow(arithmetic_overflow, unconditional_panic, unreachable_code, unused, "
+              "overflowing_literals, unconditional_recursion, while_true)]\n")
+    for i, p in enumerate(ptr_programs[:5]):
+        path = os.path.join(str(tmp_path), "pg%d.rs" % i)
         with open(path, "w") as f:
             f.write(header + RSP.rs_print(p))
         r = subprocess.run(["rustc", "--edition", "2021", "--emit=metadata", "--crate-type=lib",

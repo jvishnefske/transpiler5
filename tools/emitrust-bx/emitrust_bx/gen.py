@@ -39,8 +39,24 @@ data members through every place shape (`p.f`, `v[i].f`, `p.v[i]`,
 (moved or cloned) and by `&` / `&mut`.  The alias discipline extends to
 receivers: the receiver's variable is not mentioned elsewhere in the
 statement when the call may modify it, and arguments never modify it.
+
+FR-261: with ``pointers`` (OFF by default: the FR-250..260 coverage pins are
+measured on their own seeds, several within one or two of their thresholds,
+so pointer programs are a SEPARATE population -- test_property's
+``ptr_programs``) functions get EXTRA `const T*` / `T*` parameters and
+EXTRA pointer statements, every pointer draw from a FOURTH stream; bodies
+make pointer values -- a
+pointer variable, `p + k`, `v.data()`, `v.data() + k`, `&x`, `this` -- as
+arguments and as pointer locals, read and write through them (`*p`, `p[i]`,
+`p->f`, `p->m(..)`, `p->push_back(..)`) and re-slice them (`p += k`).  The
+alias rules hold by construction: a mutable pointer argument's root is not
+mentioned elsewhere in its statement; a MUTABLE pointer local hides its
+roots for the rest of its block, a CONST one freezes them (no write, no
+move, no mutable pointer); a mutable re-slice or slice never reads its own
+root.
 """
 
+import contextlib
 import random
 
 from . import kernel as K
@@ -51,14 +67,21 @@ FLOATS = ["0.0", "0.5", "1.0", "2.5", "0.125", "1e-05", "123.25", "1e+300", "3.0
 TEXT_POOL = list("abcXYZ019 ,.:;=!?%{}\"\\'\n\t()[]#@$&*+-/<>|^~`_")
 NS_POOL = ((), ("na",), ("nb",), ("na", "nc"), ("nb", "nc"), ("na", "nc", "nd"), ("na", "nd"),
            ("nb", "nc", "na"))
+# FR-261: the pointer stream's rates (an EXTRA pointer parameter / statement)
+PTR_PARAM_RATE = 0.4
+PTR_STMT_RATE = 0.3
 NC_TYPES = (K.STRING, K.STRING, K.VecT(K.I32), K.VecT(K.I64), K.VecT(K.U8), K.VecT(K.F64), K.VecT(K.I8),
             K.VecT(K.USIZE), K.VecT(K.STRING), K.VecT(K.VecT(K.I32)))
 VALUE_TYPES = K.ALL_PRIMS + NC_TYPES
 
 
 class Gen:
-    def __init__(self, seed, namespaces=True, structs=True):
+    def __init__(self, seed, namespaces=True, structs=True, pointers=False):
         self.r = random.Random(seed)
+        self.pointers = pointers
+        self.pr = random.Random(seed * 15485863 + 7)  # FR-261's own stream
+        self.roots_of = {}  # FR-261: pointer local -> its (transitive) roots
+        self.pcounter = 0
         self.namespaces = namespaces
         self.nsr = random.Random(seed * 7919 + 17)  # FR-260's own stream
         self.sr = random.Random(seed * 104729 + 31)  # FR-257's own stream
@@ -120,7 +143,7 @@ class Gen:
         `Vec::<T>::new()`) every struct reachable through their members too."""
         seen = set() if seen is None else seen
         for t in types:
-            while isinstance(t, (K.VecT, K.RefT)):
+            while isinstance(t, (K.VecT, K.RefT, K.PtrT)):
                 t = t.elem if isinstance(t, K.VecT) else t.inner
             if isinstance(t, K.StructT) and t.path not in seen:
                 seen.add(t.path)
@@ -132,6 +155,22 @@ class Gen:
 
     def struct_types(self):
         return tuple(K.StructT(sd.path) for sd in self.sdefs if self.types_visible([K.StructT(sd.path)]))
+
+    def ptr_inner(self):
+        sts = self.struct_types()
+        pool = [K.I32, K.I32, K.I32, K.U8, K.U8, K.USIZE, K.USIZE, K.F64, K.STRING, K.VecT(K.I32)] + list(sts) * 2
+        return self.pr.choice(pool)
+
+    def ptr_params(self, params, own=None):
+        """FR-261: pointer parameters are ADDED (drawn from the pointer
+        stream) so the other constructs' coverage is not diluted.  A member
+        function often takes a pointer to its own struct (`this` passes)."""
+        params = list(params)
+        while self.pointers and self.pr.random() < PTR_PARAM_RATE:
+            inner = K.StructT(own) if own and self.pr.random() < 0.4 else self.ptr_inner()
+            params.append(K.Param("p%d" % len(params), K.PtrT(inner, self.pr.random() < 0.55),
+                                  self.pr.random() < 0.6))
+        return params
 
     def param_type(self, r=None):
         r = r or self.r
@@ -195,6 +234,7 @@ class Gen:
                 for k in range(r.randint(0, 3)):
                     t, m = self.param_type(r)
                     params.append(K.Param("p%d" % k, t, m))
+                params = self.ptr_params(params, own=sd.path)
                 ms.append((sd.path + "::m%d" % j, tuple(params), self.ret_type(r), recv))
             for mp, params, ret, recv in ms:
                 self.msigs.append((mp, params, ret, recv, sd.path))
@@ -218,6 +258,7 @@ class Gen:
             for j in range(nparams):
                 t, m = self.param_type()
                 params.append(K.Param("p%d" % j, t, m))
+            params = self.ptr_params(params)
             ret = self.ret_type()
             path = K.path_of(ns, leaf)
             self.meta[path] = (ns, leaf, internal)
@@ -268,10 +309,14 @@ class Gen:
             self.begin_stmt()
             lit = K.StructLit(owner.path, tuple(self.value(f.ty, scope, 2, "consume") for f in owner.fields))
             return K.Func(name, params, ret, K.Block((K.Return(lit),)))
-        stmts = self.stmts(scope, depth=0, loop=False, n=self.r.randint(1, 6))
+        self.roots_of = {}
+        self.pcounter = 0
+        tail = None
         if ret != K.UNIT:
-            self.begin_stmt()
-            stmts.append(K.Return(self.value(ret, scope, 3, "consume", is_return=True)))
+            def tail():
+                self.begin_stmt()
+                return K.Return(self.value(ret, scope, 3, "consume", is_return=True))
+        stmts = self.stmts(scope, depth=0, loop=False, n=self.r.randint(1, 6), tail=tail)
         return K.Func(name, params, ret, K.Block(tuple(stmts)))
 
     def fresh(self):
@@ -321,8 +366,25 @@ class Gen:
         return v is not None and isinstance(v[0], K.RefT)
 
     # -------------------------------------------------------------- stmts
-    def stmts(self, scope, depth, loop, n):
-        return [self.stmt(scope, depth, loop) for _ in range(n)]
+    def stmts(self, scope, depth, loop, n, tail=None):
+        """``n`` statements (then ``tail()``) of ONE block: FR-261 pointer
+        locals hide / freeze their roots until the block ends."""
+        saved = (set(self.hidden), set(self.frozen))
+        try:
+            out = []
+            for _ in range(n):
+                if self.pointers and self.pr.random() < PTR_STMT_RATE:
+                    # FR-261: pointer statements are ADDED (see ptr_params)
+                    self.begin_stmt()
+                    st = self.ptr_stmt(scope)
+                    if st is not None:
+                        out.append(st)
+                out.append(self.stmt(scope, depth, loop))
+            if tail is not None:
+                out.append(tail())
+            return out
+        finally:
+            self.hidden, self.frozen = saved
 
     def block(self, scope, depth, loop, n=None):
         inner = scope.child()
@@ -366,7 +428,7 @@ class Gen:
             self.declare(scope, name, t, mut)
             return K.Let(name, t, mut, e)
         if k == "assign":
-            vs = self.vars_of(scope, lambda t, m: True, write=True)
+            vs = self.vars_of(scope, lambda t, m: not isinstance(t, K.PtrT), write=True)
             if not vs:
                 return self.stmt(scope, depth, loop) if r.random() < 0.5 else K.Break() if loop else self.print_(scope)
             name, t, _ = self.choice(vs)
@@ -426,7 +488,7 @@ class Gen:
             if roll < 0.3:
                 els = None
             elif roll < 0.6:
-                els = K.Block((self.stmt(scope.child(), depth + 1, loop),))
+                els = K.Block(tuple(self.stmts(scope.child(), depth + 1, loop, 1)))
                 if not isinstance(els.stmts[0], K.If):
                     self.begin_stmt()
                     els = K.Block((K.If(self.expr(K.BOOL, scope, 2), self.block(scope, depth, loop),
@@ -551,6 +613,10 @@ class Gen:
         out = [((), t)]
         if depth <= 0:
             return out
+        if isinstance(t, K.PtrT):
+            # FR-261: `p[i]`, `*p`, `p->f` (the pointer itself is no place
+            # the value generators may pick)
+            return [(("[]",) + st, tt) for st, tt in self.access_paths(name, t.inner, depth) if "[]" not in st]
         if isinstance(t, K.VecT):
             out += [(("[]",) + st, tt) for st, tt in self.access_paths(name, t.elem, depth - 1)
                     if "[]" not in st]
@@ -565,19 +631,38 @@ class Gen:
             e = K.Index(e, idx()) if st == "[]" else K.Field(e, st)
         return e
 
-    def write_places(self, scope, pred, depth):
+    @staticmethod
+    def ptr_root_ok(t, ptr):
+        """FR-261 ``ptr``: False -- no place through a pointer (the FR-251/257
+        generators keep their distributions), True -- any, 'only' -- only
+        places through a pointer."""
+        is_ptr = isinstance(t, K.PtrT)
+        return (ptr == "only" and is_ptr) or (ptr is True) or (ptr is False and not is_ptr)
+
+    def write_places(self, scope, pred, depth, ptr=False):
         """Writable places (Var, element, FR-257 data member) whose type
         satisfies pred."""
         out = []
-        for name, t, w in self.vars_of(scope, lambda t, m: True, write=True):
-            if name in self.stmt_seen:
+        for name, t, w in self.vars_of(scope, lambda t, m: True):
+            if name in self.stmt_seen or name in self.frozen or not self.ptr_root_ok(t, ptr):
+                continue
+            if isinstance(t, K.PtrT):
+                w = t.mutable  # FR-261: writes through a pointer need a `T*`
+            if not w:
                 continue
             for steps, tt in self.access_paths(name, t, depth + (1 if self.sdefs else 0)):
-                if steps and "[]" in steps and depth <= 0:
+                if steps and "[]" in steps and depth <= 0 and not isinstance(t, K.PtrT):
                     continue
                 if pred(tt):
-                    out.append(self.place_of(name, steps, lambda: self.index_for(scope, name)))
+                    out.append(self.place_of(name, steps, lambda n=name: self.ptr_index(scope, n, t)))
         return out
+
+    def ptr_index(self, scope, base, t):
+        """An index for a place rooted at ``base``: `0` half the time through
+        a pointer (`*p`, `p->f`), else a usize expression not reading base."""
+        if isinstance(t, K.PtrT) and self.pr.random() < 0.5:
+            return K.IntLit(0, K.USIZE)
+        return self.index_for(scope, base)
 
     def index_for(self, scope, base):
         """A usize index expression that does not read ``base``."""
@@ -589,11 +674,13 @@ class Gen:
             if added:
                 self.stmt_hidden.discard(base)
 
-    def places(self, scope, pred, depth, index_ok=True, hide_root=False):
+    def places(self, scope, pred, depth, index_ok=True, hide_root=False, ptr=False):
         out = []
         for name, t, w in self.vars_of(scope, lambda t, m: True):
+            if not self.ptr_root_ok(t, ptr):
+                continue
             for steps, tt in self.access_paths(name, t, depth + (1 if self.sdefs else 0)):
-                if "[]" in steps and (not index_ok or depth <= 0):
+                if "[]" in steps and (not index_ok or depth <= 0) and not isinstance(t, K.PtrT):
                     continue
                 if pred(tt):
                     # the root is SEEN before its index is drawn: an index may
@@ -601,6 +688,8 @@ class Gen:
                     self.stmt_seen.add(name)
                     idx = (lambda n=name: self.index_for(scope, n)) if hide_root else \
                         (lambda: self.expr(K.USIZE, scope, 1))
+                    if isinstance(t, K.PtrT) and (not index_ok or self.pr.random() < 0.5):
+                        idx = (lambda: K.IntLit(0, K.USIZE))
                     out.append(self.place_of(name, steps, idx))
         for p in out:
             for n in K.walk(p):
@@ -716,6 +805,12 @@ class Gen:
         not mentioned anywhere else in the statement."""
         args = [None] * len(params)
         for i, p in enumerate(params):
+            if isinstance(p.ty, K.PtrT) and p.ty.mutable:
+                # FR-261: a mutable pointer argument claims its root first
+                args[i] = self.ptr_value(scope, p.ty)
+                if args[i] is None:
+                    raise _NoCall()
+                continue
             if isinstance(p.ty, K.RefT) and p.ty.mutable:
                 vs = [v for v in self.vars_of(scope, lambda t, m: t == p.ty.inner, write=True)
                       if v[0] not in self.stmt_seen]
@@ -727,6 +822,11 @@ class Gen:
         for i, p in enumerate(params):
             if args[i] is not None:
                 continue
+            if isinstance(p.ty, K.PtrT):
+                args[i] = self.ptr_value(scope, p.ty)
+                if args[i] is None:
+                    raise _NoCall()
+                continue
             if isinstance(p.ty, K.RefT):
                 args[i] = self.value(p.ty.inner, scope, d - 1, "borrow")
             elif K.is_copy(p.ty):
@@ -735,7 +835,176 @@ class Gen:
                 args[i] = self.value(p.ty, scope, d - 1, "consume")
         return K.Call(name, tuple(args))
 
-    def mcall(self, scope, d, want):
+    # ------------------------------------------------ FR-261 pointers
+    @contextlib.contextmanager
+    def ptr_stream(self):
+        """Every random draw made while generating a pointer construct comes
+        from the pointer stream, so the FR-250..260 constructs of a seed keep
+        (nearly) the sequence -- and the coverage -- they had before FR-261."""
+        saved, self.r = self.r, self.pr
+        try:
+            yield
+        finally:
+            self.r = saved
+
+    def scope_types(self, scope):
+        """Pointee types a pointer local could be made of right now: the
+        visible variables' (referent) types, their elements and members, the
+        pointees of pointer variables."""
+        out = []
+        for name, t, w in self.vars_of(scope, lambda t, m: True):
+            for steps, tt in self.access_paths(name, t, 1 + (1 if self.sdefs else 0)):
+                if not isinstance(tt, K.PtrT) and tt not in out and tt != K.UNIT:
+                    out.append(tt)
+                if isinstance(tt, K.VecT) and K.elem_ok(tt.elem) and tt.elem not in out:
+                    out.append(tt.elem)
+        return out
+
+    def ptr_value(self, scope, want):
+        with self.ptr_stream():
+            return self._ptr_value(scope, want)
+
+    def _ptr_value(self, scope, want):
+        """A pointer value for a `want` position (a `T*` where `const T*` is
+        wanted is fine), claiming its root: a mutable one's root is then
+        hidden for the rest of the statement, a const one's seen."""
+        T, mut = want.inner, want.mutable
+        if not self.types_visible([T]):
+            return None
+        kinds = ["vec", "addr"]
+        self.pr.shuffle(kinds)
+        kinds.insert(0 if self.pr.random() < 0.5 else 2, "var")
+        for kind in kinds:
+            e = getattr(self, "pv_" + kind)(scope, T, mut)
+            if e is not None:
+                root = TC.ptr_root(e)
+                self.stmt_seen.add(root)
+                if mut:
+                    self.stmt_hidden.add(root)
+                return e
+        return None
+
+    def pv_var(self, scope, T, mut):
+        cands = []
+        for name, t, w in self.vars_of(scope, lambda t, m: isinstance(t, K.PtrT) and t.inner == T):
+            if mut and (not t.mutable or name in self.frozen or name in self.stmt_seen):
+                continue
+            cands.append(name)
+        if not cands:
+            return None
+        name = self.pr.choice(cands)
+        self.stmt_seen.add(name)
+        if self.pr.random() < 0.3:
+            start = self.index_for(scope, name) if mut else self.expr(K.USIZE, scope, 1)
+            return K.Offset(K.Var(name), start)
+        return K.Var(name)
+
+    def pv_vec(self, scope, T, mut):
+        if not K.elem_ok(T):
+            return None
+        pred = lambda tt: tt == K.VecT(T)  # noqa: E731
+        pl = self.write_places(scope, pred, 1, ptr=True) if mut else self.places(scope, pred, 1, ptr=True)
+        pl = [p for p in pl if not any(isinstance(n, (K.Call, K.MethodCall)) for n in K.walk(p))]
+        if not pl:
+            return None
+        base = self.pr.choice(pl)
+        root = TC.base_var(base)
+        self.stmt_seen.add(root)
+        if self.pr.random() < 0.5:
+            return K.Offset(base, None)
+        return K.Offset(base, self.index_for(scope, root) if mut else self.expr(K.USIZE, scope, 1))
+
+    def pv_addr(self, scope, T, mut):
+        me = scope.lookup("self")
+        if (me is not None and K.deref(me[0]) == T and self.visible("self") and self.pr.random() < 0.8
+                and (not mut or (me[0].mutable and "self" not in self.frozen and "self" not in self.stmt_seen))):
+            return K.AddrOf(K.Var("self"))  # `this`
+        pred = lambda tt: tt == T  # noqa: E731
+        pl = self.write_places(scope, pred, 1, ptr=True) if mut else self.places(scope, pred, 1, ptr=True)
+        if not pl:
+            return None
+        p = self.pr.choice(pl)
+        self.stmt_seen.add(TC.base_var(p))
+        if isinstance(p, K.Index):
+            return K.Offset(p.base, p.index)  # N17: `&v[i]` is the suffix
+        return K.AddrOf(p)
+
+    def ptr_stmt(self, scope):
+        with self.ptr_stream():
+            return self._ptr_stmt(scope)
+
+    def _ptr_stmt(self, scope):
+        """A pointer local (`T* q = ..;`), a re-slice (`p += k;`), a store
+        through a pointer (`*p = e;` / `p[i] op= e;`), a push or a member
+        call through one (`p->push_back(e);`, `p->m(..);`)."""
+        k = self.pr.choice(("plet", "plet", "pslice", "pstore", "pstore", "pvec", "pvec", "pmcall", "pmcall",
+                            "pmcall"))
+        if k == "pmcall":
+            for _ in range(4):
+                try:
+                    return K.ExprStmt(self.mcall(scope, 2, None, ptr="only"))
+                except _NoCall:
+                    self.begin_stmt()
+            return None
+        if k == "pvec":
+            places = self.write_places(scope, lambda tt: isinstance(tt, K.VecT), 1, ptr="only")
+            if not places:
+                return None
+            tgt = self.target(places)
+            return K.Push(tgt, self.value(self.ty(tgt, scope).elem, scope, 2, "consume"))
+        if k == "plet":
+            e = None
+            pool = self.scope_types(scope)
+            me = scope.lookup("self")
+            if me is not None and self.visible("self") and self.pr.random() < 0.5:
+                pool = [K.deref(me[0])]  # `S* q = this;`
+            for _ in range(4):
+                if not pool:
+                    break
+                want = K.PtrT(self.pr.choice(pool), self.pr.random() < 0.5)
+                e = self._ptr_value(scope, want)
+                if e is not None:
+                    break
+            if e is None:
+                return None
+            root = TC.ptr_root(e)
+            roots = {root} | self.roots_of.get(root, set())
+            self.pcounter += 1
+            name = "q%d" % self.pcounter  # (its own counter: the main names stay put)
+            self.roots_of[name] = roots
+            # R2: a mutable pointer local hides its roots for the rest of the
+            # block, a const one freezes them
+            if want.mutable:
+                self.hidden |= roots
+            else:
+                self.frozen |= roots
+            mut = self.pr.random() < 0.6
+            self.declare(scope, name, want, mut)
+            return K.Let(name, want, mut, e)
+        if k == "pslice":
+            cands = [(n, t) for n, t, w in self.vars_of(scope, lambda t, m: isinstance(t, K.PtrT), write=True)
+                     if n not in self.stmt_seen]
+            if not cands:
+                return None
+            name, t = self.pr.choice(cands)
+            self.stmt_seen.add(name)
+            self.stmt_hidden.add(name)
+            if self.pr.random() < 0.4:
+                return K.CompoundAssign("add", name, K.IntLit(1, K.USIZE))  # `++p;`
+            return K.CompoundAssign("add", name, self.index_for(scope, name) if t.mutable else self.expr(K.USIZE, scope, 1))
+        places = [p for p in self.write_places(scope, lambda tt: True, 1, ptr="only")
+                  if isinstance(p, (K.Index, K.Field))]
+        if not places:
+            return None
+        tgt = self.choice(places)
+        self.stmt_seen.add(TC.base_var(tgt))
+        self.stmt_hidden.add(TC.base_var(tgt))
+        el = self.ty(tgt, scope)
+        if el in K.ARITH_INT and self.pr.random() < 0.4 and not any(isinstance(n, K.Call) for n in K.walk(tgt)):
+            return K.CompoundStore("add", tgt, K.IntLit(1, el))
+        return K.Store(tgt, self.value(el, scope, 2, "consume"))
+
+    def mcall(self, scope, d, want, ptr=False):
         """FR-257: `r.m(args)` on a place, obeying the receiver alias rules:
         a non-const member function's receiver variable is not mentioned
         anywhere else in the statement (and not by the arguments, which also
@@ -748,9 +1017,9 @@ class Gen:
         mp, params, ret, recv, owner = self.choice(cands)
         st = K.StructT(owner)
         if recv == "mut":
-            places = self.write_places(scope, lambda tt: tt == st, 1)
+            places = self.write_places(scope, lambda tt: tt == st, 1, ptr=ptr)
         else:
-            places = self.places(scope, lambda tt: tt == st, 1, hide_root=True)
+            places = self.places(scope, lambda tt: tt == st, 1, hide_root=True, ptr=ptr)
         if not places:
             raise _NoCall()
         fields = [p for p in places if isinstance(p, K.Field)]
@@ -838,6 +1107,12 @@ class Gen:
 
     def expr(self, t, scope, depth):
         r = self.r
+        if self.pointers and t in K.ALL_PRIMS and self.pr.random() < 0.07:
+            # FR-261: a read through a pointer, `*p` / `p[i]` / `p->f`
+            with self.ptr_stream():
+                pl = self.places(scope, lambda tt: tt == t, 1, ptr="only")
+                if pl:
+                    return self.pr.choice(pl)
         if depth <= 0 or r.random() < 0.25:
             vs = self.vars_of(scope, lambda tt, m: tt == t)
             if vs and r.random() < 0.6:
@@ -936,5 +1211,5 @@ class _NoCall(Exception):
     pass
 
 
-def gen_program(seed, nfuncs, prefix="f", namespaces=True):
-    return Gen(seed, namespaces).program(nfuncs, prefix)
+def gen_program(seed, nfuncs, prefix="f", namespaces=True, pointers=False):
+    return Gen(seed, namespaces, pointers=pointers).program(nfuncs, prefix)

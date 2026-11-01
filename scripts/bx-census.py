@@ -264,6 +264,24 @@ RULES = [
     (r"^struct '.*' contains itself by value", "struct: contains itself", None),
     (r"^member access through a pointer$", "member access through a pointer", None),
     (r"^use of a rejected declaration$", "cascade: use of a rejected declaration", None),
+    # FR-261 pointers <=> suffix slices
+    (r"^(signed pointer offset|pointer arithmetic `p - k`|pointer decrement)", "pointer: backwards (R3)", None),
+    (r"^(pointer comparison|pointer difference)", "pointer: compare/subtract (R4)", None),
+    (r"^null pointer", "pointer: null (R6)", None),
+    (r"^(pointer arithmetic other than|pointer offset of type|pointer arithmetic on something other)",
+     "pointer: arithmetic form", "generic"),
+    (r"^address of a pointer", "pointer: pointer to pointer (R6)", None),
+    (r"^(reinterpret_cast|const_cast)$", None, None),
+    (r"^std::vector::data of something other than", "pointer: data() form", None),
+    (r"^'.*' is passed to '.*' as a mutable pointer", "pointer: argument aliasing (R1)", None),
+    (r"^('.*' is used while '.*', a mutable pointer derived|'.*' is modified or moved while '.*', a pointer into it)",
+     "pointer: root used while borrowed (R2)", None),
+    (r"^a mutable slice of '.*' starts at an offset that reads", "pointer: re-slice reads its root", None),
+    (r"^(assignment of a pointer|.* is a pointer other than|indexing a pointer expression"
+     r"|address of something other than|address of an element in the Kernel)", "pointer: expression form", "generic"),
+    (r"^.* through '.*', a pointer to const$", "pointer: write through const", None),
+    (r"^function returning a pointer$", "pointer: returned (R6)", None),
+    (r"^identifier '.*' is reserved by the canonical Rust spelling", "identifier: reserved by canonical spelling", None),
     # clang kinds with no FRIENDLY name (friendly() falls back to the kind)
     (r"^([A-Z][A-Za-z]*(Expr|Stmt|Decl|Operator|Literal))$", None, None),
     # ---- typecheck.py ------------------------------------------------------
