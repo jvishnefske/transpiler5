@@ -1675,7 +1675,7 @@ anchor = "FR-250 (opened 2026-11-01, child of FR-249): **BX KERNEL CORE"
 [[items]]
 id = "FR-251"
 kind = "feature"
-status = "open"
+status = "landed"
 rank = 58
 size = "M"
 title = "BX std::vector + std::string rows"

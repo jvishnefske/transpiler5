@@ -7,7 +7,19 @@ with `_` separators), and rejects everything else with a located
 ``unsupported:`` error.  It does no type inference: every `let` is
 explicitly typed and every non-i32 integer literal carries its suffix, so
 the Kernel types are read straight off the text.
+
+FR-251: `Vec<T>`, `String`, `&T`, `&mut T`; `&e` / `&mut e` parse to a
+SURFACE ``Borrow`` and `*x` to ``Var(x, spelling='deref')`` -- the
+checker (surface='rust') verifies they sit exactly where the canonical
+spelling puts them, and normalize drops them.  Statement-only methods
+(`.push`, `.pop`, `.clear`, `.resize`, `.push_str`, `bx::push_byte`) and
+the range-for iterator adaptors (`.iter()`, `.iter_mut()`,
+`.iter().copied()`, `.iter().cloned()`) parse to private markers that
+are only legal in their statement / `for` position.
 """
+
+from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
 from . import fmt
 from . import kernel as K
@@ -31,6 +43,28 @@ BIN_LEVELS = [
 COMPOUND = {"+=": "add", "-=": "sub", "*=": "mul", "/=": "div", "%=": "rem", "&=": "band",
             "|=": "bor", "^=": "bxor", "<<=": "shl", ">>=": "shr"}
 WRAPPING_METHODS = {"wrapping_add": "add", "wrapping_sub": "sub", "wrapping_mul": "mul"}
+
+
+@dataclass(frozen=True)
+class _MStmt:
+    """A statement-only method call (surface marker, never in a Kernel)."""
+
+    kind: str
+    target: object
+    args: Tuple[object, ...]
+    loc: Optional[Loc] = field(default=None, compare=False)
+
+
+@dataclass(frozen=True)
+class _Iter:
+    """`v.iter()` & co (surface marker, only legal as a `for` iterable)."""
+
+    mode: str  # 'ref' 'mut' 'copied' 'cloned'
+    recv: object
+    loc: Optional[Loc] = field(default=None, compare=False)
+
+
+STMT_METHODS = {"push": 1, "pop": 0, "clear": 0, "resize": 2, "push_str": 1}
 
 
 class ParseError(Exception):
@@ -87,11 +121,43 @@ class _Parser:
             raise ParseError(t.loc, "expected an identifier, found %s" % self.describe(t))
         return self.next()
 
+    def close_angle(self):
+        """Consume one `>`, splitting a `>>` token (`Vec<Vec<i32>>`)."""
+        t = self.tok
+        if t.kind == "punct" and t.text == ">>":
+            from .rs_lex import Tok
+            self.toks[self.i] = Tok("punct", ">", Loc(t.loc.line, t.loc.col + 1))
+            return t
+        return self.expect(">")
+
     def type_(self):
         t = self.tok
         if t.kind == "ident" and t.text in RUST_TYPES:
             self.next()
             return RUST_TYPES[t.text]
+        if t.kind == "ident" and t.text == "String":
+            self.next()
+            return K.STRING
+        if t.kind == "ident" and t.text == "Vec" and self.peek().text == "<":
+            self.next()
+            self.next()
+            el = self.type_()
+            self.close_angle()
+            return K.VecT(el)
+        if t.text == "&" and t.kind == "punct":
+            self.next()
+            if self.tok.kind == "punct" and self.tok.text == "'":
+                self.unsupported(self.tok, "lifetime")
+            mut = False
+            if self.at("mut"):
+                self.next()
+                mut = True
+            inner = self.type_()
+            if isinstance(inner, K.RefT):
+                self.unsupported(t, "reference to a reference")
+            return K.RefT(inner, mut)
+        if t.text == "&&" and t.kind == "punct":
+            self.unsupported(t, "reference to a reference")
         if t.text == "&":
             self.unsupported(t, "reference type")
         if t.text == "(":
@@ -232,12 +298,44 @@ class _Parser:
         if t.text == ";" and t.kind == "punct":
             self.unsupported(t, "empty statement")
         e = self.expr()
+        if isinstance(e, _MStmt):
+            self.expect(";")
+            return self.method_stmt(e, t)
+        if self.tok.kind == "punct" and (self.tok.text == "=" or self.tok.text in COMPOUND):
+            op_tok = self.next()
+            v = self.expr()
+            self.expect(";")
+            if isinstance(e, K.Var) and e.spelling == "deref":
+                if op_tok.text == "=":
+                    return K.Assign(e.name, v, t.loc)
+                return K.CompoundAssign(COMPOUND[op_tok.text], e.name, v, t.loc, "plain")
+            if isinstance(e, K.Index):
+                if op_tok.text == "=":
+                    return K.Store(e, v, t.loc)
+                return K.CompoundStore(COMPOUND[op_tok.text], e, v, t.loc, "plain")
+            self.unsupported(t, "assignment to something other than a variable or an element")
         if not isinstance(e, K.Call):
             if self.at("}"):
                 self.unsupported(t, "tail expression (the subset spells it `return e;`)")
             self.unsupported(t, "expression statement that is not a call")
         self.expect(";")
         return K.ExprStmt(e, t.loc)
+
+    def method_stmt(self, m, t):
+        L = t.loc
+        if m.kind == "push":
+            return K.Push(m.target, m.args[0], L)
+        if m.kind == "pop":
+            return K.Pop(m.target, L)
+        if m.kind == "clear":
+            return K.Clear(m.target, L)
+        if m.kind == "resize":
+            return K.Resize(m.target, m.args[0], m.args[1], L)
+        if m.kind == "push_str":
+            return K.PushStr(m.target, m.args[0], L)
+        if m.kind == "push_byte":
+            return K.PushByte(m.target, m.args[0], L)
+        raise ParseError(L, "unsupported: method `.%s()`" % m.kind)
 
     def let(self):
         t = self.expect("let")
@@ -278,11 +376,24 @@ class _Parser:
 
     def for_(self):
         t = self.expect("for")
+        mutable = False
+        if self.at("mut"):
+            self.next()
+            mutable = True
         if self.tok.kind != "ident":
             self.unsupported(self.tok, "pattern in `for`")
         var = self.ident()
         self.expect("in")
         lo = self.expr()
+        if isinstance(lo, _Iter):
+            body = self.block()
+            if lo.mode in ("copied", "cloned"):
+                return K.ForEach(var.text, mutable, "copy", lo.recv, body, t.loc)
+            if mutable:
+                self.unsupported(t, "`for mut` over references")
+            return K.ForEach(var.text, False, lo.mode, lo.recv, body, t.loc)
+        if mutable:
+            self.unsupported(t, "`for mut` over a range")
         if self.at("..="):
             self.unsupported(self.tok, "inclusive range `..=`")
         if not self.at(".."):
@@ -331,7 +442,8 @@ class _Parser:
 
     def print_arg(self):
         t = self.tok
-        if t.kind == "ident" and t.text == "bx" and self.peek().text == "::":
+        if (t.kind == "ident" and t.text == "bx" and self.peek().text == "::"
+                and self.peek(2).text in ("fmt_f", "chr")):
             self.next()
             self.next()
             name = self.ident()
@@ -414,10 +526,21 @@ class _Parser:
             if t.text == "!":
                 self.next()
                 return K.Unary("not", self.unary(), t.loc, "plain")
-            if t.text in ("&", "&&"):
-                self.unsupported(t, "reference `&`")
+            if t.text == "&":
+                self.next()
+                mut = False
+                if self.at("mut"):
+                    self.next()
+                    mut = True
+                return K.Borrow(self.unary(), mut, t.loc)
+            if t.text == "&&":
+                self.unsupported(t, "reference `&&`")
             if t.text == "*":
-                self.unsupported(t, "dereference `*`")
+                self.next()
+                e = self.unary()
+                if not isinstance(e, K.Var) or e.spelling:
+                    self.unsupported(t, "dereference `*` of something other than a reference variable")
+                return K.Var(e.name, e.loc, "deref")
         return self.postfix()
 
     def postfix(self):
@@ -441,14 +564,141 @@ class _Parser:
                     self.expect(")")
                     e = K.Unary("neg", e, m.loc, "wrapping")
                     continue
-                if self.at("("):
-                    self.unsupported(m, "method call `.%s()`" % m.text)
-                self.unsupported(m, "field access `.%s`" % m.text)
+                e = self.method(e, m)
+                continue
             if t.kind == "punct" and t.text == "[":
-                self.unsupported(t, "indexing")
+                self.next()
+                idx = self.expr()
+                self.expect("]")
+                e = K.Index(e, idx, getattr(e, "loc", None) or t.loc)  # located at its start, like C++
+                continue
             if t.kind == "punct" and t.text == "?":
                 self.unsupported(t, "`?` operator")
             return e
+
+    def method(self, recv, m):
+        """`.name(...)` after ``recv`` (the `.` and name are consumed)."""
+        name = m.text
+        if not self.at("("):
+            self.unsupported(m, "field access `.%s`" % name)
+        if isinstance(recv, (_MStmt, _Iter)):
+            self.unsupported(m, "method call `.%s()`" % name)
+        if name in ("len", "is_empty", "clone", "to_string", "as_bytes", "iter", "iter_mut") \
+                or (name in STMT_METHODS and STMT_METHODS[name] == 0):
+            self.expect("(")
+            self.expect(")")
+            if name == "len":
+                return K.Len(recv, m.loc)
+            if name == "is_empty":
+                return K.IsEmpty(recv, m.loc)
+            if name == "clone":
+                return K.Clone(recv, m.loc)
+            if name == "to_string":
+                return K.ToStr(recv, m.loc)
+            if name == "as_bytes":
+                lb = self.tok
+                if not self.at("["):
+                    self.unsupported(m, "`.as_bytes()` other than `s.as_bytes()[i] as i8`")
+                self.next()
+                idx = self.expr()
+                self.expect("]")
+                if not self.at("as") or self.peek().text != "i8":
+                    self.unsupported(lb, "byte read other than `s.as_bytes()[i] as i8` (std::string's "
+                                         "char is signed)")
+                self.next()
+                self.next()
+                return K.ByteAt(recv, idx, m.loc)
+            if name == "iter":
+                if self.at(".") and self.peek().text in ("copied", "cloned") and self.peek(2).text == "(":
+                    self.next()
+                    how = self.next().text
+                    self.expect("(")
+                    self.expect(")")
+                    return _Iter(how, recv, m.loc)
+                return _Iter("ref", recv, m.loc)
+            if name == "iter_mut":
+                return _Iter("mut", recv, m.loc)
+            return _MStmt(name, recv, (), m.loc)
+        if name in STMT_METHODS:
+            self.expect("(")
+            args = []
+            while not self.at(")"):
+                args.append(self.expr())
+                if not self.at(")"):
+                    self.expect(",")
+            self.expect(")")
+            if len(args) != STMT_METHODS[name]:
+                self.unsupported(m, "`.%s()` with %d arguments" % (name, len(args)))
+            return _MStmt(name, recv, tuple(args), m.loc)
+        self.unsupported(m, "method call `.%s()`" % name)
+
+    def call_args(self):
+        self.expect("(")
+        args = []
+        while not self.at(")"):
+            args.append(self.expr())
+            if not self.at(")"):
+                self.expect(",")
+        self.expect(")")
+        return args
+
+    def path_expr(self, t):
+        """`Vec::new()`, `String::new()`, `String::from("..")`, `bx::..`."""
+        self.next()  # ::
+        if t.text == "Vec" and self.at("<"):
+            self.next()
+            el = self.type_()
+            self.close_angle()
+            self.expect("::")
+            m = self.ident()
+            if m.text != "new":
+                self.unsupported(m, "path expression `Vec::<..>::%s`" % m.text)
+            self.expect("(")
+            self.expect(")")
+            return K.VecLit(el, (), t.loc)
+        m = self.ident()
+        path = "%s::%s" % (t.text, m.text)
+        if path in ("Vec::new", "String::new"):
+            self.expect("(")
+            self.expect(")")
+            return K.VecLit(None, (), t.loc) if t.text == "Vec" else K.StrNew(t.loc)
+        if path == "String::from":
+            self.expect("(")
+            st = self.tok
+            if st.kind != "str":
+                self.unsupported(st, "`String::from` of something other than a string literal")
+            self.next()
+            self.expect(")")
+            return K.StrFrom(st.value, t.loc)
+        if path in ("bx::substr", "bx::substr_from", "bx::push_byte"):
+            args = self.call_args()
+            want = {"bx::substr": 3, "bx::substr_from": 2, "bx::push_byte": 2}[path]
+            if len(args) != want:
+                self.unsupported(m, "`%s` with %d arguments" % (path, len(args)))
+            if path == "bx::push_byte":
+                return _MStmt("push_byte", args[0], (args[1],), t.loc)
+            return K.Substr(args[0], args[1], args[2] if len(args) == 3 else None, t.loc)
+        self.unsupported(t, "path expression `%s`" % path)
+
+    def vec_macro(self, t):
+        self.next()  # !
+        self.expect("[")
+        if self.at("]"):
+            self.unsupported(t, "`vec![]` (the subset spells the empty vector `Vec::new()`)")
+        first = self.expr()
+        if self.at(";"):
+            self.next()
+            n = self.expr()
+            self.expect("]")
+            return K.VecFill(first, n, t.loc)
+        elems = [first]
+        while self.at(","):
+            self.next()
+            if self.at("]"):
+                break
+            elems.append(self.expr())
+        self.expect("]")
+        return K.VecLit(None, tuple(elems), t.loc)
 
     def primary(self):
         t = self.tok
@@ -479,8 +729,12 @@ class _Parser:
                 self.unsupported(t, "`%s` expression" % t.text)
             self.next()
             if self.at("::"):
+                if t.text in ("Vec", "String", "bx"):
+                    return self.path_expr(t)
                 self.unsupported(t, "path expression `%s::..`" % t.text)
             if self.at("!"):
+                if t.text == "vec" and self.peek().text == "[":
+                    return self.vec_macro(t)
                 self.unsupported(t, "macro `%s!` in an expression" % t.text)
             if self.at("("):
                 self.next()
@@ -514,7 +768,13 @@ def rs_parse_surface(src):
         toks = lex(src)
     except LexError as ex:
         raise ParseError(ex.loc, ex.msg)
-    return _Parser(toks).program()
+    prog = _Parser(toks).program()
+    for n in K.walk(prog):
+        if isinstance(n, _MStmt):
+            raise ParseError(n.loc, "unsupported: `.%s()` used as a value" % n.kind)
+        if isinstance(n, _Iter):
+            raise ParseError(n.loc, "unsupported: iterator outside a `for` loop")
+    return prog
 
 
 def rs_parse(src):
@@ -534,6 +794,7 @@ def rs_parse_all(src):
         surf = rs_parse_surface(src)
     except ParseError as ex:
         return None, [(ex.loc, ex.msg)]
+    surf = TC.normalize(surf, keep_surface=True)  # N11 only: empty-vector element types
     errs = TC.check(surf, surface="rust")
     if errs:
         return None, errs

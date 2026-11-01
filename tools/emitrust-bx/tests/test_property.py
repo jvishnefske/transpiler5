@@ -8,6 +8,12 @@
 # A failure here means a printer emits something its own parser reads as a
 # DIFFERENT program -- exactly the silent miscompile class the bijection is
 # meant to rule out.
+# FR-251: the same laws over std::vector / std::string / reference params /
+# range-for; the coverage test pins that every new node, every range-for
+# mode, both reference kinds and MOVES (a bare non-Copy variable in a
+# consuming position) all occur, and the rustc subset below now also
+# exercises the borrow checker (`--emit=metadata` runs borrowck), which is
+# what makes the alias / move / self-index rules load-bearing.
 import collections
 import os
 import shutil
@@ -57,6 +63,39 @@ def test_generator_size_and_coverage(programs):
     for t in K.ALL_PRIMS:
         if t != K.BOOL:
             assert seen["cast:" + t.name] >= 10, t
+
+
+def test_generator_covers_fr251(programs):
+    seen = collections.Counter()
+    for p in programs:
+        for f in p.funcs():
+            for prm in f.params:
+                if isinstance(prm.ty, K.RefT):
+                    seen["ref:" + ("mut" if prm.ty.mutable else "shared")] += 1
+                elif not K.is_copy(prm.ty):
+                    seen["byvalue-nc"] += 1
+            if K.is_owned_nc(f.ret):
+                seen["ret-nc"] += 1
+            for n in K.walk(f):
+                seen[type(n).__name__] += 1
+                if isinstance(n, K.ForEach):
+                    seen["foreach:" + n.mode] += 1
+                if isinstance(n, K.Substr):
+                    seen["substr:" + ("n" if n.count is not None else "from")] += 1
+                if isinstance(n, K.Binary) and n.op in ("eq", "ne") and K.StrLit in (type(n.lhs), type(n.rhs)):
+                    seen["strlit-cmp"] += 1
+                if isinstance(n, (K.Let, K.Assign, K.Push, K.Return)):
+                    v = n.init if isinstance(n, K.Let) else n.value
+                    if isinstance(v, K.Var) and v is not None:
+                        seen["move"] += 1
+    for kind in ("Clone", "Index", "ByteAt", "Len", "IsEmpty", "VecLit", "VecFill", "StrNew", "StrFrom",
+                 "ToStr", "Store", "CompoundStore", "Push", "Pop", "Clear", "Resize", "PushStr",
+                 "PushByte", "ForEach"):
+        assert seen[kind] >= 10, kind
+    for k in ("foreach:copy", "foreach:ref", "foreach:mut", "substr:n", "substr:from", "ref:mut",
+              "ref:shared", "byvalue-nc", "ret-nc", "strlit-cmp"):
+        assert seen[k] >= 10, k
+    assert seen["move"] >= 30
 
 
 def test_law1_and_law2_rust(programs):
