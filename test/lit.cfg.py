@@ -87,6 +87,19 @@ tools = ["emitrust-opt", "emitrust-translate", "emitrust-import-c", "emitrust-cc
 
 llvm_config.add_tool_substitutions(tools, tool_dirs)
 
+# FR-250: emitrust-bx is a standalone Python tool (no build step), run with
+# the configured interpreter straight from the source tree. %bx_src is its
+# directory (the pytest suite lives under it).
+config.substitutions.append((
+    "%emitrust-bx",
+    "%s %s" % (config.python_executable,
+               os.path.join(config.emitrust_src_root, "tools", "emitrust-bx",
+                            "emitrust-bx.py")),
+))
+config.substitutions.append((
+    "%bx_src", os.path.join(config.emitrust_src_root, "tools", "emitrust-bx"),
+))
+
 # The differential EndToEnd tests build the emitted crate with cargo; make
 # them conditional on cargo being available on PATH.
 if shutil.which("cargo"):

@@ -1,0 +1,6 @@
+# FR-250: runs emitrust-bx's pytest suite inside the fast lit tier. It pins
+# the bijection laws as PROPERTIES (>= 500 generated Kernel functions, law 1
+# and law 2 on the Rust side in pure python and on the C++ side through real
+# clang), plus per-module unit tests. Bytecode/cache writes are disabled so a
+# test run never dirties the source tree.
+# RUN: env PYTHONDONTWRITEBYTECODE=1 %python -m pytest -q -p no:cacheprovider %bx_src/tests
