@@ -43,6 +43,13 @@ Design rules:
   unsupported construct and leaves a located Residual in its place, so a
   program's distance from the subset is a COUNT, not a first failure
   (FR-254).  A program containing a Residual never reaches a printer.
+* FR-252 adds closures: the statement ``Closure`` (`auto f = [caps](params)
+  -> R { body };` <=> `let f = [move] |params| -> R { body };`), whose ONE
+  capture bit is ``move`` (all by copy) or not (all by reference) -- the
+  capture list itself is derived from the body (``closure_captures``), the
+  expression ``ClosureCall`` (`f(a)`), and the type ``FnT`` (a closure's
+  scalar signature; behind a ``RefT`` it is a callable PARAMETER: `const F&`
+  <=> `&impl Fn`, `F&` <=> `&mut impl FnMut`).
 """
 
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -108,6 +115,8 @@ class RefT:
     mutable: bool
 
     def __str__(self):
+        if isinstance(self.inner, FnT) and self.mutable:
+            return "&mut impl FnMut" + str(self.inner)[len("impl Fn"):]
         return "&%s%s" % ("mut " if self.mutable else "", self.inner)
 
 
@@ -148,8 +157,24 @@ class PtrT:
         return "&%s[%s]" % ("mut " if self.mutable else "", self.inner)
 
 
-Ty = Union[Prim, VecT, StrT, RefT, StructT, PtrT]  # the closed sum
-TYPE_CLASSES = (Prim, VecT, StrT, RefT, StructT, PtrT)
+@dataclass(frozen=True)
+class FnT:
+    """FR-252: the type of a CLOSURE -- its parameter types (scalars) and
+    return type (a scalar or unit).  A closure variable (``Closure``) has
+    this type in a scope; as a parameter it is always behind a reference:
+    `const F& f` <=> `f: &impl Fn(..) -> R`, `F& f` <=> `f: &mut impl
+    FnMut(..) -> R` (``RefT(FnT, mutable)``)."""
+
+    params: Tuple["Ty", ...]
+    ret: "Ty"
+
+    def __str__(self):
+        return "impl Fn(%s)%s" % (", ".join(str(p) for p in self.params),
+                                  "" if self.ret == Prim("()") else " -> %s" % self.ret)
+
+
+Ty = Union[Prim, VecT, StrT, RefT, StructT, PtrT, FnT]  # the closed sum
+TYPE_CLASSES = (Prim, VecT, StrT, RefT, StructT, PtrT, FnT)
 STRING = StrT()
 
 I8 = Prim("i8")
@@ -594,10 +619,22 @@ class IncDec:
     spelling: tuple = field(default=(), compare=False, repr=False)
 
 
+# ---------------------------------------------------------------- FR-252 exprs
+
+@dataclass(frozen=True)
+class ClosureCall:
+    """`f(a, b)` of a local closure ``f`` (C++ `operator()` of the lambda's
+    closure object), or of a callable PARAMETER (``RefT(FnT)``)."""
+
+    name: str
+    args: Tuple["Expr", ...]
+    loc: Optional[Loc] = _loc()
+
+
 Expr = Union[IntLit, FloatLit, BoolLit, StrLit, Var, Unary, Binary, Cast, Call,
              ResidualExpr, Clone, Index, ByteAt, Len, IsEmpty, VecLit, VecFill,
              StrNew, StrFrom, Substr, ToStr, Field, StructLit, MethodCall, Offset, AddrOf,
-             Cond, IncDec]
+             Cond, IncDec, ClosureCall]
 
 
 # ---------------------------------------------------------------- printf
@@ -820,9 +857,35 @@ class ForEach:
     loc: Optional[Loc] = _loc()
 
 
+@dataclass(frozen=True)
+class Closure:
+    """FR-252: a local closure, `auto f = [caps](params) -> R { body };` <=>
+    `let f = move |params| -> R { body };`.
+
+    ``move`` True: every capture is BY COPY (C++ `[a, b]`, Rust `move`);
+    False: every capture is BY REFERENCE (C++ `[&a, &b]`, a non-move Rust
+    closure, which borrows exactly what it uses).  The capture LIST is not
+    stored: it is the set of enclosing variables the body uses, in order of
+    first use (``closure_captures``) -- Rust spells no list at all, and
+    C++'s written order and unused captures are spellings (normal form
+    N23).  Whether the closure MUTATES state (C++ `mutable` for a by-copy
+    closure, Rust `let mut f` / FnMut) is derived from the body too.
+    ``params`` are scalars, ``ret`` a scalar or unit.  ``spelling``
+    (compare=False) is the Rust surface's `let mut`, checked against the
+    derived FnMut-ness."""
+
+    name: str
+    move: bool
+    params: Tuple["Param", ...]
+    ret: "Ty"
+    body: "Block"
+    loc: Optional[Loc] = _loc()
+    spelling: str = field(default="", compare=False, repr=False)
+
+
 Stmt = Union[Block, Let, Assign, CompoundAssign, ExprStmt, Print, If, While,
              For, Break, Continue, Return, ResidualStmt, Store, CompoundStore,
-             Push, Pop, Clear, Resize, PushStr, PushByte, ForEach]
+             Push, Pop, Clear, Resize, PushStr, PushByte, ForEach, Closure]
 
 MUTATING_STMTS = (Push, Pop, Clear, Resize, PushStr, PushByte)
 
@@ -964,6 +1027,34 @@ class Program:
 RESIDUALS = (ResidualExpr, ResidualStmt, ResidualItem)
 
 
+def closure_captures(c):
+    """FR-252: the variables closure ``c`` captures -- every name its body
+    uses (a Var, or the target of an assignment) that the body does not
+    declare itself, in order of first use (pre-order).  The checker refuses
+    a closure that declares a name of its enclosing scope, so a used name is
+    either the closure's own or a capture."""
+    own = {p.name for p in c.params}
+    for n in walk(c.body):
+        if isinstance(n, Let):
+            own.add(n.name)
+        elif isinstance(n, (For, ForEach)):
+            own.add(n.var)
+        elif isinstance(n, Closure):
+            own.add(n.name)
+    out = []
+    for n in walk(c.body):
+        name = None
+        if isinstance(n, Var):
+            name = n.name
+        elif isinstance(n, (Assign, CompoundAssign)):
+            name = n.name
+        elif isinstance(n, ClosureCall):
+            name = n.name
+        if name is not None and name not in own and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
 # ---------------------------------------------------------------- utilities
 
 def walk(node):
@@ -1072,6 +1163,10 @@ def dump(node, indent=0):
     if isinstance(node, ForEach):
         return "%sforeach %s%s %s in %s\n" % (pad, "mut " if node.mutable else "", node.var, node.mode,
                                               dump_expr(node.iterable)) + dump(node.body, indent + 1)
+    if isinstance(node, Closure):
+        ps = ", ".join("%s%s: %s" % ("mut " if p.mutable else "", p.name, p.ty) for p in node.params)
+        return "%sclosure %s%s(%s) -> %s [%s]\n" % (pad, "move " if node.move else "", node.name, ps, node.ret,
+                                                  ", ".join(closure_captures(node))) + dump(node.body, indent + 1)
     if isinstance(node, (ResidualStmt, ResidualItem)):
         return "%sresidual %r\n" % (pad, node.reason)
     raise TypeError("dump: %r" % (node,))
@@ -1135,6 +1230,8 @@ def dump_expr(e):
         return "(cond %s %s %s)" % (dump_expr(e.cond), dump_expr(e.then), dump_expr(e.els))
     if isinstance(e, IncDec):
         return "(%s%s %s)" % ("post" if e.post else "pre", "inc" if e.op == "add" else "dec", dump_expr(e.var))
+    if isinstance(e, ClosureCall):
+        return "(call_closure %s%s)" % (e.name, "".join(" " + dump_expr(a) for a in e.args))
     if isinstance(e, ResidualExpr):
         return "(residual %r)" % e.reason
     raise TypeError("dump_expr: %r" % (e,))

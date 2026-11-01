@@ -117,6 +117,26 @@ FR-259, measured on the same clang:
   when both arms are lvalues of one type, read through LValueToRValue.
 * `x++` / `++x` is a UnaryOperator `++` with `isPostfix`; used as a value it
   is not a statement of its own.
+
+FR-252 (closures), measured on the same clang:
+
+* `auto f = [..](..) {..};` is a VarDecl of type `(lambda at F:L:C)` over a
+  LambdaExpr [implicit CXXRecordDecl, capture initializers.., body].  The
+  record's FieldDecls are the captures in order (a `T &` field is by
+  reference); its `operator()` is a CXXMethodDecl whose type lacks `const`
+  iff `mutable` (a spelling here: N23's derived list decides) and reads
+  `auto (int) const -> int` for a written trailing return type, `int (int)
+  const` for a deduced one; a generic lambda's is a FunctionTemplateDecl.
+  The body's DeclRefExprs name the ENCLOSING VarDecls by id, so captures
+  resolve like any local.  Explicit vs default capture is NOT in the JSON:
+  the capture list is read from the source text at the LambdaExpr's range.
+* a call `f(x)` is a CXXOperatorCallExpr `operator()` whose first argument
+  is the closure variable; `auto g = f;` / a temporary in place / an
+  argument is any other node (refused).
+* `template <typename F> R g(const F& f, ..)` is a FunctionTemplateDecl
+  [TemplateTypeParmDecl, pattern FunctionDecl, instantiations..]; each
+  instantiation names its lambda record through TemplateArgument ->
+  RecordType.decl and has a fully typed body, which is what is imported.
 """
 
 import bisect
@@ -426,6 +446,9 @@ class CxxImporter:
         self.ctor_types = {}  # struct path -> its user constructor's type string
         self.nonneg_ids = set()  # FR-261: decl ids of counting-loop variables with a literal lower bound
         self.td_ok = True  # FR-259 (N20): may the <cstdint> names be resolved in written spellings?
+        self.in_closure = None  # FR-252: the closure whose body is being imported
+        self.fn_params = {}  # FR-252: template instantiation id -> (param index, RefT(FnT))
+        self.bad_funcs = set()  # FR-252: decl ids of rejected function templates (pattern + instances)
 
     # -------------------------------------------------------------- utils
     def is_main(self, f):
@@ -702,6 +725,12 @@ class CxxImporter:
                 return  # `using a::f;` of a user function: spelling only
             if k == "UsingDecl":
                 items.append(K.ResidualItem(friendly(k), self.loc(n)))
+        elif k == "FunctionTemplateDecl":
+            r = self.template_func(n, ns, internal, funcs)
+            if r is not None:
+                items.append(K.ResidualItem(r, self.loc(n)))
+                # its calls are cascades of this one report
+                self.bad_funcs |= {c.get("id") for c in n.get("inner", []) if c.get("kind") == "FunctionDecl"}
         elif k == "NamespaceAliasDecl":
             al = n.get("aliasedNamespace", {}).get("id")
             if al in self.ns_index and self.decl_main.get(al):
@@ -940,8 +969,12 @@ class CxxImporter:
 
     def signature_types(self, n):
         ptys = []
+        fp = self.fn_params.get(n.get("id"))
         for p in n.get("inner", []):
             if p.get("kind") == "ParmVarDecl":
+                if fp is not None and fp[0] == len(ptys):
+                    ptys.append(fp[1])  # FR-252: the callable parameter
+                    continue
                 ptys.append(self.map_type(p.get("type"))[0])
         rs = self.ret_type_str(n)
         ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0]
@@ -977,8 +1010,20 @@ class CxxImporter:
         if recv in ("ref", "mut"):
             self.scope.declare("self", K.RefT(K.StructT(owner["path"]), recv == "mut"), False)
         params = []
+        fp = self.fn_params.get(n.get("id"))
         for p in n.get("inner", []):
             if p.get("kind") != "ParmVarDecl":
+                continue
+            if fp is not None and fp[0] == len(params):
+                # FR-252: `const F& f` / `F& f`, typed by the instantiations
+                pl = self.lines.at(_off(p.get("loc")))
+                pname = p.get("name")
+                if not pname:
+                    pre.append(K.ResidualStmt("unnamed parameter", pl))
+                    pname = "unnamed_param_%d" % len(params)
+                params.append(K.Param(pname, fp[1], False, pl))
+                self.scope.declare(pname, fp[1], False)
+                self.locals[p["id"]] = pname
                 continue
             ty, const, spelled = self.map_type(p.get("type"))
             pl = self.lines.at(_off(p.get("loc")))
@@ -1204,7 +1249,7 @@ class CxxImporter:
             # FR-259 (N22): `type` is clang's DEDUCED type, read like a written
             # one (a reference, an iterator or a lambda keeps a residual)
             if "(lambda at " in (spelled or ""):
-                return K.ResidualStmt("auto-typed declaration of a lambda", L)
+                return self.closure_decl(d, L, ty)
         if head.startswith("decltype"):
             return K.ResidualStmt("decltype-typed declaration", L)
         if d.get("storageClass") in ("static", "extern"):
@@ -1634,6 +1679,8 @@ class CxxImporter:
                 return self.rexpr(n, "indirect call")
             rd = c.get("referencedDecl", {})
             fname = self.user_funcs.get(rd.get("id"))
+            if fname is None and rd.get("id") in self.bad_funcs:
+                return K.ResidualExpr("call of a rejected function template", L, cascade=True)
             if fname is None:
                 if rd.get("name") == "move":
                     return self.rexpr(n, "std::move outside an initializer, assignment, by-value argument, "
@@ -2305,6 +2352,8 @@ class CxxImporter:
         L = self.loc(n)
         name = self.op_name(n)
         args = n.get("inner", [])[1:]
+        if name == "operator()":
+            return self.closure_call(n, args)
         if name == "operator[]" and len(args) == 2:
             base = self.borrowed(args[0])
             bt = self.ty_of(base)
@@ -2424,6 +2473,8 @@ class CxxImporter:
         e = self.operator_expr(n)
         if isinstance(e, K.ResidualExpr):
             return K.ResidualStmt(e.reason, e.loc)
+        if isinstance(e, K.ClosureCall):
+            return K.ExprStmt(e, L)
         return self.rstmt(n, "expression statement without effect")
 
     def class_direct_init(self, d, ty):
@@ -2496,6 +2547,255 @@ class CxxImporter:
         finally:
             self.scope = saved
         return K.ForEach(name, mutable, mode, it, blk, L)
+
+
+    # ================================================== FR-252: closures
+    def lambda_parts(self, lam):
+        """(closure record, operator() decl or None, capture-init exprs, body)."""
+        kids = lam.get("inner", [])
+        rec = next((c for c in kids if c.get("kind") == "CXXRecordDecl"), {})
+        body = kids[-1] if kids and kids[-1].get("kind") == "CompoundStmt" else None
+        inits = [c for c in kids[1:-1]] if body is not None else []
+        op = next((m for m in rec.get("inner", []) if m.get("name") == "operator()"
+                   and m.get("kind") in ("CXXMethodDecl", "FunctionTemplateDecl")), None)
+        return rec, op, inits, body
+
+    def lambda_sig(self, op):
+        """(param Kernel types or None, ret or None, spelled ret) of a
+        closure's operator(); clang prints `auto (int) const -> int` for a
+        written trailing return type and `int (int) const` for a deduced one."""
+        q = self.qual(op.get("type")) or ""
+        if ") const ->" in q or ") ->" in q or ") mutable ->" in q:
+            rs = q.rsplit("->", 1)[1].strip()
+        else:
+            rs = q[:q.find("(")].strip() if "(" in q else q
+        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0]
+        ptys = [self.map_type(p.get("type")) for p in op.get("inner", []) if p.get("kind") == "ParmVarDecl"]
+        return ptys, ret, rs
+
+    def capture_list(self, lam, rec, inits):
+        """The explicit list a default capture stands for, read off the
+        closure record: one field per capture, in capture order (a
+        reference-typed field is a by-reference capture), named by its
+        initializer."""
+        fields = [f for f in rec.get("inner", []) if f.get("kind") == "FieldDecl"]
+        out = []
+        for f, e in zip(fields, inits):
+            u = self.strip(e)
+            while isinstance(u, dict) and u.get("kind") in ("CXXConstructExpr", "ImplicitCastExpr") and u.get("inner"):
+                u = self.strip(u["inner"][0])
+            if isinstance(u, dict) and u.get("kind") == "CXXThisExpr":
+                out.append("this")
+                continue
+            nm = (u.get("referencedDecl") or {}).get("name", "?") if isinstance(u, dict) else "?"
+            ref = (self.qual(f.get("type")) or "").rstrip().endswith("&")
+            out.append(("&" if ref else "") + nm)
+        return "[%s]" % ", ".join(out)
+
+    def closure_decl(self, d, L, ty):
+        """`auto f = [caps](params) -> R { body };` (FR-252)."""
+        name = d.get("name")
+        lam = self.strip_tmp(self.strip((d.get("inner") or [{}])[0]))
+        if lam.get("kind") != "LambdaExpr":
+            return K.ResidualStmt("copy of a closure (`auto g = f;` copies its state in C++, Rust would move "
+                                  "it; the subset only calls a closure)", L)
+        if d.get("init") != "c":
+            return K.ResidualStmt("%s-initialization of a closure (the subset spells it `auto f = [..](..) "
+                                  "{..};`)" % d.get("init"), L)
+        if self.in_closure is not None:
+            return K.ResidualStmt("lambda inside a lambda body (nested closures are not in the subset)", L)
+        rec, op, inits, body = self.lambda_parts(lam)
+        if op is None or body is None:
+            return K.ResidualStmt("lambda expression", L)
+        if op.get("kind") == "FunctionTemplateDecl":
+            return K.ResidualStmt("generic lambda (an `auto` parameter)", self.loc(lam))
+        rg = lam.get("range") or {}
+        off = _off(rg.get("begin"))
+        text = self.source[off:off + 4000].decode("utf-8", "replace") if off is not None else ""
+        caps = _split_captures(text)
+        LL = self.loc(lam)
+        if caps is None:
+            return K.ResidualStmt("lambda expression", LL)
+        written = "[%s]" % ", ".join(caps)
+        kinds = []
+        for c in caps:
+            cc = c.replace(" ", "")
+            if cc in ("=", "&"):
+                return K.ResidualStmt("default capture `%s` (normalizer: list the captures explicitly: `%s`)"
+                                      % (written, self.capture_list(lam, rec, inits)), LL)
+            if cc in ("this", "*this"):
+                return K.ResidualStmt("capture of `%s` (a closure in the subset captures local variables only)"
+                                      % cc, LL)
+            if "=" in cc or "(" in cc or "{" in cc:
+                return K.ResidualStmt("init-capture `%s` (normalizer: declare it as a local before the lambda "
+                                      "and capture that)" % c, LL)
+            if cc.endswith("..."):
+                return K.ResidualStmt("capture pack `%s`" % c, LL)
+            ref = cc.startswith("&")
+            nm = cc[1:] if ref else cc
+            if not _IDENT_RE.match(nm):
+                return K.ResidualStmt("capture `%s`" % c, LL)
+            kinds.append(ref)
+        if kinds and any(kinds) and not all(kinds):
+            return K.ResidualStmt("mixed by-copy and by-reference captures `%s` (normalizer: copy each by-copy "
+                                  "capture into a local before the lambda and capture everything by reference)"
+                                  % written, LL)
+        move = bool(kinds) and not any(kinds)
+        ptys, ret, rs = self.lambda_sig(op)
+        if ret is None or not (ret in K.ALL_PRIMS or ret == K.UNIT):
+            return K.ResidualStmt("closure returning '%s' (the subset's closures return a scalar or nothing)"
+                                  % rs, LL)
+        pre = []
+        params = []
+        saved = (self.scope, getattr(self, "ret", None), getattr(self, "in_main", False),
+                 getattr(self, "ret_ref", False), self.in_closure)
+        self.scope = self.scope.child()
+        try:
+            pnodes = [p for p in op.get("inner", []) if p.get("kind") == "ParmVarDecl"]
+            for p, (pty, const, spelled) in zip(pnodes, ptys):
+                pl = self.lines.at(_off(p.get("loc")))
+                pname = p.get("name")
+                if not pname:
+                    return K.ResidualStmt("unnamed closure parameter", pl)
+                if pty not in K.ALL_PRIMS:
+                    return K.ResidualStmt("closure parameter of type '%s' (the subset's closures take scalars)"
+                                          % spelled, pl)
+                if p.get("init") or p.get("inner"):
+                    return K.ResidualStmt("default argument", pl)
+                params.append(K.Param(pname, pty, not const, pl))
+                self.scope.declare(pname, pty, not const)
+                self.locals[p["id"]] = pname
+            self.ret, self.in_main, self.ret_ref, self.in_closure = ret, False, False, name
+            stmts = []
+            for st in body.get("inner", []):
+                stmts.extend(self.stmt(st))
+        finally:
+            self.scope, self.ret, self.in_main, self.ret_ref, self.in_closure = saved
+        self.scope.declare(name, K.FnT(tuple(p.ty for p in params), ret), False)
+        self.locals[d["id"]] = name
+        return K.Closure(name, move, tuple(params), ret, K.Block(tuple(pre + stmts), self.loc(body)), L)
+
+    def closure_call(self, n, args):
+        """`f(a, b)` of a local closure / callable parameter (`operator()`)."""
+        L = self.loc(n)
+        if not args:
+            return self.rexpr(n, "overloaded operator call")
+        name = self.local_ref(args[0])
+        v = self.scope.lookup(name) if name is not None else None
+        if v is None or not isinstance(K.deref(v[0]), K.FnT):
+            obj = self.strip_tmp(self.strip(args[0]))
+            if obj.get("kind") == "LambdaExpr":
+                return self.rexpr(obj, friendly("LambdaExpr"))  # called in place
+            if obj.get("kind") == "DeclRefExpr" and (obj.get("referencedDecl") or {}).get("id") in self.poisoned:
+                return K.ResidualExpr("use of a rejected declaration", L, cascade=True)
+            return self.rexpr(n, "call of a callable object other than a local closure or callable parameter")
+        out = []
+        for a in args[1:]:
+            if a.get("kind") == "CXXDefaultArgExpr":
+                return self.rexpr(a, "default argument")
+            out.append(self.expr(a))
+        return K.ClosureCall(name, tuple(out), L)
+
+    def template_func(self, n, ns, internal, funcs):
+        """FR-252: `template <typename F> R g(const F& f, ..)` (or `F& f`)
+        with exactly one type parameter used ONLY as that one callable
+        parameter <=> `fn g(f: &impl Fn(..) -> R, ..)` (`&mut impl
+        FnMut`).  The closure signature is read off the instantiations,
+        which must all be closures of ONE signature.  Returns a residual
+        reason, or None after adding the first instantiation to ``funcs``."""
+        kids = n.get("inner", [])
+        tps = [c for c in kids if c.get("kind") in ("TemplateTypeParmDecl", "NonTypeTemplateParmDecl",
+                                                       "TemplateTemplateParmDecl")]
+        fds = [c for c in kids if c.get("kind") == "FunctionDecl"]
+        if not fds:
+            return "function template"
+        pat = fds[0]
+        insts = fds[1:]
+        if len(tps) != 1 or tps[0].get("kind") != "TemplateTypeParmDecl" or tps[0].get("isParameterPack"):
+            return "function template (the subset's templates take exactly one type parameter, a callable)"
+        F = tps[0].get("name") or ""
+        word = re.compile(r"(?<![\w:])%s(?![\w])" % re.escape(F)) if F else None
+        pps = [p for p in pat.get("inner", []) if p.get("kind") == "ParmVarDecl"]
+        idx = None
+        for i, p in enumerate(pps):
+            q = (self.qual(p.get("type")) or "").replace(" ", "")
+            if word is None or not word.search(self.qual(p.get("type")) or ""):
+                continue
+            if idx is not None:
+                return "function template with more than one parameter of the template type `%s`" % F
+            if q == F or q == "const" + F:
+                return ("callable parameter taken by value `%s %s` (normalizer: take it as `const %s& %s`, or "
+                        "`%s& %s` for a closure that modifies state -- C++ copies a by-value closure and its "
+                        "state, Rust would borrow it)" % (F, p.get("name"), F, p.get("name"), F, p.get("name")))
+            if q not in ("const" + F + "&", F + "&"):
+                return "parameter of type '%s' in a function template" % self.qual(p.get("type"))
+            idx = (i, q.startswith("const"))
+        rs = self.ret_type_str(pat)
+        if idx is None or (word is not None and word.search(rs)):
+            return "function template (its type parameter is not exactly one callable parameter)"
+        if pat.get("storageClass") or pat.get("inline") or pat.get("constexpr"):
+            return "function template with a storage class, inline or constexpr"
+        if not insts:
+            return "function template that is never instantiated (its callable's signature is unknown)"
+        sigs = set()
+        for fd in insts:
+            targ = next((c for c in fd.get("inner", []) if c.get("kind") == "TemplateArgument"), None)
+            rt = next((c for c in (targ or {}).get("inner", []) if c.get("kind") == "RecordType"), None)
+            rec = self.decl_info.get(((rt or {}).get("decl") or {}).get("id"))
+            if rec is None or "(lambda at " not in (self.qual((targ or {}).get("type")) or ""):
+                return "function template instantiated with something other than a closure"
+            op = next((m for m in rec.get("inner", []) if m.get("name") == "operator()"), None)
+            if op is None or op.get("kind") != "CXXMethodDecl":
+                return "function template instantiated with a generic lambda"
+            ptys, ret, _ = self.lambda_sig(op)
+            if any(p[0] not in K.ALL_PRIMS for p in ptys) or ret is None or not (ret in K.ALL_PRIMS or ret == K.UNIT):
+                return "function template instantiated with a closure outside the subset's signatures"
+            sigs.add((tuple(p[0] for p in ptys), ret))
+        if len(sigs) != 1:
+            return ("function template instantiated with closures of different signatures (Rust's `impl Fn` "
+                    "names one)")
+        (ptys, ret), = sigs
+        ft = K.RefT(K.FnT(ptys, ret), not idx[1])
+        first = insts[0]
+        for fd in insts:
+            self.fn_params[fd["id"]] = (idx[0], ft)
+            self.user_funcs[fd["id"]] = K.path_of(ns, n.get("name"))
+        self.user_funcs[pat["id"]] = K.path_of(ns, n.get("name"))
+        self.user_funcs[n["id"]] = K.path_of(ns, n.get("name"))
+        funcs.append((first, ns, internal))
+        return None
+
+
+# ================================================== FR-252: closures
+def _split_captures(text):
+    """The elements of a lambda's written capture list `[..]` (top-level
+    commas only), or None when ``text`` does not start with one."""
+    if not text.startswith("["):
+        return None
+    depth = 0
+    cur = []
+    out = []
+    for i, ch in enumerate(text[1:]):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")}":
+            depth -= 1
+        elif ch == "]":
+            if depth == 0:
+                tail = "".join(cur).strip()
+                if tail or out:
+                    out.append(tail)
+                return out
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    return None
+
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
 
 
 def cxx_import(path, clang="clang++"):

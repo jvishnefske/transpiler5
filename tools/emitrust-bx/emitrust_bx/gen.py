@@ -61,6 +61,16 @@ expressions get EXTRA `c ? a : b` (Cond) and `x++` / `++x` / `x--` / `--x`
 used as a value (IncDec), drawn from a FIFTH stream.  The sequencing rule
 holds by construction: an incremented variable is one the statement has not
 mentioned yet, and it is hidden for the rest of the statement.
+
+FR-252: with ``closures`` (OFF by default, a SEPARATE population like
+FR-259's, test_fr252's ``closure_programs``) blocks get EXTRA closure
+groups drawn from a SIXTH stream: `auto f = [caps](params) -> R { body };`
+over 0-2 scalar captures, all by copy (`move`) or all by reference, a body of
+ordinary generated statements over the captures and parameters only (fresh
+names, so nothing shadows), then 1-3 consecutive calls of it (`T y = f(..);`
+/ `f(..);`).  The alias discipline holds by construction: the calls are the
+closure's whole live range, and a by-reference closure's captures are hidden
+from the call arguments; each call statement calls it once.
 """
 
 import contextlib
@@ -85,11 +95,16 @@ FR250_PRIMS = (K.I8, K.U8, K.I32, K.I64, K.U32, K.U64, K.USIZE, K.F64, K.BOOL)
 VALUE_TYPES = FR250_PRIMS + NC_TYPES
 # FR-259: the rate of an EXTRA `?:` / increment-as-a-value in an expression
 FR259_RATE = 0.12
+# FR-252: the rate of an EXTRA closure group in a block
+CLOSURE_RATE = 0.35
 
 
 class Gen:
-    def __init__(self, seed, namespaces=True, structs=True, pointers=False, fr259=False):
+    def __init__(self, seed, namespaces=True, structs=True, pointers=False, fr259=False, closures=False):
         self.r = random.Random(seed)
+        self.closures = closures
+        self.cr = random.Random(seed * 49979687 + 3)  # FR-252's own stream
+        self.in_closure = False
         self.pointers = pointers
         self.fr259 = fr259
         self.prims = K.ALL_PRIMS if fr259 else FR250_PRIMS
@@ -399,6 +414,10 @@ class Gen:
                     self.begin_stmt()
                     with self.fr259_stream():
                         out.append(self.fr259_stmt(scope))
+                if self.closures and not self.in_closure and self.cr.random() < CLOSURE_RATE:
+                    # FR-252: an EXTRA closure and its calls
+                    with self.closure_stream():
+                        out.extend(self.closure_group(scope, depth))
                 out.append(self.stmt(scope, depth, loop))
             if tail is not None:
                 out.append(tail())
@@ -1277,9 +1296,84 @@ class Gen:
         return K.Cond(self.expr(K.BOOL, scope, d), self.expr(t, scope, d), self.expr(t, scope, d))
 
 
+    # ------------------------------------------------ FR-252 closures
+    @contextlib.contextmanager
+    def closure_stream(self):
+        saved, self.r = self.r, self.cr
+        try:
+            yield
+        finally:
+            self.r = saved
+
+    def closure_group(self, scope, depth):
+        r = self.r
+        self.begin_stmt()
+        move = r.random() < 0.5
+        cands = [v for v in self.vars_of(scope, lambda t, m: t in self.prims)
+                 if not (move and self.is_ref(scope, v[0]))]
+        caps = r.sample(cands, min(len(cands), r.randint(0, 2)))
+        cs = TC.Scope()
+        for name, _, _ in caps:
+            t, m = scope.lookup(name)
+            cs.declare(name, t, m)
+        params = []
+        for _ in range(r.randint(0, 2)):
+            pn = self.fresh()
+            pt = self.choice(self.prims)
+            pm = r.random() < 0.5
+            params.append(K.Param(pn, pt, pm))
+            cs.declare(pn, pt, pm)
+            self.decl_depth[pn] = 0
+        ret = self.choice(self.prims + (K.UNIT, K.UNIT))
+        saved = (self.ret, self.loop_depth, self.in_closure)
+        self.ret, self.loop_depth, self.in_closure = ret, 0, True
+        try:
+            tail = None
+            if ret != K.UNIT:
+                def tail():
+                    self.begin_stmt()
+                    return K.Return(self.value(ret, cs, 3, "consume", is_return=True))
+            bs = cs.child()
+            pre = []
+            for cname, dt, w in caps:
+                # use every capture: modify it (FnMut; C++ `mutable` when by
+                # copy) or read it into a local
+                if w and dt in K.ARITH and r.random() < 0.5:
+                    pre.append(K.CompoundAssign(self.choice(("add", "sub", "mul")), cname, self.lit(dt)))
+                else:
+                    v = self.fresh()
+                    self.declare(bs, v, dt, False)
+                    pre.append(K.Let(v, dt, False, K.Var(cname)))
+            body = pre + self.stmts(bs, min(depth + 1, 2), False, r.randint(0, 3), tail=tail)
+        finally:
+            self.ret, self.loop_depth, self.in_closure = saved
+        name = self.fresh()
+        clo = K.Closure(name, move, tuple(params), ret, K.Block(tuple(body)))
+        out = [clo]
+        ft = K.FnT(tuple(p.ty for p in params), ret)
+        scope.declare(name, ft, False)
+        self.dead.add(name)  # only the calls below mention it (its live range ends with them)
+        hide = set() if move else {c[0] for c in caps} - self.hidden
+        self.hidden |= hide
+        try:
+            for _ in range(r.randint(1, 3)):
+                self.begin_stmt()
+                call = K.ClosureCall(name, tuple(self.expr(p.ty, scope, 2) for p in params))
+                if ret == K.UNIT or r.random() < 0.3:
+                    out.append(K.ExprStmt(call))
+                else:
+                    v = self.fresh()
+                    m = r.random() < 0.5
+                    self.declare(scope, v, ret, m)
+                    out.append(K.Let(v, ret, m, call))
+        finally:
+            self.hidden -= hide
+        return out
+
+
 class _NoCall(Exception):
     pass
 
 
-def gen_program(seed, nfuncs, prefix="f", namespaces=True, pointers=False, fr259=False):
-    return Gen(seed, namespaces, pointers=pointers, fr259=fr259).program(nfuncs, prefix)
+def gen_program(seed, nfuncs, prefix="f", namespaces=True, pointers=False, fr259=False, closures=False):
+    return Gen(seed, namespaces, pointers=pointers, fr259=fr259, closures=closures).program(nfuncs, prefix)
