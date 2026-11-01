@@ -164,6 +164,37 @@ FnMut`.
       written-but-unused captures are spellings (the list is the body's free
       variables in first-use order on both printers).
   N24 Closure(move=True) with no capture -> move=False (`[]` either way).
+
+FR-253 (<algorithm> / <numeric> over whole vectors).  ``Alg`` (a value),
+``AlgStmt`` (an effect) and ``MinMax``; the rows and both spellings are in
+kernel.py.  The operand is a vector PLACE named whole (`v.begin(), v.end()`:
+free iterators stay outside); a callable argument is a LOCAL closure of
+exactly the signature the algorithm calls (no implicit conversion), never a
+callable parameter, and never a by-copy closure that modifies its copy (C++
+passes the closure BY VALUE: its copy would advance, Rust's borrow the
+original -- FR-252's `F f`).  Because the argument is a ``Var`` of the
+closure, every FR-252/FR-263 analysis already counts the algorithm call as a
+call of the closure (its by-reference effects, unsequenced double use, may
+print, the borrow of a captured container).  The checker adds: a mutated
+target is writable; std::fill's value and an appended-to target do not
+overlap the target's access path (measured E0502 on rustc); element types:
+std::sort / stable_sort and *max_element / *min_element on integers (and
+strings for sorting) only -- equal ones are indistinguishable, so
+sort_unstable / Iterator::max are exact, while f64 (-0.0 == 0.0, NaN) is
+refused; std::find / std::count compare a value OF the element type (a
+literal that fits is converted on import); std::accumulate runs in the
+INITIAL VALUE's type A and is accepted only when every element converts to A
+without changing value (``acc_ok``: `0` over long longs, which truncates
+every step, is refused); std::max / std::min take integers only (f64::max
+differs on NaN and signed zero).  An extend_map's source does not overlap its
+target, and sort / fill / transform write only ELEMENTS (``resizes``), while
+extend_map grows its target.
+
+  N25 (cxx_import) `std::none_of(b, e, p)` -> Unary('not', any_of); the C++
+      printer spells that term `std::none_of`, the Rust one `!..any(&p)`.
+  N26 (cxx_import) `std::find(b, e, x) == v.end()` (either operand order)
+      -> Unary('not', contains); `!(std::find(..) != v.end())` is the same
+      term.  Printed `== v.end()` / `!v.contains(&x)`.
 """
 
 import collections
@@ -233,6 +264,8 @@ METHOD_RESERVED = {
     "len", "is_empty", "clone", "clone_from", "to_string", "as_bytes", "iter", "iter_mut", "push", "pop",
     "clear", "resize", "push_str", "wrapping_add", "wrapping_sub", "wrapping_mul", "wrapping_neg",
     "copied", "cloned", "into", "try_into",
+    # FR-253: the algorithm rows' Vec methods
+    "sort", "sort_unstable", "reverse", "fill", "contains", "extend",
 }
 
 RESERVED = {
@@ -258,6 +291,160 @@ RESERVED = {
 # FR-252 wordings shared by the checker and cxx_import
 CLOSURE_VALUE = ("unsupported: closure '%s' used other than by calling it or passing it to a callable "
                  "parameter (copying a closure copies its state in C++ and moves it in Rust)")
+
+
+# ---------------------------------------------------------------- FR-253
+# The C++ name of each algorithm row (messages name the C++ side; the Rust
+# spellings are in kernel.py).
+ALG_CXX = {
+    "contains": "std::find", "count": "std::count", "count_if": "std::count_if", "any_of": "std::any_of",
+    "all_of": "std::all_of", "accumulate": "std::accumulate", "max_element": "std::max_element",
+    "min_element": "std::min_element", "sort": "std::sort", "stable_sort": "std::stable_sort",
+    "reverse": "std::reverse", "fill": "std::fill", "sort_by": "std::sort", "transform": "std::transform",
+    "for_each": "std::for_each", "extend_map": "std::transform",
+}
+# element types whose `<` is a total order with no distinguishable
+# equivalents: sorting them is unique (sort_unstable == std::sort)
+ORD_ELEMS = K.INT_TYPES + (K.STRING,)
+
+
+def acc_ok(A, E):
+    """FR-253: may `std::accumulate` over elements of type E run in an
+    accumulator of type A (the INIT's type), with every step exactly
+    `a + (e as A)`?  C++ computes `init + *it` in the usual arithmetic
+    conversion of (A, E) and converts back to A: that is `a + e as A` when
+    E converts to A without changing its value (an integer range inside A's,
+    or any integer into f64).  `std::accumulate(b, e, 0)` over long longs
+    sums in INT, truncating every step -- refused."""
+    if A not in K.ARITH:
+        return False
+    if A == E:
+        return True
+    if A == K.F64:
+        return E in K.INT_TYPES
+    if E not in K.INT_TYPES or A not in K.ARITH_INT:
+        return False
+    lo, hi = K.INT_RANGE[E.name]
+    alo, ahi = K.INT_RANGE[A.name]
+    return alo <= lo and hi <= ahi
+
+
+def fold_spelling(A, E):
+    """FR-253: the Rust fold closure of `std::accumulate(b, e, init)`:
+    (wrapping, cast type name or '') -- `|a, &e| a + e`, `a.wrapping_add(e)`
+    (unsigned: C++ wraps), `a + e as i64` (E converted to A)."""
+    return (K.is_unsigned(A), "" if A == E else A.name)
+
+
+def overlapping_place(target, e):
+    """FR-253: the first maximal place in ``e`` whose access path overlaps
+    the place ``target``'s (one a prefix of the other), or None.  Measured on
+    rustc: `v.fill(v[0])`, `v.fill(v.len() as i32)` and `b.items.fill(
+    b.items[0])` are E0502 (the `&mut` of the receiver is taken first, through
+    DerefMut: no two-phase borrow), `b.items.fill(b.tag as i64)` compiles."""
+    T = place_path(target)
+    if T is None:
+        return None
+    bases = set()
+    nodes = list(K.walk(e))
+    for n in nodes:
+        if isinstance(n, (K.Index, K.Field)):
+            bases.add(id(n.base))
+    for n in nodes:
+        if is_place(n) and id(n) not in bases:
+            P = place_path(n)
+            if path_prefix(P, T) or path_prefix(T, P):
+                return n
+    return None
+
+
+def alg_fn(a, scope, want, what):
+    """FR-253: the callable argument of an algorithm -- a LOCAL closure
+    variable of exactly the signature ``want`` (C++ would convert the
+    element / result implicitly; the Kernel has no implicit conversion)."""
+    a = a.operand if isinstance(a, K.Borrow) else a
+    L = getattr(a, "loc", None)
+    if not isinstance(a, K.Var):
+        raise KernelTypeError(L, "unsupported: the callable argument of %s is not a local closure variable" % what)
+    v = scope.lookup(a.name)
+    if v is None:
+        raise KernelTypeError(L, "use of undeclared variable '%s'" % a.name)
+    if isinstance(v[0], K.RefT) and isinstance(v[0].inner, K.FnT):
+        raise KernelTypeError(L, "unsupported: callable parameter '%s' passed to %s (the subset passes a local "
+                                 "closure to an algorithm)" % (a.name, what))
+    if not isinstance(v[0], K.FnT):
+        raise KernelTypeError(L, "unsupported: the callable argument of %s is not a local closure variable" % what)
+    if v[0] != want:
+        raise KernelTypeError(L, "unsupported: closure '%s' has type %s, but %s calls it as %s (the subset "
+                                 "has no implicit conversion of an argument or result)" % (a.name, v[0], what, want))
+    return a.name
+
+
+def alg_src(e, scope, sigs, what):
+    """FR-253: the element type of an algorithm's whole-container operand."""
+    bt = type_of(e, scope, sigs)
+    if not isinstance(bt, K.VecT):
+        raise KernelTypeError(getattr(e, "loc", None), "unsupported: %s over a %s (the subset's algorithms take "
+                                                       "a std::vector)" % (what, bt))
+    return bt.elem
+
+
+def _alg_type(e, scope, sigs):
+    what = ALG_CXX.get(e.op, e.op)
+    E = alg_src(e.src, scope, sigs, what)
+    n = len(e.args)
+    L = e.loc
+    if e.op in ("contains", "count"):
+        if n != 1:
+            raise KernelTypeError(L, "%s takes one value" % what)
+        if not (isinstance(E, K.Prim) or E == K.STRING):
+            raise KernelTypeError(L, "unsupported: %s over a vector of %s (the subset compares scalars and "
+                                     "strings)" % (what, E))
+        t = type_of(e.args[0], scope, sigs)
+        if t != E:
+            raise KernelTypeError(getattr(e.args[0], "loc", None) or L,
+                                  "unsupported: %s of a value of type %s in a vector of %s (C++ would compare "
+                                  "after the usual arithmetic conversions; normalizer: static_cast the value to "
+                                  "the element type)" % (what, t, E))
+        return K.BOOL if e.op == "contains" else K.I64
+    if e.op in ("count_if", "any_of", "all_of"):
+        if n != 1:
+            raise KernelTypeError(L, "%s takes one predicate" % what)
+        if E not in K.ALL_PRIMS:
+            raise KernelTypeError(L, "unsupported: %s over a vector of %s (the subset's closures take scalars)"
+                                  % (what, E))
+        alg_fn(e.args[0], scope, K.FnT((E,), K.BOOL), what)
+        return K.I64 if e.op == "count_if" else K.BOOL
+    if e.op == "accumulate":
+        if n not in (1, 2):
+            raise KernelTypeError(L, "std::accumulate takes an initial value and an optional operation")
+        A = type_of(e.args[0], scope, sigs)
+        if n == 2:
+            if A not in K.ALL_PRIMS or E not in K.ALL_PRIMS:
+                raise KernelTypeError(L, "unsupported: std::accumulate with an operation over %s from %s (the "
+                                         "subset's closures take scalars)" % (E, A))
+            alg_fn(e.args[1], scope, K.FnT((A, E), A), what)
+            return A
+        if E not in K.ARITH and E not in K.INT_TYPES:
+            raise KernelTypeError(L, "unsupported: std::accumulate over a vector of %s" % E)
+        if not acc_ok(A, E):
+            raise KernelTypeError(getattr(e.args[0], "loc", None) or L,
+                                  "unsupported: std::accumulate of %s elements from an initial value of type %s "
+                                  "(C++ sums in the initial value's type, converting every step; normalizer: give "
+                                  "the initial value a type that holds every element, e.g. `0LL` / `0i64`)" % (E, A))
+        return A
+    if e.op in ("max_element", "min_element"):
+        if n:
+            raise KernelTypeError(L, "%s takes no comparator in the subset" % what)
+        if E == K.F64:
+            raise KernelTypeError(L, "unsupported: %s over a vector of double (it returns the FIRST extreme, "
+                                     "and -0.0 / 0.0 compare equal but print differently; f64 has no total order "
+                                     "in Rust)" % what)
+        if E not in K.INT_TYPES:
+            raise KernelTypeError(L, "unsupported: %s over a vector of %s (the subset dereferences it as an "
+                                     "integer)" % (what, E))
+        return E
+    raise KernelTypeError(L, "unknown algorithm %r" % e.op)
 
 
 def closure_info(body, sigs):
@@ -823,6 +1010,21 @@ def type_of(e, scope, sigs):
         if not isinstance(ft, K.FnT):
             raise KernelTypeError(e.loc, "call of '%s', which is not a closure" % e.name)
         return _call_type(e, e.name, (ft.params, ft.ret), e.args, scope, sigs)
+    if isinstance(e, K.Alg):
+        return _alg_type(e, scope, sigs)
+    if isinstance(e, K.MinMax):
+        a = type_of(e.lhs, scope, sigs)
+        b = type_of(e.rhs, scope, sigs)
+        if a != b:
+            raise KernelTypeError(e.loc, "operands of std::%s have different types %s and %s" % (e.op, a, b))
+        if a == K.F64:
+            raise KernelTypeError(e.loc, "unsupported: std::%s of two doubles (it returns its first argument "
+                                         "unless the second compares %s, which differs from f64::%s on NaN and "
+                                         "signed zero)" % (e.op, "greater" if e.op == "max" else "less", e.op))
+        if a not in K.INT_TYPES:
+            raise KernelTypeError(e.loc, "unsupported: std::%s of two values of type %s (the subset's std::%s "
+                                         "takes integers)" % (e.op, a, e.op))
+        return a
     if isinstance(e, K.ResidualExpr):
         raise KernelTypeError(e.loc, "residual: " + e.reason)
     raise KernelTypeError(None, "not an expression: %r" % (e,))
@@ -1083,6 +1285,10 @@ def mutated_bases(block, sigs, skip=None):
             b = base_var(n.iterable)
             if b:
                 out.add(b)
+        elif isinstance(n, K.AlgStmt) and n.target is not None:
+            b = base_var(n.target)  # FR-253: sort / fill / transform / extend write it
+            if b:
+                out.add(b)
         elif isinstance(n, K.Let) and isinstance(n.ty, K.PtrT) and n.ty.mutable and ptr_root(n.init):
             # FR-261: a mutable pointer local is a `&mut` borrow of its root
             out.add(ptr_root(n.init))
@@ -1128,6 +1334,10 @@ def resizes(block, sigs, bound):
                         targets.append(arg_target(pt, a))
         elif isinstance(n, K.ForEach) and n.mode == "mut":
             targets.append(K.Index(n.iterable, K.IntLit(0, K.USIZE)))
+        elif isinstance(n, K.AlgStmt) and n.target is not None:
+            # FR-253: extend_map grows its target; the others rewrite (permute,
+            # fill) its ELEMENTS only, like a store `v[i] = x`
+            targets.append(n.target if n.op == "extend_map" else K.Index(n.target, K.IntLit(0, K.USIZE)))
         elif isinstance(n, K.Let) and isinstance(n.ty, K.PtrT) and n.ty.mutable and ptr_root(n.init) == P[0]:
             # FR-261: a mutable pointer made in the body may write ANYTHING
             # reachable from its root (it is a `&mut` alias of it)
@@ -1184,6 +1394,8 @@ def stmt_exprs(s):
         return [s.target, s.count, s.value]
     if isinstance(s, K.ExprStmt):
         return [s.expr]
+    if isinstance(s, K.AlgStmt):
+        return [x for x in (s.target, s.src) if x is not None] + list(s.args)
     if isinstance(s, K.Print):
         return [sg.arg for sg in s.segs if isinstance(sg, K.Spec)]
     if isinstance(s, K.Return):
@@ -1371,6 +1583,11 @@ class _Checker:
                     self.wf(v, scope, self.consume_pos(fd.ty))
         elif isinstance(e, K.MethodCall):
             self.method_call(e, scope)
+        elif isinstance(e, K.Alg):
+            self.alg_expr(e, scope)
+        elif isinstance(e, K.MinMax):
+            self.wf(e.lhs, scope, "value")
+            self.wf(e.rhs, scope, "value")
         elif isinstance(e, K.Cond):
             self.wf(e.cond, scope, "value")
             self.wf(e.then, scope, "value")
@@ -1950,6 +2167,172 @@ class _Checker:
         self.check_ptr_scopes(f)
         self.check_closure_scopes(f.body)
 
+    # ---------------------------------------------------- FR-253 algorithms
+    def alg_place(self, p, what):
+        """The whole-container operand: a variable, element or data member
+        whose path calls nothing (C++ names it twice, `v.begin(), v.end()`)."""
+        inner = p.operand if isinstance(p, K.Borrow) else p
+        if not is_place(inner) or any(isinstance(x, (K.Call, K.MethodCall, K.ClosureCall, K.IncDec, K.Alg))
+                                      for x in K.walk(inner)):
+            self.err(getattr(inner, "loc", None), "unsupported: %s over something other than a variable, element "
+                                                  "or data member" % what)
+            return None
+        return inner
+
+    def rs_ref(self, raw, scope, mutable, what):
+        """The Rust surface's borrowed argument of a bx helper / `contains`:
+        `&x` / `&mut x`, a reference variable bare (it already is one)."""
+        if self.surface != "rust":
+            return
+        inner = raw.operand if isinstance(raw, K.Borrow) else raw
+        is_refvar = isinstance(inner, K.Var) and isinstance((scope.lookup(inner.name) or (None,))[0], K.RefT)
+        want = "x" if is_refvar else ("&mut x" if mutable else "&x")
+        if isinstance(raw, K.Borrow):
+            if is_refvar or raw.mutable != mutable:
+                self.err(raw.loc, "unsupported: an argument of %s is not spelled the canonical way (`%s`)"
+                         % (what, want))
+            else:
+                self.borrow_ok.add(id(raw))
+        elif not is_refvar:
+            self.err(getattr(inner, "loc", None), "unsupported: an argument of %s is not spelled the canonical "
+                                                  "way (`%s`)" % (what, want))
+
+    def alg_callable(self, raw, scope, want, what):
+        """A closure argument: Rust `&f`, `&mut f` exactly when f modifies
+        state (FnMut).  C++ takes it BY VALUE: a by-copy closure that
+        modifies its copy (`mutable`) would advance a COPY in C++ and the
+        original in Rust -- refused, like FR-252's `F f`."""
+        try:
+            name = alg_fn(raw, scope, want, what)
+        except KernelTypeError as ex:
+            self.err(ex.loc or getattr(raw, "loc", None), ex.msg)
+            return
+        L = getattr(raw, "loc", None)
+        if name in self.fnmut and name in self.move_closures:
+            self.err(L, "unsupported: closure '%s' modifies its own copy of a capture (a `mutable` lambda) and is "
+                        "passed to %s, which copies it in C++ while Rust would borrow it (normalizer: capture the "
+                        "state by reference)" % (name, what))
+            return
+        if self.surface == "rust":
+            fm = name in self.fnmut
+            if isinstance(raw, K.Borrow) and raw.mutable == fm:
+                self.borrow_ok.add(id(raw))
+            else:
+                self.err(L, "unsupported: closure argument '%s' of %s is not spelled the canonical way (`%s%s`: "
+                            "`&mut` exactly when it modifies state)" % (name, what, "&mut " if fm else "&", name))
+
+    def alg_expr(self, e, scope):
+        what = ALG_CXX.get(e.op, e.op)
+        src = self.alg_place(e.src, what)
+        if src is None:
+            return
+        if e.op in ("count", "count_if"):
+            self.rs_ref(e.src, scope, False, what)  # `bx::count(&v, ..)`
+        elif isinstance(e.src, K.Borrow):
+            self.err(e.src.loc, "unsupported: `&` borrow outside an argument position")
+        self.wf(src, scope, "borrow")
+        try:
+            E = type_of(src, scope, self.sigs).elem
+            A = type_of(e.args[0], scope, self.sigs) if e.args else None
+        except (KernelTypeError, AttributeError, IndexError):
+            return
+        if e.op in ("contains", "count"):
+            self.rs_ref(e.args[0], scope, False, what)
+            inner = e.args[0].operand if isinstance(e.args[0], K.Borrow) else e.args[0]
+            self.wf(inner, scope, "borrow")
+        elif e.op in ("count_if", "any_of", "all_of"):
+            self.alg_callable(e.args[0], scope, K.FnT((E,), K.BOOL), what)
+        elif e.op == "accumulate":
+            self.wf(e.args[0], scope, "value")
+            if len(e.args) == 2:
+                self.alg_callable(e.args[1], scope, K.FnT((A, E), A), what)
+            elif self.surface == "rust" and e.spelling and acc_ok(A, E) and e.spelling != fold_spelling(A, E):
+                w, c = fold_spelling(A, E)
+                body = "a.wrapping_add(%s)" % ("e as " + c if c else "e") if w else "a + %s" % ("e as " + c if c else "e")
+                self.err(e.loc, "unsupported: the fold of std::accumulate is not spelled the canonical way "
+                                "(`|a, &e| %s` for a %s accumulator over %s elements)" % (body, A, E))
+
+    def alg_stmt(self, s, scope):
+        what = ALG_CXX.get(s.op, s.op)
+        E = Es = None
+        tgt = src = None
+        if s.target is not None:
+            tgt = self.alg_place(s.target, what)
+            if tgt is None:
+                return
+            ty = self.place_ty(tgt, scope)
+            if ty is None:
+                return
+            if not isinstance(ty, K.VecT):
+                self.err(s.loc, "unsupported: %s over a %s (the subset's algorithms take a std::vector)" % (what, ty))
+                return
+            self.writable(tgt, scope, what)
+            if s.op in ("sort_by", "transform"):
+                self.rs_ref(s.target, scope, True, what)  # `bx::..(&mut v, ..)`
+            elif isinstance(s.target, K.Borrow):
+                self.err(s.target.loc, "unsupported: `&` borrow outside an argument position")
+            self.wf(tgt, scope, "borrow")
+            E = ty.elem
+        if s.src is not None:
+            src = self.alg_place(s.src, what)
+            if src is None:
+                return
+            ty = self.place_ty(src, scope)
+            if ty is None:
+                return
+            if not isinstance(ty, K.VecT):
+                self.err(s.loc, "unsupported: %s over a %s (the subset's algorithms take a std::vector)" % (what, ty))
+                return
+            self.wf(src, scope, "borrow")
+            Es = ty.elem
+        if s.op in ("sort", "stable_sort"):
+            if E == K.F64:
+                self.err(s.loc, "unsupported: %s of a vector of double without a comparator (-0.0 and 0.0 are "
+                                "equivalent but print differently, so the result depends on the algorithm; f64 has "
+                                "no total order in Rust)" % what)
+            elif E not in ORD_ELEMS:
+                self.err(s.loc, "unsupported: %s of a vector of %s (the subset sorts integers and strings)" % (what, E))
+        elif s.op == "fill":
+            if not (isinstance(E, K.Prim) or E == K.STRING):
+                self.err(s.loc, "unsupported: std::fill of a vector of %s" % E)
+                return
+            self.expr(s.args[0], scope, E, "copy")
+            hit = overlapping_place(tgt, s.args[0])
+            if hit is not None:
+                self.err(getattr(hit, "loc", None) or s.loc,
+                         "unsupported: the value of std::fill reads '%s', the vector it fills (a second borrow "
+                         "in Rust)" % base_var(tgt))
+        elif s.op == "sort_by":
+            if E not in K.ALL_PRIMS:
+                self.err(s.loc, "unsupported: std::sort with a comparator over a vector of %s (the subset's "
+                                "closures take scalars)" % E)
+                return
+            self.alg_callable(s.args[0], scope, K.FnT((E, E), K.BOOL), what)
+        elif s.op == "transform":
+            if E not in K.ALL_PRIMS:
+                self.err(s.loc, "unsupported: std::transform over a vector of %s (the subset's closures take "
+                                "scalars)" % E)
+                return
+            self.alg_callable(s.args[0], scope, K.FnT((E,), E), what)
+        elif s.op == "for_each":
+            if Es not in K.ALL_PRIMS:
+                self.err(s.loc, "unsupported: std::for_each over a vector of %s (the subset's closures take "
+                                "scalars)" % Es)
+                return
+            self.alg_callable(s.args[0], scope, K.FnT((Es,), K.UNIT), what)
+        elif s.op == "extend_map":
+            if Es not in K.ALL_PRIMS or E not in K.ALL_PRIMS:
+                self.err(s.loc, "unsupported: std::transform into a std::back_inserter over vectors of %s and %s "
+                                "(the subset's closures take and return scalars)" % (Es, E))
+                return
+            if overlapping_place(tgt, src) is not None:
+                self.err(s.loc, "unsupported: std::transform appends to '%s' while reading it (iterator "
+                                "invalidation in C++, a second borrow in Rust)" % base_var(tgt))
+                return
+            self.alg_callable(s.args[0], scope, K.FnT((Es,), E), what)
+        elif s.op != "reverse":
+            self.err(s.loc, "unknown algorithm statement %r" % s.op)
+
     # ---------------------------------------------------- FR-252 closures
     def closure_table(self, f):
         """Per function: what each closure modifies through a by-reference
@@ -1957,6 +2340,7 @@ class _Checker:
         closures modify state (FnMut), and which are bound `let mut`."""
         self.sigs.closure_muts = {}
         cm, self.fnmut, self.mut_closures = closure_info(f.body, self.sigs)
+        self.move_closures = {n.name for n in K.walk(f.body) if isinstance(n, K.Closure) and n.move}  # FR-253
         self.sigs.closure_muts = cm
         # FR-263: local closure -> its body may print (by name, conservative
         # over same-named closures)
@@ -2299,6 +2683,11 @@ class _Checker:
             return self.cur is None or self.cur.path in self.param_prints
         if isinstance(e, (K.Call, K.MethodCall)):
             return calls_printing(e, self.printing)
+        if isinstance(e, K.Alg):
+            # FR-253: an algorithm call IS a call of its closure argument
+            return any(self.prints(K.ClosureCall(a.name, (), e.loc)) for a in
+                       (x.operand if isinstance(x, K.Borrow) else x for x in e.args) if isinstance(a, K.Var)
+                       and a.name in self.closure_prints)
         return False
 
     def stmt_alias(self, s):
@@ -2596,6 +2985,8 @@ class _Checker:
                     self.expr(s.value, scope, self.ret, self.consume_pos(self.ret))
         elif isinstance(s, K.Closure):
             self.closure(s, scope)
+        elif isinstance(s, K.AlgStmt):
+            self.alg_stmt(s, scope)
         elif isinstance(s, K.ResidualStmt):
             pass
         else:
@@ -2863,6 +3254,15 @@ class _Normalizer:
             owner = path.rsplit("::", 1)[0] if path else ""
             return K.MethodCall(recv, e.name, tuple(self.expr(a, scope, None if pt is None else K.deref(pt))
                                                     for pt, a in zip(ptys, e.args)), e.loc, owner)
+        if isinstance(e, K.Alg):
+            src = self.expr(e.src, scope)
+            t = self.ty(src, scope)
+            E = t.elem if isinstance(t, K.VecT) else None
+            return K.Alg(e.op, src, tuple(self.expr(a, scope, E if e.op in ("contains", "count") else None)
+                                          for a in e.args), e.loc, e.spelling)
+        if isinstance(e, K.MinMax):
+            lhs = self.expr(e.lhs, scope)
+            return K.MinMax(e.op, lhs, self.expr(e.rhs, scope, self.ty(lhs, scope)), e.loc)
         if isinstance(e, K.Cast):
             inner = self.expr(e.operand, scope)
             T = e.ty
@@ -2964,6 +3364,13 @@ class _Normalizer:
             return K.PushByte(self.expr(s.target, scope), self.expr(s.value, scope), s.loc)
         if isinstance(s, K.ExprStmt):
             return K.ExprStmt(self.expr(s.expr, scope), s.loc)
+        if isinstance(s, K.AlgStmt):
+            tgt = None if s.target is None else self.expr(s.target, scope)
+            src = None if s.src is None else self.expr(s.src, scope)
+            t = self.ty(tgt, scope) if tgt is not None else None
+            el = t.elem if isinstance(t, K.VecT) else None
+            args = tuple(self.copied(a, scope, el) if s.op == "fill" else self.expr(a, scope) for a in s.args)
+            return K.AlgStmt(s.op, tgt, src, args, s.loc)
         if isinstance(s, K.Print):
             segs = []
             for sg in s.segs:

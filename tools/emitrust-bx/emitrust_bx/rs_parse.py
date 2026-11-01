@@ -104,7 +104,29 @@ class _Iter:
     loc: Optional[Loc] = field(default=None, compare=False)
 
 
-STMT_METHODS = {"push": 1, "pop": 0, "clear": 0, "resize": 2, "push_str": 1}
+STMT_METHODS = {"push": 1, "pop": 0, "clear": 0, "resize": 2, "push_str": 1,
+                # FR-253
+                "sort_unstable": 0, "sort": 0, "reverse": 0, "fill": 1, "extend": 1}
+
+
+@dataclass(frozen=True)
+class _IterMap:
+    """FR-253: `v.iter().copied().map(&f)` (surface marker, only legal as
+    the argument of `w.extend(..)`)."""
+
+    recv: object
+    fn: object
+    loc: Optional[Loc] = field(default=None, compare=False)
+
+
+@dataclass(frozen=True)
+class _Unwrap:
+    """FR-253: `v.iter().max().unwrap()` (surface marker, only legal under
+    `*`: the extreme element's value)."""
+
+    op: str  # 'max_element' | 'min_element'
+    recv: object
+    loc: Optional[Loc] = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -608,6 +630,22 @@ class _Parser:
             return K.PushStr(m.target, m.args[0], L)
         if m.kind == "push_byte":
             return K.PushByte(m.target, m.args[0], L)
+        # FR-253
+        kind = m.kind
+        if kind in ("sort_unstable", "sort", "reverse"):
+            return K.AlgStmt({"sort_unstable": "sort", "sort": "stable_sort"}.get(kind, kind), m.target, None, (), L)
+        if kind == "fill":
+            return K.AlgStmt("fill", m.target, None, m.args, L)
+        if kind in ("sort_by", "transform"):
+            return K.AlgStmt(kind, m.target, None, m.args, L)
+        if kind == "for_each":
+            return K.AlgStmt("for_each", None, m.target, m.args, L)
+        if kind == "extend":
+            it = m.args[0]
+            if not isinstance(it, _IterMap):
+                raise ParseError(getattr(it, "loc", None) or L, "unsupported: `.extend()` of something other than "
+                                                                "`v.iter().copied().map(&f)`")
+            return K.AlgStmt("extend_map", m.target, it.recv, (it.fn,), L)
         raise ParseError(L, "unsupported: method `.%s()`" % m.kind)
 
     def let(self):
@@ -900,6 +938,8 @@ class _Parser:
             if t.text == "*":
                 self.next()
                 e = self.unary()
+                if isinstance(e, _Unwrap):
+                    return K.Alg(e.op, e.recv, (), t.loc)  # FR-253: `*v.iter().max().unwrap()`
                 if not isinstance(e, K.Var) or e.spelling:
                     self.unsupported(t, "dereference `*` of something other than a reference variable")
                 return K.Var(e.name, e.loc, "deref")
@@ -923,7 +963,7 @@ class _Parser:
                     self.unsupported(m, "field access")
                 self.next()
                 if not self.at("(") and m.text not in WRAPPING_METHODS and m.text != "wrapping_neg":
-                    if isinstance(e, (_MStmt, _Iter)):
+                    if isinstance(e, (_MStmt, _Iter, _IterMap, _Unwrap)):
                         self.unsupported(m, "field access `.%s`" % m.text)
                     e = K.Field(e, m.text, getattr(e, "loc", None) or m.loc)  # located at its start, like C++
                     continue
@@ -970,8 +1010,15 @@ class _Parser:
         name = m.text
         if not self.at("("):
             self.unsupported(m, "field access `.%s`" % name)
-        if isinstance(recv, (_MStmt, _Iter)):
+        if isinstance(recv, _Iter) and name in ("max", "min", "fold", "any", "all", "for_each", "map"):
+            return self.iter_method(recv, m)  # FR-253 (any other name keeps the generic wording)
+        if isinstance(recv, (_MStmt, _Iter, _IterMap, _Unwrap)):
             self.unsupported(m, "method call `.%s()`" % name)
+        if name == "contains":
+            args = self.call_args()
+            if len(args) != 1:
+                self.unsupported(m, "`.contains()` with %d arguments" % len(args))
+            return K.Alg("contains", recv, (args[0],), getattr(recv, "loc", None) or m.loc)  # FR-253
         if name in ("len", "is_empty", "clone", "to_string", "as_bytes", "iter", "iter_mut") \
                 or (name in STMT_METHODS and STMT_METHODS[name] == 0):
             self.expect("(")
@@ -1023,6 +1070,87 @@ class _Parser:
         # receiver's struct type (the checker reports `.capacity()` on a Vec)
         return K.MethodCall(recv, name, tuple(self.call_args()), m.loc)
 
+    # ---------------------------------------------------- FR-253
+    ITER_BAD = ("iterator method `.%s()` (the subset's iterator chains are `v.iter().fold(init, |a, &e| ..)`, "
+                "`v.iter().max().unwrap()` / `.min()`, and `v.iter().copied()` followed by `.fold(init, &f)`, "
+                "`.any(&p)`, `.all(&p)`, `.for_each(&f)` or, inside `w.extend(..)`, `.map(&f)`)")
+
+    def iter_method(self, it, m):
+        """`.name(..)` on `v.iter()` / `v.iter().copied()`: the algorithm rows."""
+        name = m.text
+        L = getattr(it.recv, "loc", None) or m.loc
+        if it.mode == "ref" and name in ("max", "min"):
+            self.expect("(")
+            self.expect(")")
+            if not (self.at(".") and self.peek().text == "unwrap" and self.peek(2).text == "("):
+                self.unsupported(m, "`.%s()` other than `*v.iter().%s().unwrap()`" % (name, name))
+            self.next()
+            self.next()
+            self.expect("(")
+            self.expect(")")
+            return _Unwrap(name + "_element", it.recv, L)
+        if it.mode == "ref" and name == "fold":
+            self.expect("(")
+            init = self.free_expr()
+            self.expect(",")
+            spelling = self.fold_closure()
+            self.expect(")")
+            return K.Alg("accumulate", it.recv, (init,), L, spelling)
+        if it.mode == "copied" and name in ("fold", "any", "all", "for_each", "map"):
+            args = self.call_args()
+            want = 2 if name == "fold" else 1
+            if len(args) != want:
+                self.unsupported(m, "`.%s()` with %d arguments" % (name, len(args)))
+            if name == "fold":
+                return K.Alg("accumulate", it.recv, (args[0], args[1]), L)
+            if name in ("any", "all"):
+                return K.Alg(name + "_of", it.recv, (args[0],), L)
+            if name == "for_each":
+                return _MStmt("for_each", it.recv, (args[0],), L)
+            return _IterMap(it.recv, args[0], L)
+        self.unsupported(m, self.ITER_BAD % name)
+
+    def fold_closure(self):
+        """The canonical fold closure of std::accumulate: `|a, &e| a + e`,
+        `|a, &e| a.wrapping_add(e)`, either with `e as T`.  Returns
+        (wrapping, cast type name or '') for the checker."""
+        t = self.tok
+        bad = ("fold closure other than `|a, &e| a + e` (the canonical std::accumulate step: `a.wrapping_add(e)` "
+               "for an unsigned accumulator, `e as T` when the element type differs; any other operation is a "
+               "closure variable `.copied().fold(init, &f)`)")
+        for want in ("|", "a", ",", "&", "e", "|", "a"):
+            if self.tok.text != want:
+                self.unsupported(t, bad)
+            self.next()
+        wrapping = False
+        if self.at("."):
+            self.next()
+            if self.tok.text != "wrapping_add":
+                self.unsupported(t, bad)
+            self.next()
+            self.expect("(")
+            wrapping = True
+        elif self.at("+"):
+            self.next()
+        else:
+            self.unsupported(t, bad)
+        if self.tok.text != "e":
+            self.unsupported(t, bad)
+        self.next()
+        cast = ""
+        if self.at("as"):
+            self.next()
+            ct = self.tok
+            if ct.text not in RUST_TYPES:
+                self.unsupported(t, bad)
+            self.next()
+            cast = ct.text
+        if wrapping:
+            self.expect(")")
+        if not self.at(")"):
+            self.unsupported(t, bad)
+        return (wrapping, cast)
+
     def call_args(self):
         self.expect("(")
         args = []
@@ -1061,6 +1189,15 @@ class _Parser:
             self.next()
             self.expect(")")
             return K.StrFrom(st.value, t.loc)
+        if path in ("bx::count", "bx::count_if", "bx::transform", "bx::sort_by_less"):
+            # FR-253
+            self.bx_uses.append((m.text, t))
+            args = self.call_args()
+            if len(args) != 2:
+                self.unsupported(m, "`%s` with %d arguments" % (path, len(args)))
+            if m.text in ("count", "count_if"):
+                return K.Alg(m.text, args[0], (args[1],), t.loc)
+            return _MStmt("sort_by" if m.text == "sort_by_less" else "transform", args[0], (args[1],), t.loc)
         if path in ("bx::substr", "bx::substr_from", "bx::push_byte"):
             self.bx_uses.append((m.text, t))
             args = self.call_args()
@@ -1213,6 +1350,11 @@ class _Parser:
                     segs.append(self.ident().text)
                 if segs[:2] == ["std", "slice"] and len(segs) == 3 and segs[2] in ("from_ref", "from_mut"):
                     return self.slice_from(segs[2], t)
+                if segs[:2] == ["std", "cmp"] and len(segs) == 3 and segs[2] in ("max", "min") and self.at("("):
+                    args = self.call_args()  # FR-253
+                    if len(args) != 2:
+                        self.unsupported(t, "`std::cmp::%s` with %d arguments" % (segs[2], len(args)))
+                    return K.MinMax(segs[2], args[0], args[1], t.loc)
                 if self.at("{") and not self.no_struct:
                     return self.struct_lit("::".join(segs), t)
                 if not self.at("("):
@@ -1411,6 +1553,11 @@ def rs_parse_surface(src):
             raise ParseError(n.loc, "unsupported: `.%s()` used as a value" % n.kind)
         if isinstance(n, _Iter):
             raise ParseError(n.loc, "unsupported: iterator outside a `for` loop")
+        if isinstance(n, _IterMap):
+            raise ParseError(n.loc, "unsupported: `.map(&f)` outside `w.extend(v.iter().copied().map(&f))`")
+        if isinstance(n, _Unwrap):
+            raise ParseError(n.loc, "unsupported: `v.iter().%s().unwrap()` other than dereferenced at once "
+                                    "(`*v.iter().%s().unwrap()`)" % (n.op[:3], n.op[:3]))
         if isinstance(n, _SliceIdx):
             raise ParseError(n.loc, "unsupported: unsized slice place `x[k..]` (the subset spells a re-slice "
                                     "`&x[k..]` / `&mut x[k..]`)")
