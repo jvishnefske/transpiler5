@@ -17,6 +17,15 @@ mentions (mutable) the iterated vector; a variable passed by `T&` is not
 mentioned elsewhere in its statement; a written element's index never
 reads its own vector.  ``check`` must accept every program, and the
 rustc subset in test_property must borrow-check.
+
+FR-260: with ``namespaces`` (the default) about 60% of the functions live in
+namespaces up to three deep, drawn from a SEPARATE random stream so the
+function bodies of a seed are unchanged.  Leaf names are drawn from a small
+pool so the same name recurs in sibling namespaces and in a namespace and
+its ancestors (inner hides outer -- a bare same-namespace call must find the
+inner one on both sides); a quarter of namespaced functions are internal
+(anonymous-namespace / private `fn`) and are only called from inside their
+namespace, as the subset requires.
 """
 
 import random
@@ -27,14 +36,48 @@ from . import typecheck as TC
 FLOATS = ["0.0", "0.5", "1.0", "2.5", "0.125", "1e-05", "123.25", "1e+300", "3.0", "100.0",
           "0.1", "6.02e+23"]
 TEXT_POOL = list("abcXYZ019 ,.:;=!?%{}\"\\'\n\t()[]#@$&*+-/<>|^~`_")
+NS_POOL = ((), ("na",), ("nb",), ("na", "nc"), ("nb", "nc"), ("na", "nc", "nd"), ("na", "nd"),
+           ("nb", "nc", "na"))
 NC_TYPES = (K.STRING, K.STRING, K.VecT(K.I32), K.VecT(K.I64), K.VecT(K.U8), K.VecT(K.F64), K.VecT(K.I8),
             K.VecT(K.USIZE), K.VecT(K.STRING), K.VecT(K.VecT(K.I32)))
 VALUE_TYPES = K.ALL_PRIMS + NC_TYPES
 
 
 class Gen:
-    def __init__(self, seed):
+    def __init__(self, seed, namespaces=True):
         self.r = random.Random(seed)
+        self.namespaces = namespaces
+        self.nsr = random.Random(seed * 7919 + 17)  # FR-260's own stream
+        self.meta = {}  # path -> (ns, leaf, internal)
+        self.cur_ns = ()
+
+    def placement(self, i, nfuncs, prefix, taken):
+        """(ns, leaf, internal) for the i-th generated function."""
+        r = self.nsr
+        if not self.namespaces or r.random() < 0.4:
+            ns = ()
+        else:
+            ns = r.choice(NS_POOL[1:])
+        while True:
+            leaf = "%s%d" % (prefix, r.randint(0, max(2, nfuncs // 3)) if ns else i)
+            if K.path_of(ns, leaf) not in taken:
+                break
+            if not ns:
+                leaf = "%s%d" % (prefix, i + nfuncs)  # unique at the root
+                if K.path_of(ns, leaf) not in taken:
+                    break
+        return ns, leaf, bool(ns) and r.random() < 0.25
+
+    def callable_sigs(self):
+        """Signatures the current function may call (FR-260: an internal
+        function only from inside its namespace)."""
+        out = []
+        for s in self.sigs:
+            ns, _, internal = self.meta.get(s[0], ((), s[0], False))
+            if internal and self.cur_ns[:len(ns)] != ns:
+                continue
+            out.append(s)
+        return out
 
     def choice(self, xs):
         return self.r.choice(xs)
@@ -60,11 +103,17 @@ class Gen:
                 t, m = self.param_type()
                 params.append(K.Param("p%d" % j, t, m))
             ret = self.choice(K.ALL_PRIMS + (K.UNIT, K.UNIT) + NC_TYPES[:4])
-            sigs.append(("%s%d" % (prefix, i), tuple(params), ret))
+            ns, leaf, internal = self.placement(i, nfuncs, prefix, self.meta)
+            path = K.path_of(ns, leaf)
+            self.meta[path] = (ns, leaf, internal)
+            sigs.append((path, tuple(params), ret))
         self.sigs = sigs
         funcs = []
         for name, params, ret in sigs:
-            funcs.append(self.func(name, params, ret))
+            ns, leaf, internal = self.meta[name]
+            self.cur_ns = ns
+            f = self.func(name, params, ret)
+            funcs.append(K.Func(leaf, f.params, f.ret, f.body, None, ns, internal))
         prog = TC.normalize(K.Program(tuple(funcs)))
         errs = TC.check(prog)
         assert not errs, errs[:3]
@@ -207,7 +256,7 @@ class Gen:
         if k == "print":
             return self.print_(scope)
         if k == "call":
-            name, params, ret = self.choice(self.sigs)
+            name, params, ret = self.choice(self.callable_sigs())
             try:
                 return K.ExprStmt(self.call(name, params, scope, 2))
             except _NoCall:
@@ -417,6 +466,10 @@ class Gen:
         if el in K.ARITH and self.r.random() < 0.5:
             op = self.choice(("add", "sub", "mul") + (("band", "bor", "bxor") if el in K.ARITH_INT else ()))
             self.stmt_hidden.add(TC.base_var(tgt))
+            if (K.is_unsigned(el) and op in K.WRAPPING_OPS
+                    and any(isinstance(n, K.Call) for n in K.walk(tgt))):
+                # the subset's rule: Rust would evaluate the index twice
+                return K.Store(tgt, self.value(el, scope, 2, "consume"))
             if self.r.random() < 0.3 and el in K.ARITH_INT and op in ("add", "sub"):
                 return K.CompoundStore(op, tgt, K.IntLit(1, el))
             return K.CompoundStore(op, tgt, self.expr(el, scope, 2))
@@ -524,7 +577,7 @@ class Gen:
     def temp(self, t, scope, depth):
         r = self.r
         d = depth - 1
-        fs = [s for s in self.sigs if s[2] == t]
+        fs = [s for s in self.callable_sigs() if s[2] == t]
         if fs and depth > 1 and r.random() < 0.2:
             try:
                 name, params, _ = self.choice(fs)
@@ -582,7 +635,7 @@ class Gen:
             srcs = [s for s in K.ALL_PRIMS if s != t and (s != K.BOOL or K.is_int(t))]
             return K.Cast(t, self.expr(self.choice(srcs), scope, d))
         if k == "call":
-            fs = [s for s in self.sigs if s[2] == t]
+            fs = [s for s in self.callable_sigs() if s[2] == t]
             if not fs:
                 return self.lit(t)
             name, params, _ = self.choice(fs)
@@ -635,5 +688,5 @@ class _NoCall(Exception):
     pass
 
 
-def gen_program(seed, nfuncs, prefix="f"):
-    return Gen(seed).program(nfuncs, prefix)
+def gen_program(seed, nfuncs, prefix="f", namespaces=True):
+    return Gen(seed, namespaces).program(nfuncs, prefix)

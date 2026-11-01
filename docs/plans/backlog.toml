@@ -1773,7 +1773,7 @@ anchor = "FR-259 (opened 2026-11-01, from FR-256): **BX CHEAP SYNTACTIC"
 [[items]]
 id = "FR-260"
 kind = "feature"
-status = "open"
+status = "landed"
 rank = 59
 size = "M"
 title = "BX namespaces <=> mod: the gate to 95% of woff2/brunsli bodies"

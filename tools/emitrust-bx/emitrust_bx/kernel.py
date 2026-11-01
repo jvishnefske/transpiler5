@@ -658,6 +658,32 @@ class Func:
     ret: Prim
     body: Block
     loc: Optional[Loc] = _loc()
+    # FR-260: the enclosing named namespaces, outermost first (C++
+    # `namespace a { namespace b {` <=> Rust `mod a { pub mod b {`).
+    ns: Tuple[str, ...] = ()
+    # FR-260: a member of an anonymous namespace (C++) <=> a private `fn`
+    # inside a `mod` (Rust).  Always False at the root (normal form N14).
+    internal: bool = False
+
+    @property
+    def path(self):
+        return path_of(self.ns, self.name)
+
+
+def path_of(ns, name):
+    """The absolute Kernel name of a function: 'a::b::f', or 'f' at the root.
+
+    Every ``Call.name`` is such an absolute path (FR-260): name lookup is
+    RESOLVED on import (clang decl ids / rs_parse's module resolution), so
+    no Kernel term depends on declaration order or on a using-directive.
+    """
+    return "::".join(tuple(ns) + (name,))
+
+
+def split_path(path):
+    """'a::b::f' -> (('a', 'b'), 'f')."""
+    parts = path.split("::")
+    return tuple(parts[:-1]), parts[-1]
 
 
 @dataclass(frozen=True)
@@ -725,7 +751,7 @@ def dump(node, indent=0):
         return "".join(dump(i, indent) for i in node.items)
     if isinstance(node, Func):
         ps = ", ".join("%s%s: %s" % ("mut " if p.mutable else "", p.name, p.ty) for p in node.params)
-        s = "%sfunc %s(%s) -> %s\n" % (pad, node.name, ps, node.ret)
+        s = "%sfunc %s%s(%s) -> %s\n" % (pad, "internal " if node.internal else "", node.path, ps, node.ret)
         return s + dump(node.body, indent + 1)
     if isinstance(node, Block):
         return pad + "block\n" + "".join(dump(s, indent + 1) for s in node.stmts)

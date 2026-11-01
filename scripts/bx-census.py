@@ -212,6 +212,14 @@ RULES = [
      r"|class/struct definition|namespace|function template|class template|typedef"
      r"|type alias|enum|using-declaration|static_assert|member function|compound literal"
      r"|statement expression)$", None, None),
+    # FR-260 namespace rejections: the first three reject the namespace WHOLE (OPAQUE)
+    (r"^inline namespace$", "namespace: inline", None),
+    (r"^named namespace inside an anonymous namespace$", "namespace: named inside anonymous", None),
+    (r"^namespace name: ", "namespace: name not representable", None),
+    (r"^function 'main' inside a namespace$", "namespace: main inside", None),
+    (r"^namespace alias of a namespace outside this file$", "namespace: foreign alias", None),
+    (r"^'.*' is internal to namespace '.*'", "namespace: internal member referenced outside", None),
+    (r"^function '.*' has the name of a namespace", "namespace: function named like a namespace", None),
     # clang kinds with no FRIENDLY name (friendly() falls back to the kind)
     (r"^([A-Z][A-Za-z]*(Expr|Stmt|Decl|Operator|Literal))$", None, None),
     # ---- typecheck.py ------------------------------------------------------
@@ -265,6 +273,7 @@ OPAQUE = {
     "CXXConstructorDecl", "CXXDestructorDecl", "CXXConversionDecl",
     "ClassTemplatePartialSpecializationDecl", "ClassTemplateSpecializationDecl",
     "local class/struct definition", "label", "statement expression", "GCCAsmStmt",
+    "namespace: inline", "namespace: named inside anonymous", "namespace: name not representable",
 }
 
 
