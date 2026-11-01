@@ -1664,7 +1664,7 @@ anchor = "FR-249 (opened 2026-11-01): **EMITRUST-BX"
 [[items]]
 id = "FR-250"
 kind = "feature"
-status = "open"
+status = "landed"
 rank = 59
 size = "L"
 title = "BX kernel core: scalars, control flow, functions, printf; both printers/parsers; property round-trip; crate emission"
