@@ -112,6 +112,8 @@ class _Parser:
         self.ns = ()  # FR-260: the module being parsed
         self.no_struct = False  # FR-257: an if/while condition or for iterable
         self.impls = []  # FR-257: (struct raw name, ns, [Func], loc)
+        self.bx_defined = set()  # helpers defined in `mod bx`
+        self.bx_uses = []  # (helper name, token): each must be defined (rustc E0433)
 
     # -------------------------------------------------------------- helpers
     @property
@@ -218,7 +220,11 @@ class _Parser:
 
     # -------------------------------------------------------------- items
     def program(self):
-        return K.Program(tuple(self.items(top=True)))
+        prog = K.Program(tuple(self.items(top=True)))
+        for name, t in self.bx_uses:
+            if name not in self.bx_defined:
+                self.unsupported(t, "`bx::%s` without its definition in `mod bx` (rustc E0433)" % name)
+        return prog
 
     def items(self, top):
         items = []
@@ -369,6 +375,7 @@ class _Parser:
             if got != want:
                 raise ParseError(t.loc, "unsupported: `bx::%s` differs from the canonical helper" % name)
             self.i += len(want)
+            self.bx_defined.add(name)
         self.expect("}")
         return start
 
@@ -650,6 +657,7 @@ class _Parser:
             self.next()
             self.next()
             name = self.ident()
+            self.bx_uses.append((name.text, t))
             self.expect("(")
             e = self.expr()
             if name.text == "fmt_f":
@@ -898,6 +906,7 @@ class _Parser:
             self.expect(")")
             return K.StrFrom(st.value, t.loc)
         if path in ("bx::substr", "bx::substr_from", "bx::push_byte"):
+            self.bx_uses.append((m.text, t))
             args = self.call_args()
             want = {"bx::substr": 3, "bx::substr_from": 2, "bx::push_byte": 2}[path]
             if len(args) != want:
