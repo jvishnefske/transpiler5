@@ -337,6 +337,7 @@ class Gen:
         if recv == "ctor":
             # a member-initializer list: `return S { every field };`
             self.begin_stmt()
+            self.ncalls = 1
             lit = K.StructLit(owner.path, tuple(self.value(f.ty, scope, 2, "consume") for f in owner.fields))
             return K.Func(name, params, ret, K.Block((K.Return(lit),)))
         self.roots_of = {}
@@ -356,6 +357,10 @@ class Gen:
     def begin_stmt(self):
         self.stmt_seen = set()
         self.stmt_hidden = set()
+        # FR-263: at most one call per statement (a constructor is exempt
+        # and its body calls nothing): two calls that may print, unsequenced
+        # in one statement, are refused by the checker
+        self.ncalls = 0
 
     # -------------------------------------------------------------- scope
     def all_vars(self, scope):
@@ -839,9 +844,11 @@ class Gen:
             v = r.randint(0, hi)
         return K.IntLit(v, t)
 
-    def call(self, name, params, scope, d):
+    def call(self, name, params, scope, d, counted=False):
         """A call obeying the alias rules: a `T&` argument is a variable
         not mentioned anywhere else in the statement."""
+        if not counted and not name.endswith("::new"):
+            self.count_call()
         args = [None] * len(params)
         for i, p in enumerate(params):
             if isinstance(p.ty, K.PtrT) and p.ty.mutable:
@@ -1043,6 +1050,11 @@ class Gen:
             return K.CompoundStore("add", tgt, K.IntLit(1, el))
         return K.Store(tgt, self.value(el, scope, 2, "consume"))
 
+    def count_call(self):
+        if self.ncalls:
+            raise _NoCall()
+        self.ncalls = 1
+
     def mcall(self, scope, d, want, ptr=False):
         """FR-257: `r.m(args)` on a place, obeying the receiver alias rules:
         a non-const member function's receiver variable is not mentioned
@@ -1053,6 +1065,7 @@ class Gen:
                  and self.types_visible([K.StructT(m[4])] + [p.ty for p in m[1]] + [m[2]])]
         if not cands:
             raise _NoCall()
+        self.count_call()
         mp, params, ret, recv, owner = self.choice(cands)
         st = K.StructT(owner)
         if recv == "mut":
@@ -1067,7 +1080,7 @@ class Gen:
         self.stmt_seen.add(b)
         if recv == "mut":
             self.stmt_hidden.add(b)
-        c = self.call(mp, params, scope, d)
+        c = self.call(mp, params, scope, d, counted=True)
         return K.MethodCall(rv, mp.rsplit("::", 1)[1], c.args)
 
     def value(self, t, scope, depth, pos, is_return=False):

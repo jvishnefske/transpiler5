@@ -287,6 +287,8 @@ RULES = [
     (r"^(closure '.*' (is not spelled the canonical way|may reach its end|modifies its capture of immutable)"
      r"|call to void closure|call of a callable object other than)", "closure: form", "generic"),
     (r"^the body of a range-for over '.*' modifies", "range-for: body modifies its container", None),
+    # FR-263
+    (r"^two calls that may print in one statement", "sequencing: two printing calls (normalizer)", None),
     (r"^identifier '.*' is reserved by the canonical Rust spelling", "identifier: reserved by canonical spelling", None),
     (r"^struct '.*' contains itself by value", "struct: contains itself", None),
     (r"^member access through a pointer$", "member access through a pointer", None),
