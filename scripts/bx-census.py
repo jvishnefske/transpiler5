@@ -226,6 +226,8 @@ RULES = [
     (r"^union$", "struct: union", None),
     (r"^class with a base class", "struct: inheritance", None),
     (r"^struct with members outside the subset$", "struct: has members outside the subset", None),
+    (r"^member function of a struct with members outside the subset$", "struct: has members outside the subset", None),
+    (r"^definition of a rejected member function$", "struct: definition of a rejected member", None),
     (r"^(private or protected member|bit-field|default member initializer|mutable data member"
      r"|unnamed data member|const data member|static data member|operator overload"
      r"|virtual member function|defaulted or deleted member function|volatile member function"
@@ -350,7 +352,8 @@ OPAQUE = {
 }
 
 # a member-function definition bx rejects as ONE item without inspecting its body
-WHOLE_MEMBER = {"member function", "CXXConstructorDecl", "CXXDestructorDecl", "CXXConversionDecl"}
+WHOLE_MEMBER = {"member function", "CXXConstructorDecl", "CXXDestructorDecl", "CXXConversionDecl",
+                "struct: definition of a rejected member"}
 
 
 def mark(key):
