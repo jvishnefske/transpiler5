@@ -1784,12 +1784,12 @@ anchor = "FR-260 (opened 2026-11-01, from FR-258): **BX NAMESPACES"
 [[items]]
 id = "FR-261"
 kind = "feature"
-status = "open"
+status = "spiked"
 rank = 60
 size = "L"
 title = "BX pointer buffers <=> slices: 87% of probe-observed real-module functions"
 summary = "Spike first: shape census of the 215 T* parameter functions; strict bijection or located residual."
-blocked_by = []
+blocked_by = ["FR-251", "FR-260"]
 anchor = "FR-261 (opened 2026-11-01, from FR-258): **BX POINTER BUFFERS"
 
 [[items]]
