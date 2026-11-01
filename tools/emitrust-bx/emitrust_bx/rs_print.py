@@ -97,6 +97,12 @@ bare `f(..)`; every other call is absolute, `crate::a::b::f(..)` (C++
 declaration order, enclosing-scope search, or using-directives.  Inside a
 module the safe helpers are `crate::bx::..` (`bx::` resolves relative to
 the current module).
+
+FR-252 rows (closures): `let f = move |mut a: i32| -> i32 {` .. `};` (`move`
+for by-copy captures; `let mut f` when it modifies state or is passed as
+`&mut impl FnMut`; `|| ->` with no parameter; no `-> ()`), `f(a)`; a
+callable parameter `f: &impl Fn(i32) -> i32` / `f: &mut impl FnMut(i32)`,
+an argument `&add` / `&mut bump` (a callable parameter passed on bare).
 """
 
 from . import fmt
@@ -121,6 +127,11 @@ def rs_ty(t, ns=()):
         return "Vec<%s>" % rs_ty(t.elem, ns)
     if isinstance(t, K.StrT):
         return "String"
+    if isinstance(t, K.RefT) and isinstance(t.inner, K.FnT):
+        # FR-252: `const F& f` <=> `&impl Fn(..)`, `F& f` <=> `&mut impl FnMut(..)`
+        return "&%simpl %s(%s)%s" % ("mut " if t.mutable else "", "FnMut" if t.mutable else "Fn",
+                                     ", ".join(rs_ty(p, ns) for p in t.inner.params),
+                                     "" if t.inner.ret == K.UNIT else " -> " + rs_ty(t.inner.ret, ns))
     if isinstance(t, K.RefT):
         return "&%s%s" % ("mut " if t.mutable else "", rs_ty(t.inner, ns))
     if isinstance(t, K.StructT):
@@ -186,7 +197,7 @@ class _Printer:
     def atomic(self, e, scope):
         if isinstance(e, K.Var):
             return not self.is_ref(e, scope)
-        if isinstance(e, (K.IntLit, K.FloatLit, K.BoolLit, K.Call, K.StrLit, K.Clone, K.Index, K.Len,
+        if isinstance(e, (K.IntLit, K.FloatLit, K.BoolLit, K.Call, K.ClosureCall, K.StrLit, K.Clone, K.Index, K.Len,
                           K.IsEmpty, K.VecLit, K.VecFill, K.StrNew, K.StrFrom, K.Substr, K.ToStr, K.Field,
                           K.MethodCall, K.StructLit)):
             return True
@@ -213,6 +224,12 @@ class _Printer:
             return '"' + fmt.rust_escape(e.value, False) + '"'
         if isinstance(e, K.Var):
             return "*" + e.name if self.is_ref(e, scope) else e.name
+        if isinstance(e, K.ClosureCall):
+            saved, self.in_cast = self.in_cast, 0
+            try:
+                return "%s(%s)" % (e.name, ", ".join(self.expr(a, scope) for a in e.args))
+            finally:
+                self.in_cast = saved
         if isinstance(e, K.Call):
             saved, self.in_cast = self.in_cast, 0
             try:
@@ -424,6 +441,20 @@ class _Printer:
             self.emit(d, "{")
             self.block_body(s, scope, d + 1)
             self.emit(d, "}")
+        elif isinstance(s, K.Closure):
+            # FR-252: `let f = move |a: i32| -> i32 {` .. `};` (`let mut f`
+            # when it modifies state or is passed as `&mut impl FnMut`)
+            ps = ", ".join("%s%s: %s" % ("mut " if p.mutable else "", p.name, self.rty(p.ty)) for p in s.params)
+            ret = "" if s.ret == K.UNIT else " -> " + self.rty(s.ret)
+            mut = s.name in self.mut_closures
+            self.emit(d, "let %s%s = %s|%s|%s {" % ("mut " if mut else "", s.name, "move " if s.move else "",
+                                                     ps, ret))
+            inner = scope.child()
+            for p in s.params:
+                inner.declare(p.name, p.ty, p.mutable)
+            self.block_body(s.body, inner, d + 1, same=True)
+            self.emit(d, "};")
+            scope.declare(s.name, K.FnT(tuple(p.ty for p in s.params), s.ret), mut)
         elif isinstance(s, K.Let):
             init = self.ptr_val(s.init, scope, s.ty.mutable) if isinstance(s.ty, K.PtrT) else self.typed(s.init, scope)
             self.emit(d, "let %s%s: %s = %s;" % ("mut " if s.mutable else "", s.name, self.rty(s.ty), init))
@@ -556,6 +587,7 @@ class _Printer:
 
     def func(self, f):
         scope = TC.Scope()
+        self.mut_closures = TC.mut_closure_names(f, self.sigs)
         ps = []
         if f.recv in ("ref", "mut"):
             ps.append("&mut self" if f.recv == "mut" else "&self")

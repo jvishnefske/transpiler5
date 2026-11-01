@@ -221,7 +221,7 @@ def test_n22_neighbours_stay_refused(tmp_path):
     assert errs(tmp_path, src) == [
         (2, 5, "unsupported: variable of type 'int &'"),
         (3, 5, "unsupported: variable of type 'iterator'"),
-        (4, 5, "unsupported: auto-typed declaration of a lambda"),
+        # (line 4, `auto lam = [](int q) {..};`, is a closure since FR-252)
         (5, 5, "unsupported: variable of type 'std::initializer_list<int>'"),
         (6, 5, "unsupported: list-initialization (the subset spells it `T x = e;`)"),
         (7, 5, "unsupported: decltype-typed declaration"),

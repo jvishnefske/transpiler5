@@ -1686,7 +1686,7 @@ anchor = "FR-251 (opened 2026-11-01, child of FR-249): **BX std::vector"
 [[items]]
 id = "FR-252"
 kind = "feature"
-status = "open"
+status = "landed"
 rank = 65
 size = "M"
 title = "BX closures: copy/ref captures, FnMut, impl Fn params"

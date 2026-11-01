@@ -79,6 +79,13 @@ FR-257 rows (structs):
   constructors.
 * `self` is `*this`; a member through it is `this->f` / `this->m(..)`.
 * aggregate init: `S s = {a, b};` as a declaration, `S{a, b}` elsewhere.
+
+FR-252 rows (closures): `auto f = [k, v](int a) mutable -> int {` .. `};`
+(captures by copy, or `[&acc]` by reference, in first-use order; `mutable`
+exactly when a by-copy closure modifies its copy; `-> R` unless void; an
+empty list `[]`), `f(a)`; a function with a callable parameter is `template
+<typename F> R g(const F& f, ..)` (`F& f` for `&mut impl FnMut`), one line
+(the prototype too), called `g(add, ..)`.
 """
 
 from . import fmt
@@ -109,6 +116,8 @@ def cxx_ty(t, ns=()):
         return "std::vector<%s>" % cxx_ty(t.elem, ns)
     if isinstance(t, K.StrT):
         return "std::string"
+    if isinstance(t, K.RefT) and isinstance(t.inner, K.FnT):
+        return "%sF&" % ("" if t.mutable else "const ")  # FR-252: the one template parameter
     if isinstance(t, K.RefT):
         return "%s%s&" % ("" if t.mutable else "const ", cxx_ty(t.inner, ns))
     if isinstance(t, K.StructT):
@@ -203,7 +212,7 @@ class _Printer:
             return False
         if self.is_deref(e, scope):
             return False
-        return isinstance(e, (K.IntLit, K.FloatLit, K.BoolLit, K.Var, K.Call, K.Cast, K.StrLit, K.Index,
+        return isinstance(e, (K.IntLit, K.FloatLit, K.BoolLit, K.Var, K.Call, K.ClosureCall, K.Cast, K.StrLit, K.Index,
                               K.ByteAt, K.Len, K.IsEmpty, K.VecLit, K.VecFill, K.StrNew, K.StrFrom,
                               K.Substr, K.ToStr, K.Clone, K.Field, K.StructLit, K.MethodCall))
 
@@ -309,6 +318,8 @@ class _Printer:
         if isinstance(e, K.Call):
             ptys = self.sigs[e.name][0]
             return "%s(%s)" % (self.callee(e.name), self.args(ptys, e.args, scope))
+        if isinstance(e, K.ClosureCall):
+            return "%s(%s)" % (e.name, ", ".join(self.expr(a, scope) for a in e.args))
         if isinstance(e, (K.Clone, K.Index, K.ByteAt, K.Len, K.IsEmpty, K.VecLit, K.VecFill, K.StrNew,
                           K.StrFrom, K.Substr, K.ToStr, K.Field, K.StructLit, K.MethodCall, K.Offset, K.AddrOf)):
             return self.nc_expr(e, scope)
@@ -365,6 +376,19 @@ class _Printer:
             self.emit(d, "{")
             self.block_body(s, scope, d + 1)
             self.emit(d, "}")
+        elif isinstance(s, K.Closure):
+            # FR-252: `auto f = [k, v](int a) mutable -> int {` .. `};`
+            caps = ", ".join(("" if s.move else "&") + c for c in K.closure_captures(s))
+            ps = ", ".join("%s%s %s" % ("" if p.mutable else "const ", self.tyname(p.ty), p.name) for p in s.params)
+            mutable = " mutable" if s.move and s.name in self.fnmut else ""
+            ret = "" if s.ret == K.UNIT else " -> " + self.tyname(s.ret)
+            self.emit(d, "auto %s = [%s](%s)%s%s {" % (s.name, caps, ps, mutable, ret))
+            inner = scope.child()
+            for p in s.params:
+                inner.declare(p.name, p.ty, p.mutable)
+            self.block_body(s.body, inner, d + 1, same=True)
+            self.emit(d, "};")
+            scope.declare(s.name, K.FnT(tuple(p.ty for p in s.params), s.ret), True)
         elif isinstance(s, K.Let):
             if isinstance(s.ty, K.PtrT):
                 # FR-261: top-level const follows the pointer (`T* const q`)
@@ -520,6 +544,9 @@ class _Printer:
         ps, scope = self.params(f)
         if f.path == "main":
             return "int main()", scope
+        if any(isinstance(p.ty, K.RefT) and isinstance(p.ty.inner, K.FnT) for p in f.params):
+            # FR-252: one callable parameter, the template's only parameter F
+            return "template <typename F> %s %s(%s)" % (self.tyname(f.ret), f.name, ps), scope
         if f.recv == "ctor":
             return ("%s(%s)" % (f.owner, ps) if in_class else "%s::%s(%s)" % (f.owner, f.owner, ps)), scope
         name = f.name if not f.owner or in_class else "%s::%s" % (f.owner, f.name)
@@ -532,6 +559,7 @@ class _Printer:
 
     def func(self, f):
         sig, scope = self.signature(f)
+        self.fnmut = TC.closure_info(f.body, self.sigs)[1]
         self.method = f if f.owner else None
         try:
             if f.recv == "ctor":

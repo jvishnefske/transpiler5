@@ -49,6 +49,13 @@ none; `new` is the constructor), field access `e.f`, method calls `e.m(..)`
 `for` iterable, like rustc).  Struct types and literal paths are resolved
 after the whole crate is read, with the rules calls use; a literal must list
 every field in declaration order.
+
+FR-252: `let [mut] f = [move] |a: T, ..| [-> R] { .. };` (every parameter
+typed, a block body; the `let mut` is checked against the derived FnMut-ness
+by the checker), `&impl Fn(..) -> R` / `&mut impl FnMut(..) -> R` parameter
+types, and a bare call `f(..)` of a closure or callable parameter in scope
+(block-scoped, so a Rust local hides a function of its name) as a
+ClosureCall; any other `|..|` is a located error.
 """
 
 from dataclasses import dataclass, field
@@ -138,6 +145,7 @@ class _Parser:
         self.impls = []  # FR-257: (struct raw name, ns, [Func], loc)
         self.bx_defined = set()  # helpers defined in `mod bx`
         self.bx_uses = []  # (helper name, token): each must be defined (rustc E0433)
+        self.closures = [set()]  # FR-252: closure / callable-parameter names per block scope
 
     # -------------------------------------------------------------- helpers
     @property
@@ -212,6 +220,8 @@ class _Parser:
             if self.at("mut"):
                 self.next()
                 mut = True
+            if self.at("impl"):
+                return K.RefT(self.fn_type(t, mut), mut)
             if self.at("["):
                 # FR-261: a slice `&[T]` / `&mut [T]` is a pointer
                 self.next()
@@ -244,6 +254,30 @@ class _Parser:
         if t.kind == "ident":
             self.unsupported(t, "type `%s`" % t.text)
         raise ParseError(t.loc, "expected a type, found %s" % self.describe(t))
+
+    def fn_type(self, amp, mut):
+        """FR-252: `impl Fn(T, ..) -> R` after `&`, `impl FnMut(..)` after
+        `&mut` (a callable parameter; C++ `const F&` / `F&`)."""
+        self.expect("impl")
+        tr = self.ident()
+        want = "FnMut" if mut else "Fn"
+        if tr.text not in ("Fn", "FnMut", "FnOnce"):
+            self.unsupported(tr, "trait `impl %s`" % tr.text)
+        if tr.text != want:
+            self.unsupported(tr, "`&%simpl %s` (the subset spells a callable parameter `&impl Fn(..)` or "
+                                 "`&mut impl FnMut(..)`)" % ("mut " if mut else "", tr.text))
+        self.expect("(")
+        ps = []
+        while not self.at(")"):
+            ps.append(self.type_())
+            if not self.at(")"):
+                self.expect(",")
+        self.expect(")")
+        ret = K.UNIT
+        if self.at("->"):
+            self.next()
+            ret = self.type_()
+        return K.FnT(tuple(ps), ret)
 
     def path_segments(self):
         segs = [self.ident().text]
@@ -452,6 +486,8 @@ class _Parser:
         if self.at("->"):
             self.next()
             ret = self.type_()
+        # FR-252: a callable parameter is called like a closure
+        self.closures = [{p.name for p in params if isinstance(p.ty, K.RefT) and isinstance(p.ty.inner, K.FnT)}]
         body = self.block()
         if owner is not None:
             return K.Func(name.text, tuple(params), ret, body, start.loc, self.ns, False, owner, recv)
@@ -461,12 +497,22 @@ class _Parser:
     def block(self):
         start = self.expect("{")
         stmts = []
-        while not self.at("}"):
-            if self.tok.kind == "eof":
-                raise ParseError(self.tok.loc, "expected `}`, found end of file")
-            stmts.append(self.stmt())
+        self.closures.append(set())
+        try:
+            while not self.at("}"):
+                if self.tok.kind == "eof":
+                    raise ParseError(self.tok.loc, "expected `}`, found end of file")
+                stmts.append(self.stmt())
+        finally:
+            self.closures.pop()
         self.expect("}")
         return K.Block(tuple(stmts), start.loc)
+
+    def is_closure(self, name):
+        """FR-252: does ``name`` (a bare call) name a closure in scope?  A
+        Rust local hides a function of the same name; any other local name
+        shadowing it hides the closure too."""
+        return any(name in sc for sc in self.closures)
 
     def stmt(self):
         t = self.tok
@@ -541,7 +587,7 @@ class _Parser:
                     return K.Store(e, v, t.loc)
                 return K.CompoundStore(COMPOUND[op_tok.text], e, v, t.loc, "plain")
             self.unsupported(t, "assignment to something other than a variable or an element")
-        if not isinstance(e, (K.Call, K.MethodCall)):
+        if not isinstance(e, (K.Call, K.MethodCall, K.ClosureCall)):
             if self.at("}"):
                 self.unsupported(t, "tail expression (the subset spells it `return e;`)")
             self.unsupported(t, "expression statement that is not a call")
@@ -573,6 +619,8 @@ class _Parser:
         if self.tok.kind != "ident":
             self.unsupported(self.tok, "pattern in `let`")
         name = self.ident()
+        if self.at("=") and (self.peek().text in ("|", "||", "move")):
+            return self.closure(t, name, mutable)
         if not self.at(":"):
             self.unsupported(self.tok if self.tok.kind != "eof" else t,
                              "`let` without a type annotation (every declaration is explicitly typed)")
@@ -584,6 +632,51 @@ class _Parser:
         init = self.expr()
         self.expect(";")
         return K.Let(name.text, ty, mutable, init, t.loc)
+
+    def closure(self, t, name, mutable):
+        """FR-252: `let [mut] f = [move] |a: T, ..| [-> R] { body };`."""
+        self.expect("=")
+        move = False
+        if self.at("move"):
+            self.next()
+            move = True
+        params = []
+        if self.at("||"):
+            self.next()
+        else:
+            self.expect("|")
+            while not self.at("|"):
+                pt = self.tok
+                pm = False
+                if self.at("mut"):
+                    self.next()
+                    pm = True
+                pname = self.ident()
+                if not self.at(":"):
+                    self.unsupported(self.tok, "closure parameter without a type annotation")
+                self.next()
+                ty = self.type_()
+                params.append(K.Param(pname.text, ty, pm, pt.loc))
+                if not self.at("|"):
+                    self.expect(",")
+            self.expect("|")
+        ret = K.UNIT
+        if self.at("->"):
+            self.next()
+            ret = self.type_()
+        if not self.at("{"):
+            self.unsupported(self.tok, "closure body that is not a block")
+        saved = self.closures
+        # a call of an outer closure in the body stays a ClosureCall, so the
+        # checker can name it (a closure is not captured by another one)
+        self.closures = [set(), {n for sc in saved for n in sc}]
+        try:
+            body = self.block()
+        finally:
+            self.closures = saved
+        self.expect(";")
+        self.closures[-1].add(name.text)
+        return K.Closure(name.text, move, tuple(params), ret, body, t.loc, "let mut" if mutable else "let")
 
     def if_(self):
         t = self.expect("if")
@@ -1137,6 +1230,8 @@ class _Parser:
                     if not self.at(")"):
                         self.expect(",")
                 self.expect(")")
+                if self.is_closure(t.text):
+                    return K.ClosureCall(t.text, tuple(args), t.loc)
                 return K.Call(t.text, tuple(args), t.loc)
             if self.at("{") and not self.no_struct and t.text != "self":
                 return self.struct_lit(t.text, t)

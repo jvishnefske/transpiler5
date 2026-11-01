@@ -139,7 +139,35 @@ their own (C++ promotes them to int first).  Three C++-side normal forms:
   N22 (cxx_import) `auto x = e;` / `const auto x = e;` is `T x = e;` with T
       clang's DEDUCED type, when that is a Kernel type; the canonical C++
       spells the type.
+
+FR-252 (closures).  A ``Closure`` captures all by copy (`move`) or all by
+reference; a closure variable has type ``FnT`` and is only called
+(``ClosureCall``) or passed to a callable parameter (``RefT(FnT)``, at most
+one per free function, never a member function, and only on a function some
+closure-argument call instantiates).  The checker adds: no nested closure,
+no capture of `self`, a pointer, a callable, or -- by copy -- a reference; no
+closure-declared name that names an enclosing variable; scalar parameters
+and a scalar or unit result; a by-copy capture of a Vec / String / struct is
+a MOVE for the move rule (C++ copies, Rust moves: equal only when nothing
+mentions it later); a closure never moves its capture out (FnOnce); the
+alias discipline over a by-reference closure's live range (creation to its
+LAST call: a modified capture is not mentioned, a read one not modified or
+moved -- assignment targets included); a call of a closure counts as the
+modifications its body makes through by-reference captures for EVERY
+analysis (``closure_effects``: counting-loop bounds and sizes, range-for,
+pointers); a closure that modifies state is not used twice in one
+statement without a sequence point (``unsequenced_uses``); and on the Rust
+surface `let mut f` exactly when f modifies state or is passed as `&mut impl
+FnMut`.
+
+  N23 A closure's capture LIST is not a Kernel field: C++'s written order and
+      written-but-unused captures are spellings (the list is the body's free
+      variables in first-use order on both printers).
+  N24 Closure(move=True) with no capture -> move=False (`[]` either way).
 """
+
+import collections
+from dataclasses import fields, is_dataclass
 
 from . import kernel as K
 
@@ -225,6 +253,104 @@ RESERVED = {
     "FOPEN_MAX", "TMP_MAX", "SEEK_SET", "SEEK_CUR", "SEEK_END", "P_tmpdir",
     "String",
 }
+
+
+# FR-252 wordings shared by the checker and cxx_import
+CLOSURE_VALUE = ("unsupported: closure '%s' used other than by calling it or passing it to a callable "
+                 "parameter (copying a closure copies its state in C++ and moves it in Rust)")
+
+
+def closure_info(body, sigs):
+    """FR-252, per function body: (closure name -> enclosing variables a call
+    of it modifies through a by-reference capture; the closures that modify
+    state at all -- FnMut; the closures bound `let mut` -- FnMut, or passed
+    to an `F&` / `&mut impl FnMut` parameter).  By name (conservative)."""
+    cm, fnmut, mut = {}, set(), set()
+    for c in K.walk(body):
+        if not isinstance(c, K.Closure):
+            continue
+        caps = set(K.closure_captures(c))
+        muts = mutated_bases(c.body, sigs) & caps
+        cm.setdefault(c.name, set())
+        if not c.move:
+            cm[c.name] |= muts
+        if muts:
+            fnmut.add(c.name)
+            mut.add(c.name)
+    for n in K.walk(body):
+        if isinstance(n, K.Call):
+            sig = sigs.get(n.name)
+            if sig is None:
+                continue
+            for pt, a in zip(sig[0], n.args):
+                a = a.operand if isinstance(a, K.Borrow) else a  # (the Rust surface's `&mut f`)
+                if isinstance(pt, K.RefT) and isinstance(pt.inner, K.FnT) and pt.mutable and isinstance(a, K.Var):
+                    mut.add(a.name)
+    return cm, fnmut, mut
+
+
+def unsequenced_uses(exprs, name):
+    """FR-252: a second use of closure ``name`` (a call, or the closure passed
+    as an argument) that C++ does not sequence against another one in the
+    statement whose expressions are ``exprs`` -- or None.  `&&`, `||` and
+    `?:` sequence their operands (and only one `?:` arm runs); every other
+    pair of operands -- arithmetic, call arguments, printf arguments -- is
+    unsequenced, and a call is not sequenced with a use in its own arguments
+    as far as Rust's borrow of a FnMut closure is concerned."""
+
+    def uses(e):
+        """(the uses in ``e``, a node that is unsequenced with another one)."""
+        if isinstance(e, K.Binary) and e.op in K.LOGIC_OPS:
+            a, ba = uses(e.lhs)
+            b, bb = uses(e.rhs)
+            return a + b, ba or bb
+        if isinstance(e, K.Cond):
+            parts = [uses(x) for x in (e.cond, e.then, e.els)]
+            return sum((p[0] for p in parts), []), next((p[1] for p in parts if p[1] is not None), None)
+        own = [e] if isinstance(e, (K.ClosureCall, K.Var)) and e.name == name else []
+        groups = [own]
+        bad = None
+        for f in fields(e) if is_dataclass(e) else ():
+            if f.name in ("loc", "spelling", "ty", "elem"):
+                continue
+            v = getattr(e, f.name)
+            for c in (v if isinstance(v, tuple) else (v,)):
+                if isinstance(c, K.Spec):
+                    c = c.arg
+                if is_dataclass(c) and not isinstance(c, (K.Loc,) + K.TYPE_CLASSES):
+                    u, b = uses(c)
+                    groups.append(u)
+                    bad = bad or b
+        flat = [x for g in groups for x in g]
+        if bad is None and sum(1 for g in groups if g) > 1:
+            bad = flat[1]
+        return flat, bad
+
+    groups = [uses(e) for e in exprs]
+    bad = next((g[1] for g in groups if g[1] is not None), None)
+    if bad is None and sum(1 for g in groups if g[0]) > 1:
+        bad = [x for g in groups for x in g[0]][1]
+    return bad
+
+
+def mut_closure_names(f, sigs):
+    return closure_info(f.body, sigs)[2]
+
+
+def fn_sig_ok(ft):
+    """FR-252: a closure signature: scalar parameters, a scalar or unit result."""
+    return (all(p in K.ALL_PRIMS for p in ft.params)
+            and (ft.ret in K.ALL_PRIMS or ft.ret == K.UNIT))
+
+
+def own_nodes(node):
+    """FR-252: K.walk(node) WITHOUT the bodies of closures (a `return` there
+    returns from the closure, not from the function)."""
+    inner = set()
+    for n in K.walk(node):
+        if isinstance(n, K.Closure):
+            inner |= {id(x) for x in K.walk(n.body)}
+    return [n for n in K.walk(node) if id(n) not in inner]
 
 
 def ident_problem(name):
@@ -682,6 +808,14 @@ def type_of(e, scope, sigs):
         if t not in K.ARITH_INT:
             raise KernelTypeError(e.loc, "increment/decrement of %s used as a value" % t)
         return t
+    if isinstance(e, K.ClosureCall):
+        v = scope.lookup(e.name)
+        if v is None:
+            raise KernelTypeError(e.loc, "call to undeclared closure '%s'" % e.name)
+        ft = K.deref(v[0])
+        if not isinstance(ft, K.FnT):
+            raise KernelTypeError(e.loc, "call of '%s', which is not a closure" % e.name)
+        return _call_type(e, e.name, (ft.params, ft.ret), e.args, scope, sigs)
     if isinstance(e, K.ResidualExpr):
         raise KernelTypeError(e.loc, "residual: " + e.reason)
     raise KernelTypeError(None, "not an expression: %r" % (e,))
@@ -719,8 +853,12 @@ def _nc_binary(e, a, b):
 def value_type(e, scope, sigs):
     """type_of, additionally rejecting unit-typed calls and bare strings."""
     t = type_of(e, scope, sigs)
+    if t == K.UNIT and isinstance(e, K.ClosureCall):
+        raise KernelTypeError(e.loc, "call to void closure '%s' used as a value" % e.name)
     if t == K.UNIT:
         raise KernelTypeError(e.loc, "call to void function '%s' used as a value" % getattr(e, "name", "?"))
+    if isinstance(t, K.FnT):
+        raise KernelTypeError(e.loc, CLOSURE_VALUE % getattr(e, "name", "?"))
     if isinstance(e, K.StructLit) or K.has_struct(t):
         _struct_known(t, e, sigs)
     if t == K.STR:
@@ -765,6 +903,8 @@ def _check_value_subexprs(e, scope, sigs):
             raise KernelTypeError(n.loc, "call to void function '%s' used as a value" % n.name)
         if isinstance(n, K.MethodCall) and type_of(n, scope, sigs) == K.UNIT:
             raise KernelTypeError(n.loc, "call to void function '%s' used as a value" % n.name)
+        if isinstance(n, K.ClosureCall) and type_of(n, scope, sigs) == K.UNIT:
+            raise KernelTypeError(n.loc, "call to void closure '%s' used as a value" % n.name)
 
 
 def definitely_returns(s):
@@ -828,9 +968,22 @@ def method_sigs(n, sigs):
             if recv_of(sigs).get(pth) in ("ref", "mut") and pth.rsplit("::", 1)[1] == n.name]
 
 
-def assigned_names(block, sigs=None):
+def closure_effects(sigs):
+    """FR-252: closure name -> the ENCLOSING variables a call of it may
+    modify (its by-reference captures it mutates), for the function being
+    checked (set by the checker; empty elsewhere)."""
+    return getattr(sigs, "closure_muts", None) or {}
+
+
+def assigned_names(block, sigs=None, skip=None):
     out = set()
+    cm = closure_effects(sigs)
     for n in K.walk(block):
+        if isinstance(n, (K.ClosureCall, K.Var)) and n.name in cm and n.name != skip:
+            # FR-252: calling a closure (or passing it to a callable
+            # parameter) runs its body: what it modifies through a
+            # by-reference capture is modified HERE
+            out |= cm[n.name]
         if isinstance(n, (K.Assign, K.CompoundAssign)):
             out.add(n.name)
         elif isinstance(n, K.IncDec) and isinstance(n.var, K.Var):
@@ -854,10 +1007,11 @@ def _method_mut_ref_args(n, sigs):
     return out
 
 
-def mutated_bases(block, sigs):
+def mutated_bases(block, sigs, skip=None):
     """Variables a block may MUTATE: assigned, stored into, pushed to,
-    passed by `T&`, or iterated mutably -- the range-for alias check."""
-    out = assigned_names(block, sigs)
+    passed by `T&`, or iterated mutably -- the range-for alias check.
+    FR-252: or modified by a call of a closure (``skip``: except that one)."""
+    out = assigned_names(block, sigs, skip)
     for n in K.walk(block):
         if isinstance(n, (K.Store, K.CompoundStore) + K.MUTATING_STMTS):
             b = base_var(n.target)
@@ -890,6 +1044,9 @@ def resizes(block, sigs, bound):
         return True
     if P[0] in assigned_names(block, None):
         return True
+    cm = closure_effects(sigs)
+    if any(isinstance(n, (K.ClosureCall, K.Var)) and P[0] in cm.get(n.name, ()) for n in K.walk(block)):
+        return True  # FR-252: a call of a closure that modifies the bound's root
     targets = []
     for n in K.walk(block):
         if isinstance(n, (K.Store, K.CompoundStore) + K.MUTATING_STMTS):
@@ -990,6 +1147,12 @@ class _Checker:
         self.struct_leaves = {sd.name for sd in program.structs()}
         self.cur = None  # FR-257: the function being checked
         self.ctor_lit = None
+        # FR-252
+        self.capture_moves = set()  # ids of the synthetic Vars of by-copy captures of non-Copy values
+        self.cap_vars = {}  # id(Closure) -> (Closure, [Var per capture])
+        self.mut_closures = set()  # closures bound `let mut` (FnMut, or passed to an `F&` parameter)
+        self.fnmut = set()  # closures that modify state (FnMut)
+        self.in_closure = None  # the Closure whose body is being checked
 
     def err(self, loc, msg):
         self.errors.append((loc, msg))
@@ -1130,6 +1293,9 @@ class _Checker:
                 self.err(e.lhs.loc, "string literal outside a printf %s argument")
         elif isinstance(e, K.Call):
             self.call_args(e, scope)
+        elif isinstance(e, K.ClosureCall):
+            for a in e.args:
+                self.wf(a, scope, "value")
         elif isinstance(e, K.Field):
             self.wf(e.base, scope, "borrow")
         elif isinstance(e, K.StructLit):
@@ -1239,6 +1405,23 @@ class _Checker:
             if isinstance(pt, K.RefT):
                 inner = a.operand if isinstance(a, K.Borrow) else a
                 L = getattr(inner, "loc", None) or e.loc
+                if isinstance(pt.inner, K.FnT):
+                    # FR-252: a callable argument is a closure variable or a
+                    # callable parameter passed on with the same constness
+                    cv = scope.lookup(inner.name) if isinstance(inner, K.Var) else None
+                    if cv is None or not isinstance(K.deref(cv[0]), K.FnT):
+                        self.err(L, "unsupported: argument %d of '%s' is a callable other than a closure variable"
+                                 % (i + 1, e_name))
+                        continue
+                    if isinstance(cv[0], K.RefT) and cv[0].mutable != pt.mutable:
+                        self.err(L, "unsupported: callable parameter '%s' passed on as a%s callable parameter"
+                                 % (inner.name, " mutable" if pt.mutable else " const"))
+                        continue
+                    if not pt.mutable and inner.name in self.fnmut:
+                        self.err(L, "unsupported: closure '%s' modifies state but is passed to a `const F&` "
+                                    "parameter of '%s' (Rust's `&impl Fn` cannot call it; normalizer: take it as `F&`)"
+                                 % (inner.name, e_name))
+                        continue
                 if pt.mutable and not is_place(inner):
                     self.err(L, "unsupported: argument %d of '%s' binds a non-const reference to something "
                                 "other than a variable or element" % (i + 1, e_name))
@@ -1462,7 +1645,45 @@ class _Checker:
                 self.err(f.loc, "member function '%s' outside its struct" % f.path)
             self.func(f)
         self.check_structs(structs, ns_names, {f.path for f in funcs})
+        self.check_instantiated(funcs)
         return self.errors
+
+    def check_instantiated(self, funcs):
+        """FR-252: C++ types a callable parameter only through its
+        template's INSTANTIATIONS, so a function with one must be called
+        with a closure -- directly, or by a function that is, passing its
+        own callable parameter on.  Rust compiles an uncalled generic
+        function; its C++ template would have no signature to import."""
+        callable = {f.path for f in funcs if any(isinstance(p.ty, K.RefT) and isinstance(p.ty.inner, K.FnT)
+                                                 for p in f.params)}
+        if not callable:
+            return
+        edges = collections.defaultdict(set)  # g -> functions g passes its callable parameter to
+        done = set()
+        for f in self.program.all_funcs():
+            own = {p.name for p in f.params if isinstance(p.ty, K.RefT) and isinstance(p.ty.inner, K.FnT)}
+            for n in K.walk(f.body):
+                if isinstance(n, K.Call) and n.name in callable:
+                    for pt, a in zip(self.sigs[n.name][0], n.args):
+                        a = a.operand if isinstance(a, K.Borrow) else a
+                        if not (isinstance(pt, K.RefT) and isinstance(pt.inner, K.FnT) and isinstance(a, K.Var)):
+                            continue
+                        if a.name in own:
+                            edges[f.path].add(n.name)
+                        else:
+                            done.add(n.name)  # a closure local
+        todo = list(done)
+        while todo:
+            g = todo.pop()
+            for h in edges.get(g, ()):
+                if h not in done:
+                    done.add(h)
+                    todo.append(h)
+        for f in funcs:
+            if f.path in callable and f.path not in done:
+                self.err(f.loc, "unsupported: function '%s' with a callable parameter is never called with a "
+                                "closure (its C++ template would never be instantiated, and is typed only by "
+                                "its instantiations)" % f.path)
 
     # ---------------------------------------------------- FR-257 structs
     def check_structs(self, structs, ns_names, free_paths):
@@ -1539,6 +1760,9 @@ class _Checker:
                 stack.extend(direct(by[x]))
 
     def type_ok(self, t, loc=None, ref_ok=False, ptr_ok=False):
+        if isinstance(t, K.RefT) and isinstance(t.inner, K.FnT):
+            # FR-252: a callable parameter `const F& f` / `F& f`
+            return ref_ok and fn_sig_ok(t.inner)
         if isinstance(t, K.RefT):
             return ref_ok and self.type_ok(t.inner, loc)
         if isinstance(t, K.PtrT):
@@ -1596,6 +1820,7 @@ class _Checker:
         self.borrow_ok = set()
         self.ns = f.ns
         self.cur = f
+        self.closure_table(f)
         for n in K.walk(f.body):
             if isinstance(n, K.Call):
                 self.check_visibility(n)
@@ -1614,7 +1839,7 @@ class _Checker:
                 self.err(f.loc, "main with parameters")
             if f.ret != K.UNIT:
                 self.err(f.loc, "main must return unit")
-            if any(isinstance(n, K.Return) for n in K.walk(f.body)):
+            if any(isinstance(n, K.Return) for n in own_nodes(f.body)):
                 self.err(f.loc, "main may not contain return")
         scope = Scope()
         if f.recv in ("ref", "mut"):
@@ -1632,6 +1857,19 @@ class _Checker:
                 # only the returned literal itself is the member-initializer
                 # list; a nested `S{..}` would call the constructor in C++
                 self.ctor_lit = st[-1].value
+        callables = [p for p in f.params if isinstance(p.ty, K.RefT) and isinstance(p.ty.inner, K.FnT)]
+        if callables:
+            # FR-252: C++ spells it `template <typename F> R g(const F& f, ..)`
+            if len(callables) > 1:
+                self.err(f.loc, "unsupported: function '%s' with more than one callable parameter (the subset's "
+                                "template has the one type parameter F)" % f.path)
+            if f.owner:
+                self.err(f.loc, "unsupported: member function '%s' with a callable parameter (a member function "
+                                "template)" % f.path)
+            if "F" in self.struct_leaves or any(n == "F" for n in [p.name for p in f.params]
+                                                 + list(declared_names(f.body))):
+                self.err(f.loc, "unsupported: function '%s' with a callable parameter uses the name 'F' (its "
+                                "template parameter)" % f.path)
         for p in f.params:
             self.ident(p.name, p.loc)
             if not self.type_ok(p.ty, p.loc, ref_ok=True, ptr_ok=True):
@@ -1647,6 +1885,166 @@ class _Checker:
             self.err(f.loc, "function '%s' may reach its end without returning a value" % f.path)
         self.check_moves(f)
         self.check_ptr_scopes(f)
+        self.check_closure_scopes(f.body)
+
+    # ---------------------------------------------------- FR-252 closures
+    def closure_table(self, f):
+        """Per function: what each closure modifies through a by-reference
+        capture (the effect of calling it, ``closure_effects``), which
+        closures modify state (FnMut), and which are bound `let mut`."""
+        self.sigs.closure_muts = {}
+        cm, self.fnmut, self.mut_closures = closure_info(f.body, self.sigs)
+        self.sigs.closure_muts = cm
+
+    def capture_vars(self, s):
+        """One synthetic Var per capture of closure ``s`` (stable ids: the
+        move rule tracks nodes by identity), located at the closure."""
+        hit = self.cap_vars.get(id(s))
+        if hit is None or hit[0] is not s:
+            hit = (s, [K.Var(c, s.loc) for c in K.closure_captures(s)])
+            self.cap_vars[id(s)] = hit
+        return hit[1]
+
+    def exprs_of(self, s):
+        """stmt_exprs, plus FR-252: a closure statement USES its captures."""
+        if isinstance(s, K.Closure):
+            return self.capture_vars(s)
+        return stmt_exprs(s)
+
+    def closure(self, s, scope):
+        """FR-252: `auto f = [caps](params) -> R { body };` <=> `let f =
+        move |params| -> R { body };`."""
+        self.ident(s.name, s.loc)
+        if s.name in scope.vars:
+            self.err(s.loc, "redeclaration of '%s' in the same scope" % s.name)
+        if self.in_closure is not None:
+            self.err(s.loc, "unsupported: closure '%s' defined inside closure '%s' (nested closures are not in "
+                            "the subset)" % (s.name, self.in_closure.name))
+        caps = K.closure_captures(s)
+        for c in caps:
+            v = scope.lookup(c)
+            if v is None:
+                continue  # reported when the body is typed
+            ty = v[0]
+            if c == "self":
+                self.err(s.loc, "unsupported: closure '%s' captures `this` / `self`" % s.name)
+            elif isinstance(K.deref(ty), K.FnT):
+                self.err(s.loc, "unsupported: closure '%s' uses the callable '%s' (a closure is not captured by "
+                                "another closure in the subset)" % (s.name, c))
+            elif isinstance(ty, K.PtrT):
+                self.err(s.loc, "unsupported: closure '%s' captures the pointer '%s'" % (s.name, c))
+            elif isinstance(ty, K.RefT) and s.move:
+                self.err(s.loc, "unsupported: closure '%s' captures the reference '%s' by copy (C++ copies the "
+                                "referent, a Rust `move` closure the reference)" % (s.name, c))
+        own = {p.name for p in s.params} | declared_names(s.body)
+        for nm in sorted(own):
+            if scope.lookup(nm) is not None:
+                self.err(s.loc, "unsupported: closure '%s' declares '%s', which names a variable of the enclosing "
+                                "scope (a capture and a local must not share a name)" % (s.name, nm))
+        if not (s.ret in K.ALL_PRIMS or s.ret == K.UNIT):
+            self.err(s.loc, "unsupported: closure '%s' returning %s (the subset's closures return a scalar or "
+                            "nothing)" % (s.name, s.ret))
+        inner = scope.child()
+        seen = set()
+        for p in s.params:
+            self.ident(p.name, p.loc)
+            if p.ty not in K.ALL_PRIMS:
+                self.err(p.loc or s.loc, "unsupported: closure parameter '%s' of type %s (the subset's closures "
+                                         "take scalars)" % (p.name, p.ty))
+            if p.name in seen:
+                self.err(p.loc or s.loc, "duplicate parameter '%s'" % p.name)
+            seen.add(p.name)
+            inner.declare(p.name, p.ty, p.mutable)
+        saved = (self.ret, self.moves, self.in_closure)
+        self.ret, self.moves, self.in_closure = s.ret, [], s
+        try:
+            self.block(s.body, inner, loop=False, same_scope=True)
+            if s.ret != K.UNIT and not definitely_returns(s.body):
+                self.err(s.loc, "closure '%s' may reach its end without returning a value" % s.name)
+            pseudo = K.Func(s.name, s.params, s.ret, s.body, s.loc)
+            capset = set(caps)
+            own_moves = []
+            for v in self.moves:
+                if v.name in capset:
+                    self.err(v.loc or s.loc, "unsupported: closure '%s' moves its capture '%s' out (Rust makes "
+                                             "it FnOnce: callable once)" % (s.name, v.name))
+                else:
+                    own_moves.append(v)
+            self.moves = own_moves
+            self.check_moves(pseudo)
+            self.check_ptr_scopes(pseudo)
+        finally:
+            self.ret, self.moves, self.in_closure = saved
+        muts = mutated_bases(s.body, self.sigs) & set(caps)
+        for c in sorted(muts):
+            v = scope.lookup(c)
+            if v is None:
+                continue
+            ty, m = v
+            if isinstance(ty, K.RefT):
+                m = ty.mutable
+            if not m:
+                self.err(s.loc, "unsupported: closure '%s' modifies its capture of immutable '%s'" % (s.name, c))
+        if s.move:
+            for v in self.capture_vars(s):
+                d = scope.lookup(v.name)
+                if d is not None and K.is_owned_nc(d[0]):
+                    # C++ copies it into the closure, Rust moves it: equal
+                    # only when nothing mentions it afterwards (check_moves)
+                    self.moves.append(v)
+                    self.capture_moves.add(id(v))
+        if self.surface == "rust":
+            want = "let mut" if s.name in self.mut_closures else "let"
+            if s.spelling and s.spelling != want:
+                self.err(s.loc, "unsupported: closure '%s' is not spelled the canonical way (`%s %s = ..`: `let "
+                                "mut` exactly when it modifies state or is passed as `&mut impl FnMut`)"
+                         % (s.name, want, s.name))
+        scope.declare(s.name, K.FnT(tuple(p.ty for p in s.params), s.ret), s.name in self.mut_closures)
+
+    def check_closure_scopes(self, body):
+        """FR-252 alias discipline (modelled on FR-261's R2): a BY-REFERENCE
+        closure borrows each capture from its creation to its LAST CALL
+        (Rust's NLL).  In between, a capture it MODIFIES is not mentioned at
+        all (E0499 / E0502 / E0503 / E0506 in Rust), and a capture it only
+        reads is neither modified nor moved (E0502 / E0505 / E0506).  The
+        last call's own statement is inside the range."""
+        moved = {id(v) for v in self.moves}
+
+        def visit(block):
+            for i, s in enumerate(block.stmts):
+                if isinstance(s, K.Closure) and not s.move:
+                    self.closure_live(s, block.stmts[i + 1:], moved)
+                for b in child_blocks(s):
+                    visit(b)
+
+        visit(body)
+
+    def closure_live(self, c, rest, moved):
+        caps = K.closure_captures(c)
+        if not caps:
+            return
+        last = -1
+        for k, s in enumerate(rest):
+            if any(isinstance(n, (K.ClosureCall, K.Var)) and n.name == c.name for n in K.walk(s)):
+                last = k
+        muts = self.sigs.closure_muts.get(c.name, set()) & set(caps)
+        for s in rest[:last + 1]:
+            blk = K.Block((s,))
+            mb = mutated_bases(blk, self.sigs, skip=c.name)
+            for x in caps:
+                if x in muts:
+                    hit = [n for n in K.walk(s) if isinstance(n, K.Var) and n.name == x]
+                    if hit or x in mb:
+                        self.err((hit[0].loc if hit else None) or s.loc,
+                                 "unsupported: '%s' is used while closure '%s', which modifies it through a "
+                                 "by-reference capture, is still called later (a second borrow in Rust)"
+                                 % (x, c.name))
+                        return
+                elif x in mb or any(isinstance(n, K.Var) and n.name == x and id(n) in moved for n in K.walk(s)):
+                    self.err(s.loc, "unsupported: '%s' is modified or moved while closure '%s', which captures it "
+                                    "by reference, is still called later (a borrow conflict in Rust)"
+                             % (x, c.name))
+                    return
 
     # ---------------------------------------------------- FR-261 R2
     def check_ptr_scopes(self, f):
@@ -1747,7 +2145,7 @@ class _Checker:
 
         def visit(block, loops):
             for s in block.stmts:
-                exprs = stmt_exprs(s)
+                exprs = self.exprs_of(s)
                 inner_loops = loops
                 if isinstance(s, K.While):
                     inner_loops = loops + (s,)
@@ -1786,7 +2184,17 @@ class _Checker:
                                                   for m in K.walk(x))
                     dl = decl_loops.get(name, ())
                     in_loop = len(loops) > len(dl) and not is_return
-                    if same > 1 or later:
+                    if id(n) in self.capture_moves and (same > 1 or later):
+                        reported.add(id(n))
+                        self.err(n.loc, "unsupported: '%s' is used after closure '%s' captures it by copy (C++ "
+                                        "copies it, Rust moves it into the closure: the subset requires no later "
+                                        "mention of '%s')" % (name, s.name, name))
+                    elif id(n) in self.capture_moves and in_loop:
+                        reported.add(id(n))
+                        self.err(n.loc, "unsupported: closure '%s' captures '%s' by copy inside a loop '%s' was "
+                                        "declared outside of (Rust moves it on the first iteration)"
+                                 % (s.name, name, name))
+                    elif same > 1 or later:
                         reported.add(id(n))
                         self.err(n.loc, "unsupported: '%s' is used after it is moved (std::move(%s) <=> %s "
                                         "requires no later mention of %s)" % (name, name, name, name))
@@ -1815,9 +2223,27 @@ class _Checker:
         """A variable a call may modify (passed by `T&`) is not mentioned
         anywhere else in the statement: C++ leaves the order of `bump(k) + k`
         unspecified, Rust fixes it left to right."""
+        if isinstance(s, K.Closure):
+            return
         exprs = stmt_exprs(s)
         if not exprs:
             return
+        # FR-252: a closure that modifies state, called (or passed) twice in
+        # one statement: `cnt() * 10 + cnt()` has no defined order in C++
+        names = set()
+        for n in (n for e in exprs for n in K.walk(e)):
+            nm = n.name if isinstance(n, (K.ClosureCall, K.Var)) else None
+            cv = self.scope_now.lookup(nm) if nm is not None else None
+            if nm in self.mut_closures or (cv is not None and isinstance(cv[0], K.RefT)
+                                           and isinstance(cv[0].inner, K.FnT) and cv[0].mutable):
+                names.add(nm)
+        for nm in sorted(names):
+            hit = unsequenced_uses(exprs, nm)
+            if hit is not None:
+                self.err(hit.loc or s.loc, "unsupported: closure '%s', which modifies state, is called twice "
+                                           "in one statement without a sequence point between the calls (C++ "
+                                           "leaves the order unspecified)" % nm)
+                return
         for n in (n for e in exprs for n in K.walk(e) if isinstance(n, K.IncDec)):
             # FR-259: `i++ + i` is unsequenced (undefined) in C++, `f(i++, i)`
             # unspecified, `x = x++` defined only since C++17 -- Rust fixes
@@ -1997,7 +2423,7 @@ class _Checker:
             self.expr(s.value, scope, K.I8)
             self.elem_arg_alias(s, [s.value])
         elif isinstance(s, K.ExprStmt):
-            if not isinstance(s.expr, (K.Call, K.MethodCall)):
+            if not isinstance(s.expr, (K.Call, K.MethodCall, K.ClosureCall)):
                 self.err(s.loc, "expression statement that is not a call")
                 return
             if isinstance(s.expr, K.Call) and recv_of(sigs).get(s.expr.name) == "ctor":
@@ -2007,7 +2433,8 @@ class _Checker:
             try:
                 type_of(s.expr, scope, sigs)
                 for a in s.expr.args:
-                    value_type(a, scope, sigs)
+                    if not isinstance(type_of(a, scope, sigs), K.FnT):  # (FR-252: a callable argument)
+                        value_type(a, scope, sigs)
             except KernelTypeError as ex:
                 self.err(ex.loc or s.loc, ex.msg)
                 return
@@ -2076,6 +2503,8 @@ class _Checker:
                     self.err(s.loc, "return with a value in a void function")
                 else:
                     self.expr(s.value, scope, self.ret, self.consume_pos(self.ret))
+        elif isinstance(s, K.Closure):
+            self.closure(s, scope)
         elif isinstance(s, K.ResidualStmt):
             pass
         else:
@@ -2288,6 +2717,11 @@ class _Normalizer:
             ptys = sig[0] if sig and len(sig[0]) == len(e.args) else (None,) * len(e.args)
             return K.Call(e.name, tuple(self.expr(a, scope, None if pt is None else K.deref(pt))
                                         for pt, a in zip(ptys, e.args)), e.loc)
+        if isinstance(e, K.ClosureCall):
+            v = scope.lookup(e.name)
+            ft = K.deref(v[0]) if v else None
+            ptys = ft.params if isinstance(ft, K.FnT) and len(ft.params) == len(e.args) else (None,) * len(e.args)
+            return K.ClosureCall(e.name, tuple(self.expr(a, scope, pt) for pt, a in zip(ptys, e.args)), e.loc)
         if isinstance(e, K.Clone):
             return K.Clone(self.expr(e.operand, scope), e.loc)
         if isinstance(e, K.Index):
@@ -2379,6 +2813,21 @@ class _Normalizer:
     def stmt(self, s, scope):
         if isinstance(s, K.Block):
             return self.block(s, scope)
+        if isinstance(s, K.Closure):
+            inner = scope.child()
+            for p in s.params:
+                inner.declare(p.name, p.ty, p.mutable)
+            saved, self.ret = self.ret, s.ret
+            try:
+                body = self.block(s.body, inner, same=True)
+            finally:
+                self.ret = saved
+            out = K.Closure(s.name, s.move, s.params, s.ret, body, s.loc, s.spelling)
+            if s.move and not K.closure_captures(out) and not self.keep:
+                # N24: with nothing captured, `move` (C++ `[]` either way) says nothing
+                out = K.Closure(s.name, False, s.params, s.ret, body, s.loc, s.spelling)
+            scope.declare(s.name, K.FnT(tuple(p.ty for p in s.params), s.ret), False)
+            return out
         if isinstance(s, K.Let):
             init = self.expr(s.init, scope, s.ty)
             scope.declare(s.name, s.ty, s.mutable)

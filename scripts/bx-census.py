@@ -262,6 +262,31 @@ RULES = [
     (r"^(struct name: |struct '.*' has the name of|variable '.*' has the name of a struct"
      r"|data member '.*' has the name of a struct|member function '.*' has the name of a struct)",
      "struct: name clash", None),
+    # FR-252 closures
+    (r"^default capture `", "closure: default capture (normalizer)", None),
+    (r"^mixed by-copy and by-reference captures", "closure: mixed captures (normalizer)", None),
+    (r"^init-capture `", "closure: init-capture (normalizer)", None),
+    (r"^(capture of `this`|capture pack|closure '.*' captures `(this|self)`)", "closure: captures this/pack", None),
+    (r"^(generic lambda|function template instantiated with a generic lambda)", "closure: generic lambda", None),
+    (r"^(lambda inside a lambda body|closure '.*' defined inside closure)", "closure: nested", None),
+    (r"^(copy of a closure|closure '.*' used other than by calling it)", "closure: copied or used as a value", None),
+    (r"^(closure returning|closure '.*' returning|closure parameter|unnamed closure parameter|closure body that is not a block)",
+     "closure: signature outside the subset", "generic"),
+    (r"^'.*' is (used|modified or moved) while closure '.*', which (modifies it through a by-reference capture|captures it by reference)",
+     "closure: by-reference capture borrow conflict", None),
+    (r"^('.*' is used after closure '.*' captures it by copy|closure '.*' captures '.*' by copy inside a loop)",
+     "closure: by-copy capture then use (Rust move)", None),
+    (r"^closure '.*', which modifies state, is called twice in one statement", "closure: unsequenced double call", None),
+    (r"^closure '.*' (captures the pointer|captures the reference|uses the callable)", "closure: capture of a pointer/reference/callable", "generic"),
+    (r"^closure '.*' declares '.*', which names a variable of the enclosing scope", "closure: capture shadowed by a local", None),
+    (r"^closure '.*' moves its capture", "closure: moves its capture out (FnOnce)", None),
+    (r"^function template", "function template", "generic"),
+    (r"^(callable parameter|parameter of type '.*' in a function template|argument \d+ of '.*' is a callable"
+     r"|closure '.*' modifies state but is passed to a|function '.*' with (more than one callable parameter|a callable parameter)"
+     r"|member function '.*' with a callable parameter|`&(mut )?impl Fn)", "closure: callable parameter form", "generic"),
+    (r"^(closure '.*' (is not spelled the canonical way|may reach its end|modifies its capture of immutable)"
+     r"|call to void closure|call of a callable object other than)", "closure: form", "generic"),
+    (r"^the body of a range-for over '.*' modifies", "range-for: body modifies its container", None),
     (r"^identifier '.*' is reserved by the canonical Rust spelling", "identifier: reserved by canonical spelling", None),
     (r"^struct '.*' contains itself by value", "struct: contains itself", None),
     (r"^member access through a pointer$", "member access through a pointer", None),
@@ -286,7 +311,6 @@ RULES = [
     # FR-259 cheap syntax
     (r"^conditional operator `\?:` of type '(.*)' \(", "?: of non-scalar type", "type"),
     (r"^conditional operator `\?:` used as an lvalue$", "?: used as an lvalue", None),
-    (r"^auto-typed declaration of a lambda$", "auto: lambda", None),
     (r"^increment/decrement of '.*' used as a value in a statement that also uses", "incdec: unsequenced", None),
     (r"^unsigned compound assignment to an element whose index increments", "incdec: index double evaluation", None),
     (r"^increment/decrement of (.*) used as a value$", "incdec: non-integer target", "generic"),
