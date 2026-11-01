@@ -625,7 +625,10 @@ def analyze(job):
         rec["detail"] = "AST walk: %r" % ex
         return rec
     try:
-        b = subprocess.run([sys.executable, bx, "--emit=kernel", path],
+        # BX_EXTRA_ARGS (e.g. "--normalize", set by bx-frontier --bx-arg) is inherited
+        # by pool workers like CPLUS_INCLUDE_PATH; empty means the plain subset.
+        extra = os.environ.get("BX_EXTRA_ARGS", "").split()
+        b = subprocess.run([sys.executable, bx, "--emit=kernel"] + extra + [path],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     except subprocess.TimeoutExpired:
         rec["status"] = "TIMEOUT"

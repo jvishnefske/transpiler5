@@ -237,3 +237,22 @@ URL: https://github.com/DARPA-TRACTOR-Program/Reports/blob/main/First_TRACTOR_Ev
   oracle, not one.
 - **Not actionable by the build loop:** criteria 2 and 4 (buyer interviews, a design partner).
   These are the user's to run. Nothing measured here substitutes for them.
+
+### 2026-11-01 ~16:30 CST -- FR-253 landed; suites say +0; normalizer is the remaining lever
+
+- **Landed.** FR-253 (cf39265): `<algorithm>`/`<numeric>` over whole vectors, both
+  directions, zero `unsafe`, comparator sort as an exact libstdc++ introsort port. With
+  FR-252 this closes the four areas of the original request (closures, algorithm, vector,
+  string) at the Kernel level.
+- **Measured, +0.** Side-by-side through ledger_runner with private manifests: Cpp17Suite
+  bx 6/35 vs emitrust-cc 35/35; CppStdSuite bx 4/65 vs 11. Both bx sets are strict subsets
+  of emitrust-cc's, and bx miscompiled 0. FR-254's pre-spike had already refuted "a small
+  rule set" on woff2/brunsli (≤15 functions, ~7 honest).
+- **Reading.** Breadth by more Kernel rows has stopped paying on every corpus measured.
+  What bx has that emitrust-cc does not is the both-direction, two-compiler, zero-miscompile
+  guarantee over its subset. That supports the verifier positioning (criterion 3), not the
+  coverage one (criterion 1).
+- **Decision.** Build FR-254's first rules (`for`→`while`, do-while) with their double
+  validation, behind an opt-in `--normalize`. The purpose is to make the search seam real
+  and measurable on the frontier (`bx-frontier --bx-arg=--normalize`), not to chase
+  criterion 1. If the measured gain is ≤ the halved estimate, stop adding rules and record it.

@@ -349,7 +349,8 @@ def render_md(data, top):
     out = []
     w = out.append
     m = data["meta"]
-    w("# emitrust-bx function frontier -- %s (bx %s)" % (m["date"], m["bx_rev"]))
+    w("# emitrust-bx function frontier -- %s (bx %s%s)" % (m["date"], m["bx_rev"],
+      "".join(" " + a for a in m.get("bx_args", []))))
     w("")
     w("Stage reported: **EMIT** only. VERIFY column is empty by design (no per-function "
       "differential harness yet). Never compare these numbers to a whole-program, "
@@ -416,10 +417,13 @@ def main(argv=None):
     ap.add_argument("--cover-steps", type=int, default=40)
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--probe-erase-namespaces", action="store_true")
+    ap.add_argument("--bx-arg", action="append", default=[],
+                    help="extra emitrust-bx argument, e.g. --bx-arg=--normalize (repeatable; recorded in the JSON)")
     ap.add_argument("--keep-records", action="store_true", help="embed raw census records in the JSON")
     ap.add_argument("--date", default=datetime.date.today().isoformat())
     args = ap.parse_args(argv)
     args.bx = os.path.abspath(args.bx)
+    os.environ["BX_EXTRA_ARGS"] = " ".join(args.bx_arg)
     args.out = os.path.abspath(args.out)
     src = os.path.abspath(args.src)
     os.makedirs(args.out, exist_ok=True)
@@ -431,7 +435,7 @@ def main(argv=None):
     check_pins(man, src)
     data = {
         "meta": {
-            "fr": "FR-258", "date": args.date, "bx_rev": args.bx_rev,
+            "fr": "FR-258", "date": args.date, "bx_rev": args.bx_rev, "bx_args": args.bx_arg,
             "manifest": os.path.relpath(os.path.abspath(args.manifest), REPO),
             "clang": subprocess.run([args.clang, "--version"], stdout=subprocess.PIPE,
                                     text=True).stdout.splitlines()[0],
@@ -455,7 +459,7 @@ def main(argv=None):
         data["probe"]["label"] = ("EXPOSURE PROBE, NOT A FRONTIER: the project's own namespaces were "
                                   "textually erased in a copy; numbers show what bx sees behind the "
                                   "namespace wall and are still LOWER-bound blocker sets")
-    name = "frontier-%s-%s" % (args.date, args.bx_rev)
+    name = "frontier-%s-%s%s" % (args.date, args.bx_rev, "-normalize" if "--normalize" in args.bx_arg else "")
     with open(os.path.join(args.out, name + ".json"), "w") as fh:
         json.dump(data, fh, indent=1, sort_keys=False)
     md = render_md(data, args.top)
