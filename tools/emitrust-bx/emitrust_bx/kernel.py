@@ -50,6 +50,14 @@ Design rules:
   expression ``ClosureCall`` (`f(a)`), and the type ``FnT`` (a closure's
   scalar signature; behind a ``RefT`` it is a callable PARAMETER: `const F&`
   <=> `&impl Fn`, `F&` <=> `&mut impl FnMut`).
+* FR-253 adds the <algorithm>/<numeric> rows over WHOLE containers (`v.begin(),
+  v.end()`; free iterators stay outside the Kernel): the expression ``Alg``
+  (a read-only pass that yields a value: contains, count, count_if, any_of,
+  all_of, accumulate, max_element, min_element), the statement ``AlgStmt``
+  (sort, stable_sort, reverse, fill, sort_by, for_each, transform,
+  extend_map) and ``MinMax`` (`std::max(a, b)` <=> `std::cmp::max(a, b)` on
+  integers).  A callable argument is always a LOCAL closure variable
+  (``Var``): the algorithm call IS a call of the closure for every analysis.
 """
 
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -631,10 +639,49 @@ class ClosureCall:
     loc: Optional[Loc] = _loc()
 
 
+# ---------------------------------------------------------------- FR-253 exprs
+
+# Alg ops (read-only passes over ``src``, a vector PLACE):
+#   contains     (x)        `std::find(b, e, x) != v.end()` <=> `v.contains(&x)`        bool
+#   count        (x)        `std::count(b, e, x)` <=> `bx::count(&v, &x)`              i64
+#   count_if     (p)        `std::count_if(b, e, p)` <=> `bx::count_if(&v, &p)`        i64
+#   any_of       (p)        `std::any_of(b, e, p)` <=> `v.iter().copied().any(&p)`     bool
+#   all_of       (p)        `std::all_of(b, e, p)` <=> `v.iter().copied().all(&p)`     bool
+#   accumulate   (init)     `std::accumulate(b, e, init)` <=> `v.iter().fold(init, |a, &e| a + e)`
+#   accumulate   (init, f)  `std::accumulate(b, e, init, f)` <=> `v.iter().copied().fold(init, &f)`
+#   max_element  ()         `*std::max_element(b, e)` <=> `*v.iter().max().unwrap()`
+#   min_element  ()         `*std::min_element(b, e)` <=> `*v.iter().min().unwrap()`
+# `std::none_of` is Unary('not', any_of) and `std::find(..) == v.end()` is
+# Unary('not', contains) (normal forms N25/N26: one Kernel term each).
+ALG_OPS = ("contains", "count", "count_if", "any_of", "all_of", "accumulate", "max_element", "min_element")
+
+
+@dataclass(frozen=True)
+class Alg:
+    op: str
+    src: "Expr"
+    args: Tuple["Expr", ...]
+    loc: Optional[Loc] = _loc()
+    # Rust input only: the written fold closure of accumulate (wrapping?, cast type or '')
+    spelling: tuple = field(default=(), compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class MinMax:
+    """`std::max(a, b)` / `std::min(a, b)` <=> `std::cmp::max(a, b)` /
+    `std::cmp::min(a, b)` on two integers of ONE type (equal integers are
+    indistinguishable, so which one is returned cannot be observed)."""
+
+    op: str  # 'max' | 'min'
+    lhs: "Expr"
+    rhs: "Expr"
+    loc: Optional[Loc] = _loc()
+
+
 Expr = Union[IntLit, FloatLit, BoolLit, StrLit, Var, Unary, Binary, Cast, Call,
              ResidualExpr, Clone, Index, ByteAt, Len, IsEmpty, VecLit, VecFill,
              StrNew, StrFrom, Substr, ToStr, Field, StructLit, MethodCall, Offset, AddrOf,
-             Cond, IncDec, ClosureCall]
+             Cond, IncDec, ClosureCall, Alg, MinMax]
 
 
 # ---------------------------------------------------------------- printf
@@ -883,9 +930,35 @@ class Closure:
     spelling: str = field(default="", compare=False, repr=False)
 
 
+# AlgStmt ops (FR-253):
+#   sort        target          `std::sort(b, e);` <=> `v.sort_unstable();`
+#   stable_sort target          `std::stable_sort(b, e);` <=> `v.sort();`
+#   reverse     target          `std::reverse(b, e);` <=> `v.reverse();`
+#   fill        target (x)      `std::fill(b, e, x);` <=> `v.fill(x);`
+#   sort_by     target (cmp)    `std::sort(b, e, cmp);` <=> `bx::sort_by_less(&mut v, &cmp);`
+#   transform   target (f)      `std::transform(b, e, b, f);` <=> `bx::transform(&mut v, &f);`
+#   for_each    src (f)         `std::for_each(b, e, f);` <=> `v.iter().copied().for_each(&f);`
+#   extend_map  target src (f)  `std::transform(b, e, std::back_inserter(w), f);` <=>
+#                               `w.extend(v.iter().copied().map(&f));`
+ALG_STMT_OPS = ("sort", "stable_sort", "reverse", "fill", "sort_by", "transform", "for_each", "extend_map")
+
+
+@dataclass(frozen=True)
+class AlgStmt:
+    """FR-253: an algorithm evaluated for its effect.  ``target`` is the
+    vector place it modifies (None for for_each), ``src`` the one it only
+    reads (extend_map, for_each; else None)."""
+
+    op: str
+    target: Optional["Expr"]
+    src: Optional["Expr"]
+    args: Tuple["Expr", ...]
+    loc: Optional[Loc] = _loc()
+
+
 Stmt = Union[Block, Let, Assign, CompoundAssign, ExprStmt, Print, If, While,
              For, Break, Continue, Return, ResidualStmt, Store, CompoundStore,
-             Push, Pop, Clear, Resize, PushStr, PushByte, ForEach, Closure]
+             Push, Pop, Clear, Resize, PushStr, PushByte, ForEach, Closure, AlgStmt]
 
 MUTATING_STMTS = (Push, Pop, Clear, Resize, PushStr, PushByte)
 
@@ -1167,6 +1240,11 @@ def dump(node, indent=0):
         ps = ", ".join("%s%s: %s" % ("mut " if p.mutable else "", p.name, p.ty) for p in node.params)
         return "%sclosure %s%s(%s) -> %s [%s]\n" % (pad, "move " if node.move else "", node.name, ps, node.ret,
                                                   ", ".join(closure_captures(node))) + dump(node.body, indent + 1)
+    if isinstance(node, AlgStmt):
+        return "%salg %s%s%s%s\n" % (pad, node.op,
+                                     "" if node.target is None else " " + dump_expr(node.target),
+                                     "" if node.src is None else " from " + dump_expr(node.src),
+                                     "".join(" " + dump_expr(a) for a in node.args))
     if isinstance(node, (ResidualStmt, ResidualItem)):
         return "%sresidual %r\n" % (pad, node.reason)
     raise TypeError("dump: %r" % (node,))
@@ -1232,6 +1310,10 @@ def dump_expr(e):
         return "(%s%s %s)" % ("post" if e.post else "pre", "inc" if e.op == "add" else "dec", dump_expr(e.var))
     if isinstance(e, ClosureCall):
         return "(call_closure %s%s)" % (e.name, "".join(" " + dump_expr(a) for a in e.args))
+    if isinstance(e, Alg):
+        return "(alg %s %s%s)" % (e.op, dump_expr(e.src), "".join(" " + dump_expr(a) for a in e.args))
+    if isinstance(e, MinMax):
+        return "(%s %s %s)" % (e.op, dump_expr(e.lhs), dump_expr(e.rhs))
     if isinstance(e, ResidualExpr):
         return "(residual %r)" % e.reason
     raise TypeError("dump_expr: %r" % (e,))

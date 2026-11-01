@@ -86,6 +86,19 @@ exactly when a by-copy closure modifies its copy; `-> R` unless void; an
 empty list `[]`), `f(a)`; a function with a callable parameter is `template
 <typename F> R g(const F& f, ..)` (`F& f` for `&mut impl FnMut`), one line
 (the prototype too), called `g(add, ..)`.
+
+FR-253 rows (<algorithm> / <numeric> over whole containers, `<algorithm>`,
+`<numeric>` and `<iterator>` included exactly when used):
+`std::sort(v.begin(), v.end());`, `std::stable_sort(..);`, `std::reverse(..);`,
+`std::fill(v.begin(), v.end(), x);`, `std::sort(v.begin(), v.end(), cmp);`,
+`std::transform(v.begin(), v.end(), v.begin(), f);`, `std::transform(v.begin(),
+v.end(), std::back_inserter(w), f);`, `std::for_each(v.begin(), v.end(), f);`;
+values `std::find(v.begin(), v.end(), x) != v.end()` (`== v.end()` for its
+negation, N26; parenthesized as an operand), `std::count(..)`,
+`std::count_if(..)`, `std::any_of(..)`, `std::all_of(..)`, `std::none_of(..)`
+(the negation of any_of, N25), `std::accumulate(v.begin(), v.end(), init[,
+f])`, `*std::max_element(..)` / `*std::min_element(..)`, `std::max(a, b)` /
+`std::min(a, b)`.  A callable argument is the closure's bare name.
 """
 
 from . import fmt
@@ -212,9 +225,39 @@ class _Printer:
             return False
         if self.is_deref(e, scope):
             return False
+        if isinstance(e, K.Alg):
+            return e.op not in ("contains", "max_element", "min_element")  # `.. != v.end()`, `*std::..`
+        if self.alg_not(e):
+            return e.operand.op == "any_of"  # `std::none_of(..)`
         return isinstance(e, (K.IntLit, K.FloatLit, K.BoolLit, K.Var, K.Call, K.ClosureCall, K.Cast, K.StrLit, K.Index,
                               K.ByteAt, K.Len, K.IsEmpty, K.VecLit, K.VecFill, K.StrNew, K.StrFrom,
-                              K.Substr, K.ToStr, K.Clone, K.Field, K.StructLit, K.MethodCall))
+                              K.Substr, K.ToStr, K.Clone, K.Field, K.StructLit, K.MethodCall, K.MinMax))
+
+    @staticmethod
+    def alg_not(e):
+        """FR-253: Unary('not', contains / any_of) -- `std::find(..) ==
+        v.end()` / `std::none_of(..)` (N25/N26)."""
+        return (isinstance(e, K.Unary) and e.op == "not" and isinstance(e.operand, K.Alg)
+                and e.operand.op in ("contains", "any_of"))
+
+    def range_(self, base, scope):
+        m = self.member(base, scope)
+        return "%sbegin(), %send()" % (m, m)
+
+    def alg(self, e, scope, negated=False):
+        """An FR-253 algorithm value (``negated``: its N25/N26 negation)."""
+        r = self.range_(e.src, scope)
+        if e.op == "accumulate":
+            self.includes.add("numeric")
+        else:
+            self.includes.add("algorithm")
+        a = [self.expr(x, scope) for x in e.args]
+        if e.op == "contains":
+            return "std::find(%s, %s) %s %send()" % (r, a[0], "==" if negated else "!=", self.member(e.src, scope))
+        if e.op in ("max_element", "min_element"):
+            return "*std::%s(%s)" % (e.op, r)
+        name = "none_of" if negated else e.op
+        return "std::%s(%s)" % (name, ", ".join([r] + a))
 
     def recv(self, e, scope):
         s = self.expr(e, scope)
@@ -333,6 +376,13 @@ class _Printer:
         if isinstance(e, K.IncDec):
             sym = "++" if e.op == "add" else "--"
             return e.var.name + sym if e.post else sym + e.var.name
+        if isinstance(e, K.Alg):
+            return self.alg(e, scope)
+        if self.alg_not(e):
+            return self.alg(e.operand, scope, negated=True)
+        if isinstance(e, K.MinMax):
+            self.includes.add("algorithm")
+            return "std::%s(%s, %s)" % (e.op, self.expr(e.lhs, scope), self.expr(e.rhs, scope))
         if isinstance(e, K.Unary):
             t = self.ty(e.operand, scope)
             if e.op == "neg":
@@ -356,8 +406,9 @@ class _Printer:
 
     def operand(self, parent, child, scope, is_lhs, consume=False):
         s = self.consume(child, scope) if consume else self.expr(child, scope)
-        if isinstance(child, K.Cond):
-            return "(" + s + ")"
+        if isinstance(child, K.Cond) or (isinstance(child, K.Alg) and child.op == "contains") or (
+                self.alg_not(child) and child.operand.op == "contains"):
+            return "(" + s + ")"  # (FR-253: `std::find(..) != v.end()` is an equality expression)
         if isinstance(child, K.Binary):
             same = child.op == parent.op and is_lhs and parent.op not in K.CMP_OPS
             return s if same else "(" + s + ")"
@@ -449,6 +500,17 @@ class _Printer:
             self.emit(d, "%s += %s;" % (self.expr(s.target, scope), self.expr(s.value, scope)))
         elif isinstance(s, K.PushByte):
             self.emit(d, "%spush_back(%s);" % (self.member(s.target, scope), self.expr(s.value, scope)))
+        elif isinstance(s, K.AlgStmt):
+            self.includes.add("algorithm")
+            name = {"sort_by": "sort", "extend_map": "transform"}.get(s.op, s.op)
+            parts = [self.range_(s.src if s.target is None or s.op == "extend_map" else s.target, scope)]
+            if s.op == "transform":
+                parts.append(self.member(s.target, scope) + "begin()")
+            elif s.op == "extend_map":
+                self.includes.add("iterator")
+                parts.append("std::back_inserter(%s)" % self.expr(s.target, scope))
+            parts += [self.expr(a, scope) for a in s.args]
+            self.emit(d, "std::%s(%s);" % (name, ", ".join(parts)))
         elif isinstance(s, K.ForEach):
             t = self.ty(s.iterable, scope)
             el = self.tyname(t.elem)

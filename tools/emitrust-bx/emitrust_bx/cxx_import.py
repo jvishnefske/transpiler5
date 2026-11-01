@@ -449,6 +449,7 @@ class CxxImporter:
         self.in_closure = None  # FR-252: the closure whose body is being imported
         self.fn_params = {}  # FR-252: template instantiation id -> (param index, RefT(FnT))
         self.bad_funcs = set()  # FR-252: decl ids of rejected function templates (pattern + instances)
+        self._std = None  # FR-253: ids of the functions declared directly in namespace std
 
     # -------------------------------------------------------------- utils
     def is_main(self, f):
@@ -1214,6 +1215,9 @@ class CxxImporter:
             c = self.callee(n)
             if c == "printf":
                 return [self.printf(n)]
+            st = self.alg_stmt(n)  # FR-253
+            if st is not None:
+                return [st]
             e = self.expr(n)
             if isinstance(e, K.Call):
                 return [K.ExprStmt(e, L)]
@@ -1682,6 +1686,9 @@ class CxxImporter:
             if fname is None and rd.get("id") in self.bad_funcs:
                 return K.ResidualExpr("call of a rejected function template", L, cascade=True)
             if fname is None:
+                alg = self.alg_value(n)  # FR-253
+                if alg is not None:
+                    return alg
                 if rd.get("name") == "move":
                     return self.rexpr(n, "std::move outside an initializer, assignment, by-value argument, "
                                          "push_back or return")
@@ -2354,6 +2361,13 @@ class CxxImporter:
         args = n.get("inner", [])[1:]
         if name == "operator()":
             return self.closure_call(n, args)
+        if name in ("operator==", "operator!=") and len(args) == 2:
+            found = self.find_compare(n, name, args)  # FR-253
+            if found is not None:
+                return found
+        if name == "operator*" and len(args) == 1 and self.std_name(self.strip_tmp(args[0])) in (
+                "max_element", "min_element"):
+            return self.extreme(self.strip_tmp(args[0]))  # FR-253
         if name == "operator[]" and len(args) == 2:
             base = self.borrowed(args[0])
             bt = self.ty_of(base)
@@ -2695,6 +2709,279 @@ class CxxImporter:
                 return self.rexpr(a, "default argument")
             out.append(self.expr(a))
         return K.ClosureCall(name, tuple(out), L)
+
+    # ================================================== FR-253: algorithms
+    ALG_STMT_NAMES = ("sort", "stable_sort", "reverse", "fill", "for_each", "transform")
+    ALG_VALUE_NAMES = ("count", "count_if", "any_of", "all_of", "none_of", "accumulate", "max", "min")
+
+    def std_ids(self):
+        """Ids of the functions (and their template specializations) declared
+        DIRECTLY in namespace std in a header: clang's referencedDecl carries
+        no namespace (FR-249 spike (c)), and a user `sort` must never be
+        mistaken for std::sort, nor std::ranges::sort for it."""
+        if self._std is None:
+            out = set()
+            for n in self.ast.get("inner", []):
+                if n.get("kind") != "NamespaceDecl" or n.get("name") != "std" or self.decl_main.get(n.get("id"), True):
+                    continue
+                for c in n.get("inner", []):
+                    if c.get("kind") == "FunctionDecl":
+                        out.add(c.get("id"))
+                    elif c.get("kind") == "FunctionTemplateDecl":
+                        out.add(c.get("id"))
+                        out.update(x.get("id") for x in c.get("inner", []) if x.get("kind") == "FunctionDecl")
+            self._std = out
+        return self._std
+
+    def std_name(self, n):
+        """The name of the namespace-std function CallExpr ``n`` calls, or None."""
+        if not isinstance(n, dict) or n.get("kind") != "CallExpr":
+            return None
+        rd = self.callee_decl(n)
+        rid = rd.get("id")
+        if rid is None or rid in self.user_funcs or rid not in self.std_ids():
+            return None
+        return rd.get("name")
+
+    def whole(self, n, b, e, what):
+        """(place, None) for `v.begin(), v.end()` on ONE vector place, else
+        (None, a located residual)."""
+        free = self.rexpr(n, "%s over something other than a whole container `v.begin(), v.end()` (free "
+                             "iterators are outside the subset)" % what)
+        parts = []
+        for node, want in ((b, "begin"), (e, "end")):
+            u = self.strip_tmp(node)
+            if u.get("kind") != "CXXMemberCallExpr":
+                return None, free
+            me = self.strip(u["inner"][0])
+            if me.get("kind") != "MemberExpr" or me.get("name") != want:
+                return None, free
+            _, recv, margs, bad = self.member_call_parts(u)
+            if bad is not None:
+                return None, bad
+            if margs:
+                return None, free
+            parts.append(recv)
+        if parts[0] != parts[1]:
+            return None, self.rexpr(n, "%s over the begin() and end() of two different containers" % what)
+        recv = parts[0]
+        if not TC.is_place(recv) or any(isinstance(x, (K.Call, K.MethodCall)) for x in K.walk(recv)):
+            return None, self.rexpr(n, "%s over something other than a variable, element or data member" % what)
+        t = self.ty_of(recv)
+        if t == K.STRING:
+            return None, self.rexpr(n, "%s over a std::string (the subset's algorithms take a std::vector)" % what)
+        if not isinstance(t, K.VecT):
+            return None, self.rexpr(n, "%s over a container that is not a std::vector" % what)
+        return recv, None
+
+    def alg_closure(self, a, what):
+        """A callable argument: a LOCAL closure variable (C++ copies the
+        closure object into the algorithm; FR-252's lambdas are only ever
+        bound by `auto f = ..;`, so an inline lambda is refused, naming the
+        rewrite)."""
+        u = self.strip_tmp(a)
+        while isinstance(u, dict) and u.get("kind") == "CXXConstructExpr" and len(self.real_args(u)) == 1:
+            u = self.strip_tmp(self.real_args(u)[0])
+        u = self.strip(u)
+        if u.get("kind") == "LambdaExpr":
+            return self.rexpr(u, "lambda expression as an argument of %s (normalizer: bind it to a local closure "
+                                 "first, `auto f = [..](..) {..};`, and pass `f`)" % what)
+        name = self.local_ref(u)
+        if name is not None:
+            return K.Var(name, self.loc(u))
+        rd = (u.get("referencedDecl") or {}) if u.get("kind") == "DeclRefExpr" else {}
+        if rd.get("id") in self.poisoned:
+            return K.ResidualExpr("use of a rejected declaration", self.loc(a), cascade=True)
+        while u.get("kind") == "ImplicitCastExpr" and u.get("castKind") == "FunctionToPointerDecay":
+            u = self.strip(u["inner"][0])
+            rd = (u.get("referencedDecl") or {}) if u.get("kind") == "DeclRefExpr" else {}
+        if rd.get("kind") == "FunctionDecl":
+            return self.rexpr(a, "function '%s' passed to %s (the subset passes a local closure)"
+                              % (rd.get("name"), what))
+        return self.rexpr(a, "the callable argument of %s is not a local closure variable" % what)
+
+    def alg_elem_value(self, a, E, what):
+        """The value `std::find` / `std::count` compares each element with.
+        C++ deduces its type from the argument and compares after the usual
+        arithmetic conversions; the Kernel compares values of the ELEMENT
+        type, so a literal that fits the element type is converted (the
+        comparison is the same either way) and any other type is left for
+        the checker to refuse, located."""
+        if E == K.STRING:
+            return self.borrowed(a)
+        e = self.expr(self.strip_tmp(a))
+        t = self.ty_of(e)
+        if t is None or t == E or isinstance(e, K.ResidualExpr):
+            return e
+        lit, neg = (e.operand, True) if isinstance(e, K.Unary) and e.op == "neg" else (e, False)
+        if isinstance(lit, K.IntLit) and (E in K.INT_TYPES or E == K.F64):
+            v = -lit.value if neg else lit.value
+            lo, hi = K.INT_RANGE[E.name] if E != K.F64 else (-(1 << 53), 1 << 53)
+            if lo <= v <= hi:
+                return K.Cast(E, e, self.loc(a))
+        return e
+
+    def alg_stmt(self, n):
+        """A namespace-std algorithm evaluated for its effect, or None."""
+        name = self.std_name(n)
+        if name not in self.ALG_STMT_NAMES:
+            return None
+        L = self.loc(n)
+        what = "std::" + name
+        args = self.real_args(n)[1:]
+
+        def residual(e):
+            return K.ResidualStmt(e.reason, e.loc)
+
+        need = {"sort": (2, 3), "stable_sort": (2,), "reverse": (2,), "fill": (3,), "for_each": (3,),
+                "transform": (4,)}[name]
+        if len(args) not in need:
+            if name == "stable_sort" and len(args) == 3:
+                return self.rstmt(n, "std::stable_sort with a comparator")
+            if name == "transform" and len(args) == 5:
+                return self.rstmt(n, "std::transform over two ranges (a binary operation)")
+            return self.rstmt(n, "%s with %d arguments" % (what, len(args)))
+        v, bad = self.whole(n, args[0], args[1], what)
+        if bad is not None:
+            return residual(bad)
+        E = self.ty_of(v).elem
+        if name in ("sort", "stable_sort", "reverse") and len(args) == 2:
+            return K.AlgStmt(name, v, None, (), L)
+        if name == "sort":
+            f = self.alg_closure(args[2], what)
+            return residual(f) if isinstance(f, K.ResidualExpr) else K.AlgStmt("sort_by", v, None, (f,), L)
+        if name == "fill":
+            if isinstance(E, K.Prim):
+                x = self.expr(self.strip_tmp(args[2]))
+                t = self.ty_of(x)
+                if t is not None and t != E and t in K.ALL_PRIMS:
+                    x = K.Cast(E, x, self.loc(args[2]))  # `*it = value` converts to the element type
+            else:
+                x = self.copied(args[2], E)
+            if isinstance(x, K.ResidualExpr):
+                return residual(x)
+            return K.AlgStmt("fill", v, None, (x,), L)
+        if name == "for_each":
+            f = self.alg_closure(args[2], what)
+            return residual(f) if isinstance(f, K.ResidualExpr) else K.AlgStmt("for_each", None, v, (f,), L)
+        # transform: in place (`v.begin()` again) or appended (`std::back_inserter(w)`)
+        out = self.strip_tmp(args[2])
+        f = self.alg_closure(args[3], what)
+        if isinstance(f, K.ResidualExpr):
+            return residual(f)
+        if out.get("kind") == "CXXMemberCallExpr":
+            me = self.strip(out["inner"][0])
+            if me.get("kind") == "MemberExpr" and me.get("name") == "begin":
+                _, w, margs, bad = self.member_call_parts(out)
+                if bad is None and not margs and w == v:
+                    return K.AlgStmt("transform", v, None, (f,), L)
+        while isinstance(out, dict) and out.get("kind") == "CXXConstructExpr" and len(self.real_args(out)) == 1:
+            out = self.strip_tmp(self.real_args(out)[0])
+        if self.std_name(out) == "back_inserter" and len(self.real_args(out)) == 2:
+            w = self.place(self.real_args(out)[1])
+            if isinstance(w, K.ResidualExpr):
+                return residual(w)
+            if not isinstance(self.ty_of(w), K.VecT):
+                return self.rstmt(n, "std::transform into a std::back_inserter of a container that is not a "
+                                     "std::vector")
+            return K.AlgStmt("extend_map", w, v, (f,), L)
+        return self.rstmt(n, "std::transform into something other than its own begin() or a "
+                             "std::back_inserter(w) (free iterators are outside the subset)")
+
+    def alg_value(self, n):
+        """A namespace-std algorithm whose value is used (FR-253), a located
+        residual for one outside the subset, or None (not an algorithm)."""
+        name = self.std_name(n)
+        if name is None:
+            return None
+        L = self.loc(n)
+        what = "std::" + name
+        args = self.real_args(n)[1:]
+        if name in self.ALG_STMT_NAMES:
+            return self.rexpr(n, "%s used as a value" % what)
+        if name == "find":
+            return self.rexpr(n, "std::find other than `std::find(v.begin(), v.end(), x) != v.end()` or `== "
+                                 "v.end()` (iterators are outside the subset)")
+        if name in ("max_element", "min_element"):
+            return self.rexpr(n, "%s other than `*%s(v.begin(), v.end())` (iterators are outside the subset)"
+                              % (what, what))
+        if name in ("max", "min"):
+            if len(args) != 2:
+                return self.rexpr(n, "%s with %s" % (what, "a comparator" if len(args) == 3 else
+                                                     "%d arguments" % len(args)))
+            a = self.expr(self.strip_tmp(args[0]))
+            b = self.expr(self.strip_tmp(args[1]))
+            return K.MinMax(name, a, b, L)
+        if name not in self.ALG_VALUE_NAMES:
+            return None
+        need = {"accumulate": (3, 4)}.get(name, (3,))
+        if len(args) not in need:
+            return self.rexpr(n, "%s with %d arguments" % (what, len(args)))
+        v, bad = self.whole(n, args[0], args[1], what)
+        if bad is not None:
+            return bad
+        E = self.ty_of(v).elem
+        if name == "count":
+            x = self.alg_elem_value(args[2], E, what)
+            return x if isinstance(x, K.ResidualExpr) else K.Alg("count", v, (x,), L)
+        if name == "accumulate":
+            init = self.expr(self.strip_tmp(args[2]))
+            if isinstance(init, K.ResidualExpr):
+                return init
+            if len(args) == 3:
+                return K.Alg("accumulate", v, (init,), L)
+            f = self.alg_closure(args[3], what)
+            return f if isinstance(f, K.ResidualExpr) else K.Alg("accumulate", v, (init, f), L)
+        f = self.alg_closure(args[2], what)
+        if isinstance(f, K.ResidualExpr):
+            return f
+        if name == "none_of":
+            return K.Unary("not", K.Alg("any_of", v, (f,), L), L)  # N25: none_of is !any_of
+        return K.Alg(name, v, (f,), L)
+
+    def find_compare(self, n, opname, args):
+        """`std::find(v.begin(), v.end(), x) != v.end()` <=> contains (`==`:
+        its negation, N26); either operand order.  None when neither operand
+        is a std::find call."""
+        a, b = (self.strip_tmp(x) for x in args)
+        if self.std_name(b) == "find" and self.std_name(a) != "find":
+            a, b = b, a
+        if self.std_name(a) != "find":
+            return None
+        L = self.loc(n)
+        fargs = self.real_args(a)[1:]
+        if len(fargs) != 3:
+            return self.rexpr(a, "std::find with %d arguments" % len(fargs))
+        v, bad = self.whole(a, fargs[0], fargs[1], "std::find")
+        if bad is not None:
+            return bad
+        end_ok = False
+        if b.get("kind") == "CXXMemberCallExpr":
+            me = self.strip(b["inner"][0])
+            if me.get("kind") == "MemberExpr" and me.get("name") == "end":
+                _, w, margs, wbad = self.member_call_parts(b)
+                end_ok = wbad is None and not margs and w == v
+        if not end_ok:
+            return self.rexpr(n, "std::find compared with something other than the same container's end() "
+                                 "(iterators are outside the subset)")
+        x = self.alg_elem_value(fargs[2], self.ty_of(v).elem, "std::find")
+        if isinstance(x, K.ResidualExpr):
+            return x
+        c = K.Alg("contains", v, (x,), L)
+        return c if opname == "operator!=" else K.Unary("not", c, L)
+
+    def extreme(self, call):
+        """`*std::max_element(v.begin(), v.end())` (dereferenced at once)."""
+        name = self.std_name(call)
+        args = self.real_args(call)[1:]
+        what = "std::" + name
+        if len(args) != 2:
+            return self.rexpr(call, "%s with a comparator" % what if len(args) == 3 else
+                              "%s with %d arguments" % (what, len(args)))
+        v, bad = self.whole(call, args[0], args[1], what)
+        if bad is not None:
+            return bad
+        return K.Alg(name, v, (), self.loc(call))
 
     def template_func(self, n, ns, internal, funcs):
         """FR-252: `template <typename F> R g(const F& f, ..)` (or `F& f`)

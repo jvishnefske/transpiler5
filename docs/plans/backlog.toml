@@ -1697,7 +1697,7 @@ anchor = "FR-252 (opened 2026-11-01, child of FR-249): **BX closures"
 [[items]]
 id = "FR-253"
 kind = "feature"
-status = "open"
+status = "landed"
 rank = 66
 size = "M"
 title = "BX <algorithm>/<numeric> over whole containers"

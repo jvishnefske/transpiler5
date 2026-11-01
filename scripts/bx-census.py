@@ -262,8 +262,37 @@ RULES = [
     (r"^(struct name: |struct '.*' has the name of|variable '.*' has the name of a struct"
      r"|data member '.*' has the name of a struct|member function '.*' has the name of a struct)",
      "struct: name clash", None),
+    # FR-253 <algorithm> / <numeric> (before FR-252: `callable parameter '.*' passed to std::`)
+    (r"^std::\w+ over something other than a whole container", "algorithm: free iterators (normalizer)", None),
+    (r"^std::\w+ over the begin\(\) and end\(\) of two different", "algorithm: range over two containers", None),
+    (r"^std::\w+ over something other than a variable", "algorithm: range receiver form", None),
+    (r"^std::\w+ over a (std::string|container that is not a std::vector)", "algorithm: non-vector container", None),
+    (r"^lambda expression as an argument of std::", "algorithm: inline lambda (normalizer)", None),
+    (r"^(function '.*' passed to std::|the callable argument of std::|callable parameter '.*' passed to std::)",
+     "algorithm: callable argument form", None),
+    (r"^(std::stable_sort with a comparator|std::transform over two ranges|std::\w+ with (a comparator|\d+ arguments)"
+     r"|std::accumulate takes)",
+     "algorithm: overload outside the subset", "generic"),
+    (r"^std::transform into ", "algorithm: transform destination form", None),
+    (r"^(std::\w+ used as a value|std::\w+ other than `|std::find compared with)",
+     "algorithm: iterator result (normalizer)", "generic"),
+    (r"^(std::max_element over a vector of double|std::(max|min) of two doubles|std::(stable_)?sort of a vector of double)",
+     "algorithm: f64 has no total order", None),
+    (r"^std::\w+ of a value of type .* in a vector of", "algorithm: value/element type mismatch (normalizer)", None),
+    (r"^std::accumulate of .* elements from an initial value", "algorithm: accumulate init type (normalizer)", None),
+    (r"^(std::\w+ (over|of) an? |std::\w+ with a comparator over|std::accumulate with an operation over"
+     r"|std::transform into a std::back_inserter over|std::(max|min) of two values)",
+     "algorithm: element type outside the subset", "generic"),
+    (r"^closure '.*' has type .*, but std::", "algorithm: closure signature mismatch", None),
+    (r"^closure '.*' modifies its own copy of a capture \(a `mutable` lambda\) and is passed to std::",
+     "algorithm: mutable lambda copied (normalizer)", None),
+    (r"^(the value of std::fill reads|std::transform appends to)", "algorithm: reads its own target (borrow)", None),
+    (r"^(operands of std::max have different types|std::\w+ of immutable)", "algorithm: typing", "generic"),
+    (r"^(closure argument '.*' of std::|an argument of std::|the fold of std::accumulate|fold closure other than"
+     r"|iterator method `|`\.(max|min|map|extend|contains)\(\)|`v\.iter\(\)|`bx::|`std::cmp::)",
+     "algorithm: Rust spelling", "generic"),
     # FR-252 closures
-    (r"^default capture `", "closure: default capture (normalizer)", None),
+    (r"^default capture `","closure: default capture (normalizer)", None),
     (r"^mixed by-copy and by-reference captures", "closure: mixed captures (normalizer)", None),
     (r"^init-capture `", "closure: init-capture (normalizer)", None),
     (r"^(capture of `this`|capture pack|closure '.*' captures `(this|self)`)", "closure: captures this/pack", None),

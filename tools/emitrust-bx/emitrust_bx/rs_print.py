@@ -103,6 +103,19 @@ for by-copy captures; `let mut f` when it modifies state or is passed as
 `&mut impl FnMut`; `|| ->` with no parameter; no `-> ()`), `f(a)`; a
 callable parameter `f: &impl Fn(i32) -> i32` / `f: &mut impl FnMut(i32)`,
 an argument `&add` / `&mut bump` (a callable parameter passed on bare).
+
+FR-253 rows (algorithms over whole vectors; a closure argument is `&f`, or
+`&mut f` when f modifies state): `v.sort_unstable();` (std::sort),
+`v.sort();` (std::stable_sort), `v.reverse();`, `v.fill(x);` (`.clone()` of
+a String place), `bx::sort_by_less(&mut v, &cmp);` (libstdc++'s introsort),
+`bx::transform(&mut v, &f);`, `v.iter().copied().for_each(&f);`,
+`w.extend(v.iter().copied().map(&f));`; values `v.contains(&x)` (`!v.contains
+(&x)` for `== v.end()`), `bx::count(&v, &x)` / `bx::count_if(&v, &p)` (i64,
+C++'s ptrdiff_t), `v.iter().copied().any(&p)` / `.all(&p)` (`!..any(&p)` for
+none_of), `v.iter().fold(init, |a, &e| a + e)` (`a.wrapping_add(e)` for an
+unsigned accumulator, `e as A` when the element type differs),
+`v.iter().copied().fold(init, &f)`, `*v.iter().max().unwrap()` /
+`.min()`, `std::cmp::max(a, b)` / `std::cmp::min(a, b)`.
 """
 
 from . import fmt
@@ -199,8 +212,10 @@ class _Printer:
             return not self.is_ref(e, scope)
         if isinstance(e, (K.IntLit, K.FloatLit, K.BoolLit, K.Call, K.ClosureCall, K.StrLit, K.Clone, K.Index, K.Len,
                           K.IsEmpty, K.VecLit, K.VecFill, K.StrNew, K.StrFrom, K.Substr, K.ToStr, K.Field,
-                          K.MethodCall, K.StructLit)):
+                          K.MethodCall, K.StructLit, K.MinMax)):
             return True
+        if isinstance(e, K.Alg):
+            return e.op not in ("max_element", "min_element")  # `*v.iter().max().unwrap()`
         if isinstance(e, K.Binary) and self.is_wrapping(e, scope):
             return True
         if isinstance(e, K.Unary) and e.op == "neg" and K.is_unsigned(self.ty(e.operand, scope)):
@@ -245,6 +260,12 @@ class _Printer:
                 return self.nc_expr(e, scope)
             finally:
                 self.in_cast = saved
+        if isinstance(e, (K.Alg, K.MinMax)):
+            saved, self.in_cast = self.in_cast, 0
+            try:
+                return self.alg(e, scope)
+            finally:
+                self.in_cast = saved
         if isinstance(e, K.Cast):
             self.in_cast += 1
             try:
@@ -278,6 +299,57 @@ class _Printer:
             return "%s %s %s" % (self.operand(e, e.lhs, scope, True), RUST_BINOP[e.op],
                                  self.operand(e, e.rhs, scope, False))
         raise PrintError("cannot print %r" % (e,))
+
+    # ---------------------------------------------------- FR-253
+    def fn_arg(self, a):
+        """A closure argument: `&f`, `&mut f` when it modifies state."""
+        return ("&mut " if a.name in self.fnmut else "&") + a.name
+
+    def alg(self, e, scope):
+        if isinstance(e, K.MinMax):
+            return "std::cmp::%s(%s, %s)" % (e.op, self.expr(e.lhs, scope), self.expr(e.rhs, scope))
+        v = self.recv(e.src, scope)
+        if e.op == "contains":
+            return "%s.contains(%s)" % (v, self.borrow(e.args[0], scope, False))
+        if e.op == "count":
+            self.used.add("count")
+            return self.bxp + "count(%s, %s)" % (self.borrow(e.src, scope, False), self.borrow(e.args[0], scope, False))
+        if e.op == "count_if":
+            self.used.add("count_if")
+            return self.bxp + "count_if(%s, %s)" % (self.borrow(e.src, scope, False), self.fn_arg(e.args[0]))
+        if e.op in ("any_of", "all_of"):
+            return "%s.iter().copied().%s(%s)" % (v, e.op[:3], self.fn_arg(e.args[0]))
+        if e.op in ("max_element", "min_element"):
+            return "*%s.iter().%s().unwrap()" % (v, e.op[:3])
+        if e.op == "accumulate":
+            init = self.expr(e.args[0], scope)
+            if len(e.args) == 2:
+                return "%s.iter().copied().fold(%s, %s)" % (v, init, self.fn_arg(e.args[1]))
+            A = self.ty(e, scope)
+            E = self.ty(e.src, scope).elem
+            wrapping, cast = TC.fold_spelling(A, E)
+            el = "e as " + cast if cast else "e"
+            body = "a.wrapping_add(%s)" % el if wrapping else "a + " + el
+            return "%s.iter().fold(%s, |a, &e| %s)" % (v, init, body)
+        raise PrintError("cannot print %r" % (e,))
+
+    def alg_stmt(self, s, scope, d):
+        if s.op in ("sort", "stable_sort", "reverse"):
+            m = {"sort": "sort_unstable", "stable_sort": "sort", "reverse": "reverse"}[s.op]
+            self.emit(d, "%s.%s();" % (self.recv(s.target, scope), m))
+        elif s.op == "fill":
+            self.emit(d, "%s.fill(%s);" % (self.recv(s.target, scope), self.copied(s.args[0], scope)))
+        elif s.op in ("sort_by", "transform"):
+            h = "sort_by_less" if s.op == "sort_by" else "transform"
+            self.used.add(h)
+            self.emit(d, self.bxp + "%s(%s, %s);" % (h, self.borrow(s.target, scope, True), self.fn_arg(s.args[0])))
+        elif s.op == "for_each":
+            self.emit(d, "%s.iter().copied().for_each(%s);" % (self.recv(s.src, scope), self.fn_arg(s.args[0])))
+        elif s.op == "extend_map":
+            self.emit(d, "%s.extend(%s.iter().copied().map(%s));" % (self.recv(s.target, scope), self.recv(s.src, scope),
+                                                                      self.fn_arg(s.args[0])))
+        else:
+            raise PrintError("cannot print %r" % (s,))
 
     # ---------------------------------------------------- FR-259
     def cond(self, e, scope):
@@ -509,6 +581,8 @@ class _Printer:
             self.emit(d, "for %s%s in %s {" % ("mut " if s.mutable else "", s.var, it))
             self.block_body(s.body, inner, d + 1, same=True)
             self.emit(d, "}")
+        elif isinstance(s, K.AlgStmt):
+            self.alg_stmt(s, scope, d)
         elif isinstance(s, K.ExprStmt):
             self.emit(d, self.expr(s.expr, scope) + ";")
         elif isinstance(s, K.Print):
@@ -588,6 +662,7 @@ class _Printer:
     def func(self, f):
         scope = TC.Scope()
         self.mut_closures = TC.mut_closure_names(f, self.sigs)
+        self.fnmut = TC.closure_info(f.body, self.sigs)[1]  # FR-253: `&mut f` arguments
         ps = []
         if f.recv in ("ref", "mut"):
             ps.append("&mut self" if f.recv == "mut" else "&self")
