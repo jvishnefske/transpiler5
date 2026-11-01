@@ -4,7 +4,9 @@
 // value-initialization and an aggregate initializer that omits members (both
 // zero-fill; the subset spells every member), member access and member calls
 // on a temporary, a static member function called through an object, a
-// pointer to a struct (FR-261), and the receiver-alias shapes rustc 1.98
+// pointer to a struct whose object is used while the pointer is in scope
+// (FR-261 accepts `P* ptr = &p;` and `ptr->x`; the later uses of `p` are
+// the second borrow rustc would reject), and the receiver-alias shapes rustc 1.98
 // rejects (measured): `p.take(p)` with `take(const P&)` on a `&mut self`
 // method (E0502), `p.set(bump(p))` (E0499 -- also an unspecified C++ order),
 // `v[0].set(v[0].get())` / `v[0].set(v.size())` (IndexMut is not a two-phase
@@ -14,7 +16,7 @@
 // RUN: FileCheck %s --input-file=%t.err
 // RUN: grep -c "error: unsupported:" %t.err | FileCheck --check-prefix=COUNT %s
 // RUN: not test -e %t.rs
-// COUNT: {{^}}17{{$}}
+// COUNT: {{^}}16{{$}}
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -65,9 +67,9 @@ int main() {
     int w = make().get();
     // CHECK-NEXT: struct-uses.cpp:[[@LINE+1]]:14: error: unsupported: static member function called through an object
     int s0 = p.zero();
-    // CHECK-NEXT: struct-uses.cpp:[[@LINE+1]]:5: error: unsupported: variable of type 'P *'
     P* ptr = &p;
-    // CHECK-NEXT: struct-uses.cpp:[[@LINE+1]]:5: error: unsupported: 'p' is passed by reference to 'take', a non-const member function called on it (aliasing)
+    // CHECK-NEXT: struct-uses.cpp:[[@LINE+2]]:5: error: unsupported: 'p' is passed by reference to 'take', a non-const member function called on it (aliasing)
+    // CHECK-NEXT: struct-uses.cpp:[[@LINE+1]]:5: error: unsupported: 'p' is used while 'ptr', a mutable pointer derived from it, is in scope (a second borrow in Rust)
     p.take(p);
     // CHECK-NEXT: struct-uses.cpp:[[@LINE+2]]:5: error: unsupported: an argument of 'set' modifies 'p', the object it is called on (a second borrow in Rust)
     // CHECK-NEXT: struct-uses.cpp:[[@LINE+1]]:11: error: unsupported: 'p' is passed to 'bump' by non-const reference and also used elsewhere in the statement (C++ leaves the order unspecified)
@@ -83,7 +85,6 @@ int main() {
     int k = bump(p) + p.x;
     // CHECK-NEXT: struct-uses.cpp:[[@LINE+1]]:5: error: unsupported: expression statement without effect
     Q(3);
-    // CHECK-NEXT: struct-uses.cpp:[[@LINE+1]]:77: error: unsupported: member access through a pointer
     std::printf("%d %d %d %d %d %d\n", y, w, s0, u, k, z.a + half.a + d.x + ptr->x);
     std::printf("%s\n", t.c_str());
     return 0;

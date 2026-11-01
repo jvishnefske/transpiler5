@@ -66,6 +66,17 @@ other `crate::a::S`; `S { f: e, g }` (field-init shorthand exactly when the
 value is a non-reference variable of the field's name); `S::f(..)`,
 `r.m(..)`, `p.f`, `self.f`.
 
+FR-261 rows (pointers): `const T*` <=> `&[T]`, `T*` <=> `&mut [T]` (the
+suffix slice of the allocation; lengths stay ordinary integers); `p[i]`,
+`*p` <=> `p[0usize]`, `p->f` <=> `p[0usize].f`, `p + k` <=> `&p[k..]` /
+`&mut p[k..]` and `v.data()` <=> `&v[..]` (the `&` / `&mut` follows the
+expected type, not the base), `&x` <=> `std::slice::from_ref(&x)` /
+`std::slice::from_mut(&mut x)`, `p += k;` <=> `p = &p[k..];` (measured to
+borrow-check for `&mut` parameters and locals alike on rustc 1.96 and
+1.98), a pointer argument or `let` initializer that is a pointer variable
+bare (`&[T]` is Copy; `&mut [T]` is implicitly reborrowed at a coercion
+site).
+
 FR-260 rows (namespaces): a C++ named namespace is a `mod`, one block per
 namespace (N13), contents indented one level; a nested one is `pub mod`
 (a private nested module is unreachable from the root, E0603).  A function
@@ -104,6 +115,8 @@ def rs_ty(t, ns=()):
         return "&%s%s" % ("mut " if t.mutable else "", rs_ty(t.inner, ns))
     if isinstance(t, K.StructT):
         return rs_path(t.path, ns)
+    if isinstance(t, K.PtrT):
+        return "&%s[%s]" % ("mut " if t.mutable else "", rs_ty(t.inner, ns))
     return t.name
 
 
@@ -271,7 +284,26 @@ class _Printer:
     def arg(self, pt, a, scope):
         if isinstance(pt, K.RefT):
             return self.borrow(a, scope, pt.mutable)
+        if isinstance(pt, K.PtrT):
+            return self.ptr_val(a, scope, pt.mutable)
         return self.expr(a, scope)
+
+    def ptr_val(self, e, scope, mutable):
+        """FR-261: a pointer value where a `&[T]` (``mutable`` False) or
+        `&mut [T]` is expected: a pointer variable bare (copied / implicitly
+        reborrowed), `&p[k..]` / `&mut v[..]`, `std::slice::from_ref(&x)` /
+        `std::slice::from_mut(&mut x)`."""
+        if isinstance(e, K.Offset):
+            saved, self.in_cast = self.in_cast, 0
+            try:
+                start = "" if e.start is None else self.expr(e.start, scope)
+                return "&%s%s[%s..]" % ("mut " if mutable else "", self.recv(e.base, scope), start)
+            finally:
+                self.in_cast = saved
+        if isinstance(e, K.AddrOf):
+            return "std::slice::%s(%s)" % ("from_mut" if mutable else "from_ref",
+                                           self.borrow(e.place, scope, mutable))
+        return self.expr(e, scope)
 
     def nc_expr(self, e, scope):
         if isinstance(e, K.Clone):
@@ -347,15 +379,18 @@ class _Printer:
             self.block_body(s, scope, d + 1)
             self.emit(d, "}")
         elif isinstance(s, K.Let):
-            self.emit(d, "let %s%s: %s = %s;" % ("mut " if s.mutable else "", s.name, self.rty(s.ty),
-                                                 self.typed(s.init, scope)))
+            init = self.ptr_val(s.init, scope, s.ty.mutable) if isinstance(s.ty, K.PtrT) else self.typed(s.init, scope)
+            self.emit(d, "let %s%s: %s = %s;" % ("mut " if s.mutable else "", s.name, self.rty(s.ty), init))
             scope.declare(s.name, s.ty, s.mutable)
         elif isinstance(s, K.Assign):
             self.emit(d, "%s = %s;" % (self.expr(K.Var(s.name), scope), self.typed(s.value, scope)))
         elif isinstance(s, K.CompoundAssign):
             t = K.deref(scope.lookup(s.name)[0])
             lhs = self.expr(K.Var(s.name), scope)
-            if s.op in K.WRAPPING_OPS and K.is_unsigned(t):
+            if isinstance(t, K.PtrT):
+                # FR-261: `p += k;` <=> `p = &p[k..];` (a forward re-slice)
+                self.emit(d, "%s = %s;" % (s.name, self.ptr_val(K.Offset(K.Var(s.name), s.value), scope, t.mutable)))
+            elif s.op in K.WRAPPING_OPS and K.is_unsigned(t):
                 recv = self.paren_if(not self.atomic(K.Var(s.name), scope), lhs)
                 self.emit(d, "%s = %s.wrapping_%s(%s);" % (lhs, recv, s.op, self.expr(s.value, scope)))
             else:

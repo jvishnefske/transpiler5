@@ -26,6 +26,11 @@ is a located error, not a guess); `crate::`, `self::`, `super::` and a
 relative child-module path `b::f` are accepted.  `use`, restricted
 visibility and a reopened module (E0428 in Rust) are located errors.
 
+FR-261: `&[T]` / `&mut [T]` (pointers), `&x[k..]` / `&mut x[..]` (re-slices,
+an Offset), `std::slice::from_ref(&x)` / `std::slice::from_mut(&mut x)`
+(an AddrOf); `p = &p[k..];` is normalized to `p += k` (N18).  A bare
+`x[k..]` and a range with an end are located errors.
+
 FR-257: `#[derive(Clone)] [pub] struct S { pub f: T, .. }` (exactly that
 attribute; every field `pub`; a private struct in a module is internal),
 one `impl S { pub fn .. }` per struct in its module (`&self`, `&mut self`,
@@ -84,6 +89,16 @@ class _Iter:
 
 
 STMT_METHODS = {"push": 1, "pop": 0, "clear": 0, "resize": 2, "push_str": 1}
+
+
+@dataclass(frozen=True)
+class _SliceIdx:
+    """FR-261: `x[k..]` / `x[..]` (surface marker, only legal under `&` /
+    `&mut`, where it becomes a Kernel Offset)."""
+
+    base: object
+    start: object
+    loc: Optional[Loc] = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -188,8 +203,18 @@ class _Parser:
             if self.at("mut"):
                 self.next()
                 mut = True
+            if self.at("["):
+                # FR-261: a slice `&[T]` / `&mut [T]` is a pointer
+                self.next()
+                inner = self.type_()
+                if self.at(";"):
+                    self.unsupported(self.tok, "array type")
+                self.expect("]")
+                if isinstance(inner, (K.RefT, K.PtrT)):
+                    self.unsupported(t, "slice of references or slices")
+                return K.PtrT(inner, mut)
             inner = self.type_()
-            if isinstance(inner, K.RefT):
+            if isinstance(inner, (K.RefT, K.PtrT)):
                 self.unsupported(t, "reference to a reference")
             return K.RefT(inner, mut)
         if t.text == "&&" and t.kind == "punct":
@@ -760,7 +785,12 @@ class _Parser:
                 if self.at("mut"):
                     self.next()
                     mut = True
-                return K.Borrow(self.unary(), mut, t.loc)
+                e = self.unary()
+                if isinstance(e, _SliceIdx):
+                    # FR-261: `&p[k..]` / `&mut v[..]` is a re-slice
+                    return K.Offset(e.base, e.start, getattr(e.base, "loc", None) or t.loc,
+                                    "&mut" if mut else "&")
+                return K.Borrow(e, mut, t.loc)
             if t.text == "&&":
                 self.unsupported(t, "reference `&&`")
             if t.text == "*":
@@ -801,7 +831,22 @@ class _Parser:
                 continue
             if t.kind == "punct" and t.text == "[":
                 self.next()
+                if self.at(".."):
+                    self.next()
+                    self.expect("]")
+                    e = _SliceIdx(e, None, t.loc)
+                    continue
                 idx = self.free_expr()
+                if self.at(".."):
+                    self.next()
+                    if not self.at("]"):
+                        self.unsupported(self.tok, "slice range with an end (the subset's pointers are suffix "
+                                                   "slices `&p[k..]`)")
+                    self.next()
+                    e = _SliceIdx(e, idx, t.loc)
+                    continue
+                if self.at("..="):
+                    self.unsupported(self.tok, "inclusive range `..=`")
                 self.expect("]")
                 e = K.Index(e, idx, getattr(e, "loc", None) or t.loc)  # located at its start, like C++
                 continue
@@ -916,6 +961,17 @@ class _Parser:
             return K.Substr(args[0], args[1], args[2] if len(args) == 3 else None, t.loc)
         self.unsupported(t, "path expression `%s`" % path)
 
+    def slice_from(self, fn, t):
+        """FR-261: `std::slice::from_ref(&x)` / `std::slice::from_mut(&mut x)`
+        (or a bare reference variable `x`) is `&x` -- a one-element slice."""
+        args = self.call_args()
+        if len(args) != 1:
+            self.unsupported(t, "`std::slice::%s` with %d arguments" % (fn, len(args)))
+        a = args[0]
+        if isinstance(a, K.Borrow):
+            return K.AddrOf(a.operand, t.loc, "%s(%s)" % (fn, "&mut" if a.mutable else "&"))
+        return K.AddrOf(a, t.loc, fn + "()")
+
     def struct_lit(self, raw, t):
         """`S { f: e, g }` (FR-257); the path and the field order are
         checked once every struct is known."""
@@ -992,6 +1048,8 @@ class _Parser:
                 while self.at("::"):
                     self.next()
                     segs.append(self.ident().text)
+                if segs[:2] == ["std", "slice"] and len(segs) == 3 and segs[2] in ("from_ref", "from_mut"):
+                    return self.slice_from(segs[2], t)
                 if self.at("{") and not self.no_struct:
                     return self.struct_lit("::".join(segs), t)
                 if not self.at("("):
@@ -1094,6 +1152,9 @@ def _resolve_ty(t, structs):
     if isinstance(t, K.RefT):
         e = _resolve_ty(t.inner, structs)
         return t if e is t.inner else K.RefT(e, t.mutable)
+    if isinstance(t, K.PtrT):
+        e = _resolve_ty(t.inner, structs)
+        return t if e is t.inner else K.PtrT(e, t.mutable)
     return t
 
 
@@ -1149,6 +1210,9 @@ def rs_parse_surface(src):
             raise ParseError(n.loc, "unsupported: `.%s()` used as a value" % n.kind)
         if isinstance(n, _Iter):
             raise ParseError(n.loc, "unsupported: iterator outside a `for` loop")
+        if isinstance(n, _SliceIdx):
+            raise ParseError(n.loc, "unsupported: unsized slice place `x[k..]` (the subset spells a re-slice "
+                                    "`&x[k..]` / `&mut x[k..]`)")
     return prog
 
 

@@ -80,7 +80,7 @@ def test_every_residual_is_reported_not_first_failure(tmp_path):
            "int f(int x) {\n"
            "    auto y = x;\n"
            "    x = y;\n"
-           "    int *p = &x;\n"
+           "    int **p = nullptr;\n"  # FR-261 accepts `int *p = &x;`; a T** stays out
            "    do { x--; } while (x);\n"
            "    return x > 0 ? x : -x;\n"
            "}\n"
@@ -91,7 +91,7 @@ def test_every_residual_is_reported_not_first_failure(tmp_path):
     assert errs(tmp_path, src) == [
         ("2:1", "unsupported: global variable"),
         ("4:5", "unsupported: auto-typed declaration"),
-        ("6:5", "unsupported: variable of type 'int *'"),
+        ("6:5", "unsupported: variable of type 'int **'"),
         ("7:5", "unsupported: do-while loop"),
         ("8:12", "unsupported: conditional operator `?:`"),
         ("11:5", "unsupported: printf conversion '%x'"),

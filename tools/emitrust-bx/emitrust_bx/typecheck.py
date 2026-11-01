@@ -78,6 +78,37 @@ initialization only of a struct without a constructor, and internal
       Meaning-preserving because no Kernel reference depends on declaration
       order; it is what makes law 1 hold for Rust input (any order) and for
       C++ input (define-before-use order) alike.
+
+FR-261 (pointers <=> suffix slices).  ``PtrT``: `const T*` <=> `&[T]`,
+`T*` <=> `&mut [T]`, for parameters and locals only.  `p[i]` is an Index on
+a pointer variable, `*p` the Index `p[0]`, `p->f` a Field of it, `p + k` /
+`v.data() + k` an ``Offset`` (`&p[k..]`), `&x` an ``AddrOf`` (`from_ref` /
+`from_mut`).  A `T*` value stands where a `const T*` is wanted (the
+qualification conversion; Rust's `&mut [T]` -> `&[T]` coercion), and a
+pointer value is Copy for the move rule.  The checker adds the alias rules
+measured on rustc 1.96/1.98 (R1: a mutable pointer argument's root is not
+used by another argument or elsewhere in the statement; R2: a pointer
+local's root is not used -- mutable -- or not modified or moved -- const --
+while the local is in scope; a mutable re-slice may not read its own root),
+refuses whole-pointer assignment, `p -= k`, pointer returns and pointer data
+members, and leaves R3/R4 (signed offsets, `p - k`, `p--`, pointer
+comparison and difference) to cxx_import, which never builds them.
+
+  N16 (C++ spelling, cxx_import) `*p`, `p[0]`, `(*p).f`, `p[0].f` and `p->f`
+      are one Kernel term (Index(p, 0usize), a Field of it); the canonical
+      C++ is `*p` / `p->f` / `p->m(..)`.
+  N17 (cxx_import) `&v[i]` / `&p[i]` -- the address of an element -- is the
+      suffix slice from it, Offset(v, i) / Offset(p, i) (`v.data() + i` /
+      `p + i`), never a one-element `from_mut`: C++ may index past it.
+  N18 Assign(p, Offset(Var p, k)) on a pointer variable -> CompoundAssign(
+      'add', p, k): `p = p + k;` (Rust `p = &p[k..];`) is `p += k;`.
+  N19 (cxx_import) a pointer index or offset is usize in the Kernel: a
+      non-negative int literal becomes a usize literal (printed back bare),
+      and an unsigned or provably non-negative signed one (a counting-loop
+      variable with a literal lower bound, a promoted unsigned char) becomes
+      `static_cast<std::size_t>(e)` <=> `e as usize`; any other signed one
+      is refused (R3: C++ defines a negative offset into the middle of an
+      array, a Rust slice cannot go backwards).
 """
 
 from . import kernel as K
@@ -134,11 +165,16 @@ STRUCT_RESERVED = {
     "Ord", "PartialOrd", "AsRef", "AsMut", "Into", "From", "TryFrom", "TryInto", "FromIterator", "Debug",
 }
 # FR-257: member-function names rs_parse reads as a Vec/String/Clone method
-# (or that the derived Clone already defines).
+# (or that the derived Clone already defines).  FR-261 found two more: the
+# 2021 prelude's `Into::into` / `TryInto::try_into` take `self` BY VALUE and
+# are implemented for every type, so method probing finds them at the
+# by-value step, BEFORE an inherent `&self` / `&mut self` method of the same
+# name (measured, rustc 1.96/1.98: `p.into(4)` is E0061, `p.try_into()`
+# E0277) -- a struct with such a member was accepted and emitted unbuildable.
 METHOD_RESERVED = {
     "len", "is_empty", "clone", "clone_from", "to_string", "as_bytes", "iter", "iter_mut", "push", "pop",
     "clear", "resize", "push_str", "wrapping_add", "wrapping_sub", "wrapping_mul", "wrapping_neg",
-    "copied", "cloned",
+    "copied", "cloned", "into", "try_into",
 }
 
 RESERVED = {
@@ -300,6 +336,75 @@ def place_path(e):
     return tuple(reversed(out))
 
 
+def place_mut(e, scope):
+    """FR-261: is the object at place ``e`` writable?  Through a pointer
+    (`p[i]`, `p->f`) the POINTEE's constness decides; through a reference
+    its kind; otherwise the variable's own mutability."""
+    deep = False
+    while isinstance(e, (K.Index, K.Field)):
+        e = e.base
+        deep = True
+    if not isinstance(e, K.Var):
+        return False
+    v = scope.lookup(e.name)
+    if v is None:
+        return False
+    ty, m = v
+    if isinstance(ty, K.PtrT):
+        return ty.mutable if deep else m
+    if isinstance(ty, K.RefT):
+        return ty.mutable
+    return m
+
+
+def ptr_root(a):
+    """FR-261: the variable a pointer VALUE borrows from (`p` for `p`, `p + k`
+    and `&p[0].f`; `v` for `v.data() + k` and `&v`), or None."""
+    if isinstance(a, K.Var):
+        return a.name
+    if isinstance(a, K.Offset):
+        return base_var(a.base)
+    if isinstance(a, K.AddrOf):
+        return base_var(a.place)
+    return None
+
+
+def ptr_root_node(a):
+    """The Var node of ``ptr_root`` (its other variables are only read)."""
+    e = a.base if isinstance(a, K.Offset) else a.place if isinstance(a, K.AddrOf) else a
+    while isinstance(e, (K.Index, K.Field)):
+        e = e.base
+    return e if isinstance(e, K.Var) else None
+
+
+def mut_param(pt):
+    """A parameter through which the callee may modify the caller's object:
+    `T&` (FR-251) or, FR-261, `T*`."""
+    return isinstance(pt, (K.RefT, K.PtrT)) and pt.mutable
+
+
+def arg_root(pt, a):
+    """The variable a by-reference / by-pointer argument ``a`` borrows."""
+    a = a.operand if isinstance(a, K.Borrow) else a
+    if isinstance(pt, K.RefT):
+        return base_var(a) if is_place(a) else None
+    if isinstance(pt, K.PtrT):
+        return ptr_root(a)
+    return None
+
+
+def arg_target(pt, a):
+    """FR-261: the PLACE a mutable pointer argument may write: an `&x`
+    object itself, the elements of a re-slice / pointer variable."""
+    if isinstance(a, K.AddrOf):
+        return a.place
+    if isinstance(a, K.Offset):
+        return K.Index(a.base, K.IntLit(0, K.USIZE))
+    if isinstance(a, K.Var):
+        return K.Index(a, K.IntLit(0, K.USIZE))
+    return None
+
+
 def path_prefix(a, b):
     """Is place path ``a`` a prefix of (or equal to) place path ``b``?"""
     return a is not None and b is not None and len(a) <= len(b) and b[:len(a)] == a
@@ -450,12 +555,29 @@ def type_of(e, scope, sigs):
         return t
     if isinstance(e, K.Index):
         bt = type_of(e.base, scope, sigs)
-        if not isinstance(bt, K.VecT):
+        if not isinstance(bt, (K.VecT, K.PtrT)):
             raise KernelTypeError(e.loc, "indexing a value of type %s" % bt)
         it = type_of(e.index, scope, sigs)
         if it != K.USIZE:
             raise KernelTypeError(getattr(e.index, "loc", None) or e.loc, "index of type %s, expected usize" % it)
-        return bt.elem
+        return bt.elem if isinstance(bt, K.VecT) else bt.inner
+    if isinstance(e, K.Offset):
+        bt = type_of(e.base, scope, sigs)
+        if e.start is not None:
+            st = type_of(e.start, scope, sigs)
+            if st != K.USIZE:
+                raise KernelTypeError(getattr(e.start, "loc", None) or e.loc,
+                                      "pointer offset of type %s, expected usize" % st)
+        if isinstance(bt, K.PtrT):
+            return bt
+        if isinstance(bt, K.VecT):
+            return K.PtrT(bt.elem, place_mut(e.base, scope))
+        raise KernelTypeError(e.loc, "slice of a value of type %s" % bt)
+    if isinstance(e, K.AddrOf):
+        t = type_of(e.place, scope, sigs)
+        if isinstance(t, K.PtrT):
+            raise KernelTypeError(e.loc, "unsupported: address of a pointer (a pointer to a pointer)")
+        return K.PtrT(t, place_mut(e.place, scope))
     if isinstance(e, K.ByteAt):
         bt = type_of(e.base, scope, sigs)
         if bt != K.STRING:
@@ -517,7 +639,7 @@ def _call_type(e, name, sig, args, scope, sigs):
         raise KernelTypeError(e.loc, "'%s' takes %d arguments, %d given" % (name, len(ptys), len(args)))
     for i, (pt, a) in enumerate(zip(ptys, args)):
         at = type_of(a, scope, sigs)
-        if at != K.deref(pt):
+        if not K.ptr_fits(at, K.deref(pt)):
             raise KernelTypeError(getattr(a, "loc", None) or e.loc,
                                   "argument %d of '%s' has type %s, expected %s" % (i + 1, name, at, K.deref(pt)))
     return ret
@@ -554,7 +676,7 @@ def value_type(e, scope, sigs):
 
 
 def _struct_known(t, e, sigs):
-    while isinstance(t, (K.VecT, K.RefT)):
+    while isinstance(t, (K.VecT, K.RefT, K.PtrT)):
         t = t.elem if isinstance(t, K.VecT) else t.inner
     if isinstance(t, K.StructT) and t.path not in structs_of(sigs):
         raise KernelTypeError(getattr(e, "loc", None), "use of undeclared struct '%s'" % t.path)
@@ -612,9 +734,8 @@ def mut_ref_args(call, sigs):
     if sig is None:
         return out
     for pt, a in zip(sig[0], call.args):
-        a = a.operand if isinstance(a, K.Borrow) else a
-        if isinstance(pt, K.RefT) and pt.mutable and is_place(a):
-            out.add(base_var(a))
+        if mut_param(pt) and arg_root(pt, a) is not None:
+            out.add(arg_root(pt, a))
     return out
 
 
@@ -672,9 +793,8 @@ def _method_mut_ref_args(n, sigs):
     for sig in method_sigs(n, sigs):
         if len(sig[0]) == len(n.args):
             for pt, a in zip(sig[0], n.args):
-                a = a.operand if isinstance(a, K.Borrow) else a
-                if isinstance(pt, K.RefT) and pt.mutable and is_place(a):
-                    out.add(base_var(a))
+                if mut_param(pt) and arg_root(pt, a) is not None:
+                    out.add(arg_root(pt, a))
     return out
 
 
@@ -691,6 +811,9 @@ def mutated_bases(block, sigs):
             b = base_var(n.iterable)
             if b:
                 out.add(b)
+        elif isinstance(n, K.Let) and isinstance(n.ty, K.PtrT) and n.ty.mutable and ptr_root(n.init):
+            # FR-261: a mutable pointer local is a `&mut` borrow of its root
+            out.add(ptr_root(n.init))
     for r in mut_receivers(block, sigs):
         b = base_var(r)
         if b:
@@ -726,8 +849,14 @@ def resizes(block, sigs, bound):
                     a = a.operand if isinstance(a, K.Borrow) else a
                     if isinstance(pt, K.RefT) and pt.mutable and is_place(a):
                         targets.append(a)
+                    elif isinstance(pt, K.PtrT) and pt.mutable and arg_target(pt, a) is not None:
+                        targets.append(arg_target(pt, a))
         elif isinstance(n, K.ForEach) and n.mode == "mut":
             targets.append(K.Index(n.iterable, K.IntLit(0, K.USIZE)))
+        elif isinstance(n, K.Let) and isinstance(n.ty, K.PtrT) and n.ty.mutable and ptr_root(n.init) == P[0]:
+            # FR-261: a mutable pointer made in the body may write ANYTHING
+            # reachable from its root (it is a `&mut` alias of it)
+            return True
     targets += mut_receivers(block, sigs)
     return any(path_prefix(place_path(t), P) for t in targets if place_path(t) is not None)
 
@@ -753,6 +882,17 @@ def declared_names(block):
         elif isinstance(n, (K.For, K.ForEach)):
             out.add(n.var)
     return out
+
+
+def child_blocks(s):
+    """The blocks nested directly in statement ``s``."""
+    if isinstance(s, K.Block):
+        return [s]
+    if isinstance(s, K.If):
+        return [s.then] + ([s.els] if s.els is not None else [])
+    if isinstance(s, (K.While, K.For, K.ForEach)):
+        return [s.body]
+    return []
 
 
 def stmt_exprs(s):
@@ -819,7 +959,7 @@ class _Checker:
             return None
         if self.surface == "rust":
             self.rust_spelling(e, scope)
-        if want is not None and t != want:
+        if want is not None and not K.ptr_fits(t, want):
             self.err(getattr(e, "loc", None), "expression has type %s, expected %s" % (t, want))
             return t
         self.wf(e, scope, pos)
@@ -872,8 +1012,29 @@ class _Checker:
                 if v is not None and not isinstance(v[0], K.RefT):
                     self.err(L, "unsupported: `*` of '%s', which is not a reference" % e.name)
         elif isinstance(e, (K.Index, K.ByteAt)):
+            if isinstance(e, K.Index) and not isinstance(e.base, K.Var) and self.is_ptr_expr(e.base, scope):
+                self.err(L, "unsupported: indexing a pointer expression other than a pointer variable")
             self.wf(e.base, scope, "borrow")
             self.wf(e.index, scope, "value")
+        elif isinstance(e, K.Offset):
+            bt = self.place_ty(e.base, scope)
+            if isinstance(bt, K.PtrT):
+                if not isinstance(e.base, K.Var):
+                    self.err(L, "unsupported: pointer arithmetic on something other than a pointer variable")
+                if e.start is None:
+                    self.err(L, "unsupported: whole slice `&p[..]` of a pointer (the subset spells it `p`)")
+            elif not is_place(e.base):
+                self.err(L, "unsupported: std::vector::data of something other than a variable or element")
+            self.wf(e.base, scope, "borrow")
+            if e.start is not None:
+                self.wf(e.start, scope, "value")
+        elif isinstance(e, K.AddrOf):
+            if not is_place(e.place):
+                self.err(L, "unsupported: address of something other than a variable or data member")
+            elif isinstance(e.place, K.Index):
+                self.err(L, "unsupported: address of an element in the Kernel (normal form N17 spells it as "
+                            "the suffix slice)")
+            self.wf(e.place, scope, "borrow")
         elif isinstance(e, (K.Len, K.IsEmpty)):
             self.wf(e.base, scope, "borrow")
         elif isinstance(e, K.VecLit):
@@ -928,6 +1089,49 @@ class _Checker:
         elif isinstance(e, K.StrLit):
             pass
 
+    def is_ptr_expr(self, e, scope):
+        try:
+            return isinstance(type_of(e, scope, self.sigs), K.PtrT)
+        except KernelTypeError:
+            return False
+
+    def ptr_value(self, a, want, scope, what):
+        """FR-261: a pointer VALUE in a pointer position (an argument for a
+        `T*` / `const T*` parameter, a pointer variable's initializer).  It
+        is a pointer variable, a re-slice `p + k` / `v.data() + k`, or `&x`;
+        a MUTABLE one may not read its own root in its offset or index (the
+        `&mut` borrow is taken first: E0502 / E0503, measured); on the Rust
+        surface its `&` / `&mut` / `from_ref` / `from_mut` spelling is the
+        one the expected type ``want`` fixes."""
+        L = getattr(a, "loc", None)
+        if not isinstance(a, (K.Var, K.Offset, K.AddrOf)):
+            self.err(L, "unsupported: %s is a pointer other than a pointer variable, `p + k`, `v.data()` or "
+                        "`&x`" % what)
+            return
+        root = ptr_root(a)
+        if want.mutable and root is not None:
+            if isinstance(a, K.Offset) and a.start is not None and mentions(a.start, root):
+                self.err(L, "unsupported: a mutable slice of '%s' starts at an offset that reads '%s' "
+                            "(a second borrow in Rust)" % (root, root))
+            elif isinstance(a, K.Offset) and has_index(a.base):
+                self.self_indexed(a.base)
+            elif isinstance(a, K.AddrOf):
+                self.self_indexed(a.place)
+        if self.surface != "rust":
+            return
+        if isinstance(a, K.Offset):
+            want_sp = "&mut" if want.mutable else "&"
+            if a.spelling != want_sp:
+                self.err(L, "unsupported: %s is not spelled the canonical way (`%s%s[..]`)" % (
+                    what, want_sp + (" " if want.mutable else ""), "x"))
+        elif isinstance(a, K.AddrOf):
+            bare = isinstance(a.place, K.Var) and isinstance((scope.lookup(a.place.name) or (None,))[0], K.RefT)
+            fn = "from_mut" if want.mutable else "from_ref"
+            want_sp = fn + ("()" if bare else "(&mut)" if want.mutable else "(&)")
+            if a.spelling != want_sp:
+                self.err(L, "unsupported: %s is not spelled the canonical way (`std::slice::%s(%s)`)" % (
+                    what, fn, "x" if bare else ("&mut x" if want.mutable else "&x")))
+
     def call_args(self, e, scope, name=None, sig=None, recv_use=None):
         if sig is None:
             sig = self.sigs.get(e.name)
@@ -938,6 +1142,18 @@ class _Checker:
         uses = [] if recv_use is None else [recv_use]
         for i, (pt, a) in enumerate(zip(sig[0], e.args)):
             raw = a
+            if isinstance(pt, K.PtrT):
+                # FR-261: a pointer argument borrows its root variable
+                self.ptr_value(a, pt, scope, "argument %d of '%s'" % (i + 1, e_name))
+                self.wf(a, scope, "borrow")
+                root = ptr_root(a)
+                rn = ptr_root_node(a)
+                if root is not None:
+                    uses.append((root, "pmut" if pt.mutable else "pshared", i))
+                for n in K.walk(a):
+                    if isinstance(n, K.Var) and n is not rn:
+                        uses.append((n.name, "read", i))
+                continue
             if isinstance(pt, K.RefT):
                 inner = a.operand if isinstance(a, K.Borrow) else a
                 L = getattr(inner, "loc", None) or e.loc
@@ -978,9 +1194,15 @@ class _Checker:
                 if isinstance(n, K.Var):
                     uses.append((n.name, "read", i))
         for name, kind, i in uses:
-            if kind != "mut" or i == -1:
+            if kind not in ("mut", "pmut") or i == -1:
                 continue
             others = [u for u in uses if u[0] == name and u[2] != i]
+            if others and kind == "pmut":
+                # FR-261 R1: `f(&mut v[1..], &v[..])` is E0502, `f(from_mut(&mut x), x)` E0503
+                self.err(e.loc, "unsupported: '%s' is passed to '%s' as a mutable pointer and also used by "
+                                "another argument of the same call (aliasing: a second borrow in Rust)"
+                         % (name, e_name))
+                break
             if others:
                 self.err(e.loc, "unsupported: '%s' is passed to '%s' by non-const reference and also used "
                                 "by another argument of the same call (aliasing)" % (name, e_name))
@@ -1018,8 +1240,8 @@ class _Checker:
         uses = self.call_args(e, scope, mp, sig) or []
         if b is None:
             return
-        direct_ref = [u for u in uses if u[0] == b and u[1] in ("shared", "mut")]
-        mutating = [u for u in uses if u[0] == b and u[1] == "mut"]
+        direct_ref = [u for u in uses if u[0] == b and u[1] in ("shared", "mut", "pshared", "pmut")]
+        mutating = [u for u in uses if u[0] == b and u[1] in ("mut", "pmut")]
         for a in e.args:
             for n in K.walk(a):
                 if isinstance(n, (K.Call, K.MethodCall)) and b in self.call_mutates(n, scope):
@@ -1042,9 +1264,8 @@ class _Checker:
         if sig is None:
             return out
         for pt, a in zip(sig[0], n.args):
-            a = a.operand if isinstance(a, K.Borrow) else a
-            if isinstance(pt, K.RefT) and pt.mutable and is_place(a):
-                out.add(base_var(a))
+            if mut_param(pt) and arg_root(pt, a) is not None:
+                out.add(arg_root(pt, a))
         if isinstance(n, K.MethodCall) and recv_of(self.sigs).get(path) == "mut":
             out.add(base_var(n.recv))
         return out
@@ -1067,6 +1288,11 @@ class _Checker:
         ty, mut = v
         if isinstance(ty, K.RefT):
             mut = ty.mutable
+        elif isinstance(ty, K.PtrT) and not isinstance(place, K.Var):
+            mut = ty.mutable  # FR-261: through a pointer the pointee's constness decides
+            if not mut:
+                self.err(getattr(place, "loc", None), "%s through '%s', a pointer to const" % (what, b))
+                return
         if not mut:
             self.err(getattr(place, "loc", None), "%s of immutable '%s'" % (what, b))
 
@@ -1196,8 +1422,10 @@ class _Checker:
                         self.err(m.loc, "constructor not named 'new'")
                 else:
                     p = ident_problem(m.name) or (
-                        "identifier '%s' is reserved by the canonical Rust spelling (a method of Vec/String or "
-                        "of the derived Clone)" % m.name if m.name in METHOD_RESERVED else None)
+                        "identifier '%s' is reserved by the canonical Rust spelling (%s)" % (
+                            m.name, "a by-value prelude trait method, found before a `&self` one"
+                            if m.name in ("into", "try_into") else "a method of Vec/String or of the derived Clone")
+                        if m.name in METHOD_RESERVED else None)
                     if p:
                         self.err(m.loc, p)
                     elif m.name in self.struct_leaves:
@@ -1228,9 +1456,12 @@ class _Checker:
                 seen.add(x)
                 stack.extend(direct(by[x]))
 
-    def type_ok(self, t, loc=None, ref_ok=False):
+    def type_ok(self, t, loc=None, ref_ok=False, ptr_ok=False):
         if isinstance(t, K.RefT):
             return ref_ok and self.type_ok(t.inner, loc)
+        if isinstance(t, K.PtrT):
+            # FR-261: parameters and locals only; the pointee is a value type
+            return ptr_ok and t.inner != K.UNIT and self.type_ok(t.inner, loc)
         if isinstance(t, K.StructT):
             return t.path in self.structs
         if isinstance(t, K.VecT):
@@ -1243,7 +1474,7 @@ class _Checker:
         namespace (rustc E0603); C++ would also accept `::a::S` from outside."""
         names = []
         for t in types:
-            while isinstance(t, (K.VecT, K.RefT)):
+            while isinstance(t, (K.VecT, K.RefT, K.PtrT)):
                 t = t.elem if isinstance(t, K.VecT) else t.inner
             if isinstance(t, K.StructT):
                 names.append(t.path)
@@ -1290,6 +1521,8 @@ class _Checker:
         if not (f.ret in K.ALL_PRIMS or f.ret == K.UNIT or K.is_owned_nc(f.ret)):
             if isinstance(f.ret, K.RefT):
                 self.err(f.loc, "unsupported: function returning a reference")
+            elif isinstance(f.ret, K.PtrT):
+                self.err(f.loc, "unsupported: function returning a pointer")
             else:
                 self.err(f.loc, "return type %s" % f.ret)
         elif f.ret != K.UNIT and not self.type_ok(f.ret):
@@ -1319,7 +1552,7 @@ class _Checker:
                 self.ctor_lit = st[-1].value
         for p in f.params:
             self.ident(p.name, p.loc)
-            if not self.type_ok(p.ty, p.loc, ref_ok=True):
+            if not self.type_ok(p.ty, p.loc, ref_ok=True, ptr_ok=True):
                 self.err(p.loc, "parameter type %s" % p.ty)
             if isinstance(p.ty, K.RefT) and p.mutable:
                 self.err(p.loc, "reference parameter '%s' declared mutable" % p.name)
@@ -1331,6 +1564,69 @@ class _Checker:
         if f.ret != K.UNIT and not definitely_returns(f.body) and not (f.recv == "ctor" and has_res):
             self.err(f.loc, "function '%s' may reach its end without returning a value" % f.path)
         self.check_moves(f)
+        self.check_ptr_scopes(f)
+
+    # ---------------------------------------------------- FR-261 R2
+    def check_ptr_scopes(self, f):
+        """A pointer LOCAL is a borrow of its root variable for the rest of
+        its block (conservatively its whole scope, not just its live range):
+        while a MUTABLE one (`&mut [T]`) is in scope the root is not
+        mentioned at all (E0499 / E0503 / E0506 in Rust; in C++ two names
+        for one object), while a CONST one (`&[T]`) is in scope the root is
+        not modified or moved (E0502 / E0505; in C++ often iterator
+        invalidation).  Roots are transitive through other pointer locals."""
+        roots_of = {}
+        # `return x;` ends the function, and every pointer local with it, so
+        # moving the root there is no conflict (rustc agrees: NLL)
+        ret_vals = {id(n.value) for n in K.walk(f.body) if isinstance(n, K.Return) and isinstance(n.value, K.Var)}
+        moved = {id(v) for v in self.moves} - ret_vals
+        # name -> is it (in this scope) a CONST pointer variable?
+        top = {p.name: isinstance(p.ty, K.PtrT) and not p.ty.mutable for p in f.params}
+
+        def visit(block, env):
+            env = dict(env)
+            for i, s in enumerate(block.stmts):
+                if isinstance(s, K.Let) and isinstance(s.ty, K.PtrT):
+                    r = ptr_root(s.init)
+                    rs = set()
+                    if r is not None:
+                        rs.add(r)
+                        rs |= roots_of.get(r, set())
+                    roots_of[s.name] = roots_of.get(s.name, set()) | rs
+                    for root in sorted(rs):
+                        if not s.ty.mutable and env.get(root):
+                            # a `&[T]` variable is Copy: a const pointer made of
+                            # it borrows its pointee, never the variable, which
+                            # may be re-sliced freely (its own roots still count)
+                            continue
+                        self.ptr_live(s, root, block.stmts[i + 1:], moved)
+                if isinstance(s, K.Let):
+                    env[s.name] = isinstance(s.ty, K.PtrT) and not s.ty.mutable
+                for b in child_blocks(s):
+                    inner = dict(env)
+                    if isinstance(s, (K.For, K.ForEach)):
+                        inner[s.var] = False
+                    visit(b, inner)
+
+        visit(f.body, top)
+
+    def ptr_live(self, let, root, rest, moved):
+        for s in rest:
+            if let.ty.mutable:
+                hit = [n for n in K.walk(s) if isinstance(n, K.Var) and n.name == root]
+                if not hit and root in mutated_bases(K.Block((s,)), self.sigs):
+                    hit = [s]  # `x = e;` names x as a target, not a Var (E0506)
+                if hit:
+                    self.err(hit[0].loc or s.loc,"unsupported: '%s' is used while '%s', a mutable pointer derived "
+                                                  "from it, is in scope (a second borrow in Rust)" % (root, let.name))
+                    return
+            else:
+                blk = K.Block((s,))
+                if root in mutated_bases(blk, self.sigs) or any(
+                        isinstance(n, K.Var) and n.name == root and id(n) in moved for n in K.walk(s)):
+                    self.err(s.loc, "unsupported: '%s' is modified or moved while '%s', a pointer into it, is in "
+                                    "scope (a borrow conflict in Rust)" % (root, let.name))
+                    return
 
     def ctor_shape(self, f):
         """A constructor is a member-initializer list: its body is exactly
@@ -1350,7 +1646,7 @@ class _Checker:
         return t in K.ALL_PRIMS or t == K.STRING or (isinstance(t, K.VecT) and K.elem_ok(t.elem))
 
     def local_type_ok(self, t):
-        return self.type_ok(t)
+        return self.type_ok(t, ptr_ok=True)
 
     # ---------------------------------------------------- the move rule
     def check_moves(self, f):
@@ -1446,12 +1742,16 @@ class _Checker:
             if sig is None:
                 continue
             for pt, a in zip(sig[0], c.args):
-                a = a.operand if isinstance(a, K.Borrow) else a
-                if not (isinstance(pt, K.RefT) and pt.mutable and is_place(a)):
+                if not mut_param(pt) or arg_root(pt, a) is None:
                     continue
-                b = base_var(a)
+                b = arg_root(pt, a)
                 inside = sum(1 for n in K.walk(c) if isinstance(n, K.Var) and n.name == b)
                 total = sum(1 for e in exprs for n in K.walk(e) if isinstance(n, K.Var) and n.name == b)
+                if total > inside and isinstance(pt, K.PtrT):
+                    self.err(c.loc or s.loc, "unsupported: '%s' is passed to '%s' as a mutable pointer and "
+                                             "also used elsewhere in the statement (C++ leaves the order "
+                                             "unspecified)" % (b, path))
+                    return
                 if total > inside:
                     self.err(c.loc or s.loc, "unsupported: '%s' is passed to '%s' by non-const reference and "
                                              "also used elsewhere in the statement (C++ leaves the order "
@@ -1484,7 +1784,9 @@ class _Checker:
                 self.err(s.loc, "initializer of '%s' refers to a variable of the same name" % s.name)
             if not self.local_type_ok(s.ty):
                 self.err(s.loc, "variable type %s" % s.ty)
-            self.expr(s.init, scope, s.ty, self.consume_pos(s.ty))
+            t = self.expr(s.init, scope, s.ty, self.consume_pos(s.ty))
+            if isinstance(s.ty, K.PtrT) and t is not None:
+                self.ptr_value(s.init, s.ty, scope, "the initializer of '%s'" % s.name)
             scope.declare(s.name, s.ty, s.mutable)
         elif isinstance(s, (K.Assign, K.CompoundAssign)):
             v = scope.lookup(s.name)
@@ -1496,6 +1798,9 @@ class _Checker:
                 ty, mut = ty.inner, ty.mutable
             if not mut:
                 self.err(s.loc, "assignment to immutable '%s'" % s.name)
+            if isinstance(ty, K.PtrT):
+                self.ptr_assign(s, ty, scope)
+                return
             if isinstance(s, K.Assign):
                 self.expr(s.value, scope, ty, self.consume_pos(ty))
                 return
@@ -1649,7 +1954,10 @@ class _Checker:
             if s.var in assigned:
                 self.err(s.loc, "counting loop body assigns the loop variable '%s'" % s.var)
             if isinstance(s.hi, K.Var):
-                if s.hi.name in assigned or s.hi.name in declared_names(s.body):
+                # (FR-261: mutated_bases adds a mutable pointer made of the bound
+                # in the body -- `int* q = &n; *q = 0;` changes what C++ re-reads)
+                if (s.hi.name in assigned or s.hi.name in declared_names(s.body)
+                        or s.hi.name in mutated_bases(s.body, sigs)):
                     self.err(s.loc, "counting loop body assigns or shadows the bound '%s'" % s.hi.name)
             inner = scope.child()
             # already reported above if the body assigns it: declaring it
@@ -1674,6 +1982,40 @@ class _Checker:
             pass
         else:
             self.err(getattr(s, "loc", None), "not a statement: %r" % (s,))
+
+    def ptr_assign(self, s, ty, scope):
+        """FR-261: a pointer variable changes only by a FORWARD re-slice of
+        itself, `p += k;` / `++p;` <=> `p = &p[k..];` (normal form N18 makes
+        `p = p + k;` the same term).  Whole-pointer assignment is refused: a
+        parameter's Rust lifetime is the caller's, so `p = q;` is a lifetime
+        error, and a local's would need a borrow-scope proof."""
+        if isinstance(s, K.Assign):
+            v = s.value
+            if self.surface == "rust" and isinstance(v, K.Offset) and isinstance(v.base, K.Var) \
+                    and v.base.name == s.name and v.start is not None:
+                # the Rust surface `p = &p[k..];` (N18 makes it `p += k`)
+                self.expr(v, scope, ty)
+                self.ptr_value(v, ty, scope, "the re-slice of '%s'" % s.name)
+                return
+            if self.surface == "rust":
+                self.err(s.loc, "unsupported: assignment of a slice other than a re-slice of itself "
+                                "(`%s = &%s[k..];`)" % (s.name, s.name))
+            else:
+                self.err(s.loc, "unsupported: assignment of a pointer (the subset re-slices a pointer only by "
+                                "`p += k;` / `++p;`)")
+            return
+        if self.surface == "rust":
+            self.err(s.loc, "unsupported: `%s=` on a slice (the subset spells a re-slice `%s = &%s[k..];`)" % (
+                {"add": "+", "sub": "-"}.get(s.op, s.op), s.name, s.name))
+            return
+        if s.op != "add":
+            self.err(s.loc, "unsupported: pointer decrement or `p -= k` (a Rust suffix slice cannot move "
+                            "backwards)")
+            return
+        self.expr(s.value, scope, K.USIZE)
+        if ty.mutable and mentions(s.value, s.name):
+            self.err(s.loc, "unsupported: a mutable slice of '%s' starts at an offset that reads '%s' "
+                            "(a second borrow in Rust)" % (s.name, s.name))
 
     def elem_arg_alias(self, s, args):
         """`v[i].push(v[j].len())` borrows v mutably (IndexMut) while the
@@ -1876,6 +2218,11 @@ class _Normalizer:
             return K.ToStr(self.expr(e.operand, scope), e.loc)
         if isinstance(e, K.Field):
             return K.Field(self.expr(e.base, scope), e.name, e.loc)
+        if isinstance(e, K.Offset):
+            return K.Offset(self.expr(e.base, scope), None if e.start is None else self.expr(e.start, scope),
+                            e.loc, e.spelling)
+        if isinstance(e, K.AddrOf):
+            return K.AddrOf(self.expr(e.place, scope), e.loc, e.spelling)
         if isinstance(e, K.StructLit):
             sd = structs_of(self.sigs).get(e.path)
             ftys = [f.ty for f in sd.fields] if sd is not None and len(sd.fields) == len(e.values) \
@@ -1940,6 +2287,9 @@ class _Normalizer:
             if (isinstance(v, K.Binary) and v.op in K.COMPOUND_OPS and isinstance(v.lhs, K.Var)
                     and v.lhs.name == s.name and isinstance(t, K.Prim) and not self.keep):
                 return K.CompoundAssign(v.op, s.name, v.rhs, s.loc, v.spelling)  # N5
+            if (isinstance(t, K.PtrT) and isinstance(v, K.Offset) and isinstance(v.base, K.Var)
+                    and v.base.name == s.name and v.start is not None and not self.keep):
+                return K.CompoundAssign("add", s.name, v.start, s.loc)  # N18: `p = p + k` is `p += k`
             return K.Assign(s.name, v, s.loc)
         if isinstance(s, K.CompoundAssign):
             return K.CompoundAssign(s.op, s.name, self.expr(s.value, scope), s.loc, s.spelling)

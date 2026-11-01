@@ -80,11 +80,27 @@ FR-257 (structs), measured on the same clang:
   the parameter list is the FIRST parenthesized group.
 * constructor initializers are listed in initialization (= declaration)
   order whatever order they are written in.
+
+FR-261 (pointers), measured on the same clang:
+
+* a pointer type has NO desugared spelling (`const uint8_t *`, `size_t *`,
+  `S *`, `int *const`), so its pointee is parsed here, the common
+  <cstdint>/<cstddef> names through POINTEE_TYPEDEFS; `T**`, `void*`,
+  function pointers and a reference to a pointer stay outside.
+* `p[i]` is an ArraySubscriptExpr whose base is LValueToRValue of the
+  pointer and whose index is NOT converted (an `int` literal stays `int`):
+  normal form N19 makes it usize; `*p` a UnaryOperator `*`, `p->f` a
+  MemberExpr with `isArrow` over the pointer (N16: all `p[0]`); `p + k` a
+  BinaryOperator of pointer type; `p++` / `++p` / `p += k` act on the
+  pointer local; `&v[i]` is `&` over an operator[] call (N17: the suffix).
+* a `T*` passed for `const T*` is a NoOp ImplicitCastExpr (seen through);
+  `nullptr` / `0` for a pointer is NullToPointer, `if (p)` PointerToBoolean.
 """
 
 import bisect
 import json
 import os
+import re
 import subprocess
 
 from . import fmt
@@ -134,9 +150,28 @@ def parse_cxx_type(q, struct=None):
         return None, False
     if q.endswith("&"):
         inner, const = parse_cxx_type(q[:-1], struct)
-        if inner is None or isinstance(inner, K.RefT):
+        if inner is None or isinstance(inner, (K.RefT, K.PtrT)):
             return None, False
         return K.RefT(inner, not const), False
+    if is_ptr_spelling(q):
+        # FR-261: `const T *` <=> &[T], `T *` <=> &mut [T]; `T *const` is
+        # top-level const.  T** / void* / a function pointer stay outside.
+        top = False
+        if not q.endswith("*"):
+            q = q[:-len("const")].rstrip()
+            top = True
+        body = q[:-1].strip()
+        if body.endswith("*") or "(" in body or "&" in body:
+            return None, top
+        bconst = body.startswith("const ")
+        bare = body[len("const "):].strip() if bconst else body
+        if bare.endswith(" const"):
+            bconst, bare = True, bare[:-len(" const")].strip()
+        bare = _POINTEE_TYPEDEF_RE.sub(lambda m: POINTEE_TYPEDEFS.get(m.group(0), m.group(0)), bare)
+        inner, iconst = parse_cxx_type(bare, struct)
+        if inner is None or inner == K.UNIT or isinstance(inner, (K.RefT, K.PtrT)) or "volatile" in body:
+            return None, top
+        return K.PtrT(inner, not (bconst or iconst)), top
     const = False
     if q.startswith("const "):
         const = True
@@ -164,6 +199,26 @@ def parse_cxx_type(q, struct=None):
         if st is not None:
             return st, const
     return None, const
+
+
+def is_ptr_spelling(q):
+    """Is the clang spelling ``q`` a pointer type (`T *`, `T *const`)?"""
+    q = (q or "").strip()
+    return q.endswith("*") or q.replace(" ", "").endswith("*const")
+
+
+# FR-261: a pointer type has no desugared spelling in clang's JSON
+# (`const uint8_t *`), so the <cstdint>/<cstddef> names a pointee is
+# commonly written with are resolved here, to the type their scalar
+# desugaring maps to on LP64 (uint64_t is `unsigned long`, like size_t).
+POINTEE_TYPEDEFS = {
+    "uint8_t": "unsigned char", "std::uint8_t": "unsigned char",
+    "int32_t": "int", "std::int32_t": "int", "uint32_t": "unsigned int", "std::uint32_t": "unsigned int",
+    "int64_t": "long", "std::int64_t": "long", "uint64_t": "unsigned long", "std::uint64_t": "unsigned long",
+    "size_t": "unsigned long", "std::size_t": "unsigned long",
+}
+# (also inside a pointee's template arguments: `std::vector<uint8_t> *`)
+_POINTEE_TYPEDEF_RE = re.compile(r"(?<![\w:])(?:std::)?(?:u?int(?:8|32|64)_t|size_t)\b")
 
 
 def run_clang(path, clang="clang++"):
@@ -210,7 +265,18 @@ FRIENDLY = {
     "StaticAssertDecl": "static_assert", "CXXMethodDecl": "member function",
     "BinaryConditionalOperator": "conditional operator `?:`",
     "CompoundLiteralExpr": "compound literal", "StmtExpr": "statement expression",
+    "CXXReinterpretCastExpr": "reinterpret_cast", "CXXConstCastExpr": "const_cast",
 }
+
+# FR-261 refusals (each names the pointer SHAPE; see the module docstring)
+R3_SIGNED = ("signed pointer offset (C++ allows a negative offset into the middle of an array; a Rust suffix "
+             "slice cannot go backwards)")
+R3_MINUS = "pointer arithmetic `p - k` (a Rust suffix slice cannot go backwards)"
+R3_DEC = "pointer decrement (a Rust suffix slice cannot go backwards)"
+R4_CMP = ("pointer comparison (Rust compares slices by contents, and suffixes of distinct objects can have equal "
+          "lengths)")
+R4_DIFF = "pointer difference (a Rust slice has no address to subtract)"
+R6_NULL = "null pointer (the subset's pointers always point into an object)"
 
 
 def friendly(kind):
@@ -314,6 +380,7 @@ class CxxImporter:
         self.cpath = []  # clang's spelling of the enclosing namespaces
         self.record_cpath = {}
         self.ctor_types = {}  # struct path -> its user constructor's type string
+        self.nonneg_ids = set()  # FR-261: decl ids of counting-loop variables with a literal lower bound
 
     # -------------------------------------------------------------- utils
     def is_main(self, f):
@@ -357,6 +424,15 @@ class CxxImporter:
     def map_type(self, t):
         """(Kernel type or None, is_const, spelling)."""
         q = self.qual(t) or ""
+        d0 = t.get("desugaredQualType") if isinstance(t, dict) else None
+        if is_ptr_spelling(q) or is_ptr_spelling(d0):
+            # FR-261: the pointee's constness is not top-level const
+            kt, top = (None, False)
+            if d0 and is_ptr_spelling(d0):
+                kt, top = parse_cxx_type(d0, self.struct_canonical)
+            if kt is None:
+                kt, top = parse_cxx_type(q, self.struct_written)
+            return kt, top, q
         const = False
         s = q
         if s.startswith("const "):
@@ -664,7 +740,7 @@ class CxxImporter:
             ty, const, spelled = self.map_type(m.get("type"))
             if const:
                 bad = "const data member"
-            elif ty is None or ty == K.UNIT or isinstance(ty, K.RefT):
+            elif ty is None or ty == K.UNIT or isinstance(ty, (K.RefT, K.PtrT)):
                 bad = "data member of type '%s'" % spelled
             elif isinstance(ty, K.VecT) and not K.elem_ok(ty.elem):
                 bad = "data member of type '%s'" % spelled
@@ -852,10 +928,13 @@ class CxxImporter:
             self.cur = None
             return K.Func(name, tuple(params), ret, K.Block(tuple(pre) + (body,), self.loc(n)), floc,
                           tuple(ns), False, owner["name"], recv)
-        self.ret_ref = isinstance(ret, K.RefT)
+        self.ret_ref = isinstance(ret, (K.RefT, K.PtrT))
         if isinstance(ret, K.RefT):
             pre.append(K.ResidualStmt("function returning a reference", floc))
             ret = ret.inner  # its returns become cascades, not more reports
+        elif isinstance(ret, K.PtrT):
+            pre.append(K.ResidualStmt("return type '%s'" % rs, floc))
+            ret = ret.inner  # FR-261: like a reference, its returns become cascades
         elif ret is None or (isinstance(ret, K.VecT) and not K.elem_ok(ret.elem)):
             pre.append(K.ResidualStmt("return type '%s'" % rs, floc))
             ret = K.UNIT
@@ -957,6 +1036,7 @@ class CxxImporter:
                 return [self.rstmt(n, "return inside main other than the final `return 0;`")]
             v = (n.get("inner") or [None])[0]
             if v is not None and getattr(self, "ret_ref", False):
+                # (a reference / FR-261 pointer return type is reported once, at the function)
                 return [K.Return(K.ResidualExpr("returned reference", L, cascade=True), L)]
             if v is not None and K.is_owned_nc(self.ret):
                 return [K.Return(self.consume(v, self.ret), L)]
@@ -1107,10 +1187,20 @@ class CxxImporter:
                 return self.compound_elem(n, tgt)
             return self.rstmt(n, "compound assignment to something other than a local variable")
         op = COMPOUND_OPCODES.get(n.get("opcode"))
-        if op is None:
-            return self.rstmt(n, "operator '%s'" % n.get("opcode"))
         v = self.scope.lookup(name)
         T = K.deref(v[0]) if v else None
+        if isinstance(T, K.PtrT):
+            # FR-261: `p += k;` (a forward re-slice); `p -= k;` cannot be one
+            if op == "sub":
+                return self.rstmt(n, R3_DEC)
+            if op != "add":
+                return self.rstmt(n, "operator '%s'" % n.get("opcode"))
+            k = self.ptr_offset(n["inner"][1])
+            if isinstance(k, K.ResidualExpr):
+                return K.ResidualStmt(k.reason, k.loc)
+            return K.CompoundAssign("add", name, k, L)
+        if op is None:
+            return self.rstmt(n, "operator '%s'" % n.get("opcode"))
         CL = self.map_type(n.get("computeLHSType"))[0]
         rhs = self.expr(n["inner"][1])
         if T == K.BOOL:
@@ -1156,6 +1246,11 @@ class CxxImporter:
             return self.rstmt(n, "increment of something other than a local variable")
         v = self.scope.lookup(name)
         T = K.deref(v[0]) if v else None
+        if isinstance(T, K.PtrT):
+            # FR-261: `++p;` is the forward re-slice `p = &p[1..];`
+            if op != "add":
+                return self.rstmt(n, R3_DEC)
+            return K.CompoundAssign("add", name, K.IntLit(1, K.USIZE, L), L)
         if T in K.ARITH_INT:
             return K.CompoundAssign(op, name, K.IntLit(1, T, L), L)
         if T == K.F64:
@@ -1199,6 +1294,10 @@ class CxxImporter:
         name = vd.get("name")
         lo = self.expr(vd["inner"][0])
         hi = self.expr(cond["inner"][1])
+        if isinstance(lo, K.IntLit):
+            # FR-261 (N19): starts at a literal >= 0, only ever incremented
+            # below a bound of its own type -- never negative
+            self.nonneg_ids.add(vid)
         saved = self.scope
         self.scope = saved.child()
         self.scope.declare(name, ty, False)
@@ -1274,7 +1373,7 @@ class CxxImporter:
                 sl = self.string_lit(a)
                 cs = self.c_str_base(a)
                 if sl is None and cs is not None:
-                    segs.append(K.Spec("s", self.borrowed(cs)))
+                    segs.append(K.Spec("s", self.borrowed(cs) if isinstance(cs, dict) else cs))
                     continue
                 if sl is None:
                     return self.rstmt(a, "printf %s of something other than a string literal")
@@ -1337,6 +1436,8 @@ class CxxImporter:
                 return self.rexpr(n, "array-to-pointer decay")
             if ck == "FunctionToPointerDecay":
                 return self.rexpr(n, "function pointer")
+            if ck in ("PointerToBoolean", "NullToPointer"):
+                return self.rexpr(n, R6_NULL)
             return self.rexpr(n, "implicit conversion (%s)" % ck)
         if k in ("CXXStaticCastExpr", "CStyleCastExpr", "CXXFunctionalCastExpr"):
             T, _, spelled = self.map_type(n.get("type"))
@@ -1349,7 +1450,7 @@ class CxxImporter:
                 return self.rexpr(n, "cast to '%s'" % spelled)
             if n.get("castKind") == "ToVoid":
                 return self.rexpr(n, "cast to void")
-            if T is None or T == K.UNIT:
+            if T is None or T == K.UNIT or isinstance(T, K.PtrT):
                 return self.rexpr(n, "cast to '%s'" % spelled)
             e = self.expr(n["inner"][0])
             if T == K.BOOL:
@@ -1404,10 +1505,17 @@ class CxxImporter:
             if op in ("++", "--"):
                 return self.rexpr(n, "increment/decrement used as a value")
             if op == "&":
-                return self.rexpr(n, "address-of")
+                return self.addr_of(n)
             if op == "*":
                 if self.is_this_deref(n):
                     return K.Var("self", L)
+                p = self.ptr_var(n["inner"][0])
+                if p is not None:
+                    return K.Index(p, K.IntLit(0, K.USIZE, L), L)  # N16: `*p` is `p[0]`
+                if self.is_ptr_node(n["inner"][0]):
+                    inner = self.expr(n["inner"][0])
+                    if isinstance(inner, K.ResidualExpr):
+                        return inner  # name the pointer shape (`*(p - 1)` is R3)
                 return self.rexpr(n, "dereference")
             e = self.expr(n["inner"][0])
             if op == "+":
@@ -1423,6 +1531,8 @@ class CxxImporter:
                 return self.rexpr(n, "assignment used as a value")
             if op == ",":
                 return self.rexpr(n, "comma operator")
+            if any(self.is_ptr_node(x) for x in n["inner"][:2]):
+                return self.ptr_binary(n)
             kop = OPCODES.get(op)
             if kop is None:
                 return self.rexpr(n, "operator '%s'" % op)
@@ -1472,7 +1582,121 @@ class CxxImporter:
             return self.member_access(n)
         if k == "InitListExpr" and isinstance(self.map_type(n.get("type"))[0], K.StructT):
             return self.struct_init(n)
+        if k == "ArraySubscriptExpr":
+            return self.subscript(n)
+        if k == "CXXThisExpr" and self.cur is not None and self.cur[1] in ("ref", "mut"):
+            return K.AddrOf(K.Var("self", L), L)  # FR-261: `this` is `&*this`
         return self.rexpr(n, friendly(k))
+
+    # ================================================== FR-261: pointers
+    def is_ptr_node(self, n):
+        return isinstance(n, dict) and is_ptr_spelling(self.qual(n.get("type")))
+
+    def ptr_var(self, n):
+        """K.Var for a reference to a pointer-typed local or parameter, or None."""
+        name = self.local_ref(n)
+        if name is None:
+            return None
+        v = self.scope.lookup(name)
+        if v is None or not isinstance(v[0], K.PtrT):
+            return None
+        return K.Var(name, self.loc(self.strip(n)))
+
+    def nonneg(self, e, n):
+        """Is the signed Kernel expression ``e`` (clang node ``n``) provably
+        non-negative?  A counting-loop variable with a literal lower bound, or
+        a widening conversion of an unsigned value (`unsigned char` promoted
+        to int)."""
+        u = self.strip(n)
+        if u.get("kind") == "DeclRefExpr" and u.get("referencedDecl", {}).get("id") in self.nonneg_ids:
+            return True
+        bits = {"i8": 8, "u8": 8, "i32": 32, "u32": 32, "i64": 64, "u64": 64, "usize": 64}
+        if isinstance(e, K.Cast) and e.ty in K.SIGNED:
+            t = self.ty_of(e.operand)
+            return t in K.UNSIGNED and bits[t.name] < bits[e.ty.name]
+        return False
+
+    def ptr_offset(self, n):
+        """N19: a pointer index / offset as a usize Kernel expression."""
+        e = self.expr(n)
+        if isinstance(e, K.ResidualExpr):
+            return e
+        t = self.ty_of(e)
+        if t is None or t == K.USIZE:
+            return e
+        L = getattr(e, "loc", None) or self.loc(n)
+        if isinstance(e, K.IntLit):
+            return K.IntLit(e.value, K.USIZE, e.loc)
+        if t in K.UNSIGNED or (t in K.SIGNED and self.nonneg(e, n)):
+            return K.Cast(K.USIZE, e, L)
+        if t in K.SIGNED:
+            return self.rexpr(n, R3_SIGNED)
+        return self.rexpr(n, "pointer offset of type '%s'" % (self.qual(n.get("type")) or t))
+
+    def subscript(self, n):
+        """`p[i]` on a pointer variable (an array, `(p + 1)[i]` or `i[p]`
+        keep the old residual)."""
+        base, idx = n["inner"][0], n["inner"][1]
+        p = self.ptr_var(base)
+        if p is None:
+            return self.rexpr(n, "array subscript")
+        i = self.ptr_offset(idx)
+        if isinstance(i, K.ResidualExpr):
+            return i
+        return K.Index(p, i, self.loc(n))
+
+    def addr_of(self, n):
+        """`&x` (a one-element slice), `&v[i]` / `&p[i]` (N17: the suffix)."""
+        L = self.loc(n)
+        u = self.strip_tmp(n["inner"][0])
+        if self.ptr_var(u) is not None:
+            return self.rexpr(n, "address of a pointer (a pointer to a pointer)")
+        pl = self.place(u)
+        if isinstance(pl, K.ResidualExpr):
+            if pl.reason == "copy of something other than a variable or element":
+                return self.rexpr(n, "address-of")
+            return pl
+        if isinstance(pl, K.Index) and isinstance(self.ty_of(pl.base), (K.PtrT, K.VecT)):
+            return K.Offset(pl.base, pl.index, L)
+        if isinstance(pl, K.Index):
+            return self.rexpr(n, "address-of")
+        return K.AddrOf(pl, L)
+
+    def ptr_binary(self, n):
+        """A binary operator with a pointer operand: only `p + k` (on a
+        pointer variable or `v.data()`) is in the subset."""
+        op = n.get("opcode")
+        a, b = n["inner"][0], n["inner"][1]
+        pa, pb = self.is_ptr_node(a), self.is_ptr_node(b)
+        null = any(self.is_null(x) for x in (a, b))
+        if null:
+            return self.rexpr(n, R6_NULL)
+        if op in ("==", "!=", "<", "<=", ">", ">="):
+            return self.rexpr(n, R4_CMP)
+        if op == "-" and pa and pb:
+            return self.rexpr(n, R4_DIFF)
+        if op == "-":
+            return self.rexpr(n, R3_MINUS)
+        if op != "+" or not pa or pb:
+            return self.rexpr(n, "pointer arithmetic other than `p + k`" if op == "+" else "operator '%s'" % op)
+        base = self.expr(a)
+        if isinstance(base, K.ResidualExpr):
+            return base
+        k = self.ptr_offset(b)
+        if isinstance(k, K.ResidualExpr):
+            return k
+        L = self.loc(n)
+        if isinstance(base, K.Var) and isinstance(self.ty_of(base), K.PtrT):
+            return K.Offset(base, k, L)
+        if isinstance(base, K.Offset) and base.start is None:
+            return K.Offset(base.base, k, L)  # `v.data() + k`
+        return self.rexpr(n, "pointer arithmetic other than `p + k` on a pointer variable or `v.data()`")
+
+    def is_null(self, n):
+        u = self.strip(n)
+        while isinstance(u, dict) and u.get("kind") == "ImplicitCastExpr" and u.get("castKind") == "NullToPointer":
+            return True
+        return isinstance(u, dict) and u.get("kind") in ("CXXNullPtrLiteralExpr", "GNUNullExpr")
 
     def import_args(self, fname, nodes):
         """Kernel arguments for a call of ``fname`` (or a ResidualExpr)."""
@@ -1529,6 +1753,10 @@ class CxxImporter:
         if n.get("isArrow"):
             if base.get("kind") == "CXXThisExpr" and self.cur is not None and self.cur[1] in ("ref", "mut"):
                 return K.Field(K.Var("self", L), fname, L)
+            p = self.ptr_var(base)
+            if p is not None:
+                # FR-261 (N16): `p->f` is `p[0].f`
+                return K.Field(K.Index(p, K.IntLit(0, K.USIZE, L), L), fname, L)
             return self.rexpr(n, "member access through a pointer")
         u = self.strip_tmp(n["inner"][0])
         if u.get("valueCategory") != "lvalue" and not self.is_this_deref(u):
@@ -1794,6 +2022,10 @@ class CxxImporter:
             return self.member_access(u)
         if self.is_this_deref(u):
             return K.Var("self", L)
+        if k == "UnaryOperator" and u.get("opcode") == "*":
+            return self.expr(u)  # FR-261: `*p` (or the old "dereference" residual)
+        if k == "ArraySubscriptExpr":
+            return self.subscript(u)
         if k == "CXXOperatorCallExpr" and self.op_name(u) == "operator[]":
             e = self.operator_expr(u)
             if isinstance(e, K.ByteAt):
@@ -1823,6 +2055,10 @@ class CxxImporter:
         me = self.strip(u["inner"][0])
         if me.get("kind") == "MemberExpr" and me.get("name") == "c_str" and not me.get("isArrow"):
             return me["inner"][0]
+        if me.get("kind") == "MemberExpr" and me.get("name") == "c_str" and self.ptr_var(me["inner"][0]) is not None:
+            # FR-261: `p->c_str()` (a std::string through a pointer)
+            L = self.loc(me)
+            return K.Index(self.ptr_var(me["inner"][0]), K.IntLit(0, K.USIZE, L), L)
         return None
 
     def back_front(self, recv, which, n):
@@ -1841,6 +2077,11 @@ class CxxImporter:
             base = self.strip(me["inner"][0])
             if base.get("kind") == "CXXThisExpr" and self.cur is not None and self.cur[1] in ("ref", "mut"):
                 return me.get("name"), K.Var("self", self.loc(me)), self.real_args(n)[1:], None
+            p = self.ptr_var(base)
+            if p is not None:
+                # FR-261 (N16): `p->m(..)` is `p[0].m(..)`
+                L = self.loc(me)
+                return me.get("name"), K.Index(p, K.IntLit(0, K.USIZE, L), L), self.real_args(n)[1:], None
             return None, None, None, self.rexpr(n, "member access through a pointer")
         recv = self.borrowed(me["inner"][0])
         if isinstance(recv, K.ResidualExpr):
@@ -1878,6 +2119,11 @@ class CxxImporter:
             if name == "at":
                 return self.rexpr(n, "std::vector::at (bounds-checked access that throws; the subset has "
                                      "operator[])")
+            if name == "data" and not args:
+                # FR-261: `v.data()` <=> `&v[..]` (the elements as a slice)
+                if not TC.is_place(recv) or any(isinstance(x, K.Call) for x in K.walk(recv)):
+                    return self.rexpr(n, "std::vector::data of something other than a variable or element")
+                return K.Offset(recv, None, L)
             if name in ("begin", "end", "cbegin", "cend", "rbegin", "rend", "data", "insert", "erase"):
                 return self.rexpr(n, "std::vector::%s (iterators and pointers are outside the subset)" % name)
             if name in ("push_back", "pop_back", "clear", "resize"):
@@ -2000,6 +2246,13 @@ class CxxImporter:
         k = u.get("kind")
         if k == "MemberExpr":
             e = self.member_access(u)
+            if isinstance(e, K.ResidualExpr):
+                return K.ResidualStmt(e.reason, e.loc)
+            return e
+        if (k == "UnaryOperator" and u.get("opcode") == "*" and not self.is_this_deref(u)) \
+                or k == "ArraySubscriptExpr":
+            # FR-261: a store through a pointer, `*p = e` / `p[i] = e`
+            e = self.expr(u)
             if isinstance(e, K.ResidualExpr):
                 return K.ResidualStmt(e.reason, e.loc)
             return e

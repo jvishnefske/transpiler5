@@ -47,6 +47,12 @@ FR-251 rows:
   `v.resize(n, x);`, `s += t;`, `s.push_back(c);`, `++v[i];` for += 1,
   `x.c_str()` as a printf %s argument.
 
+FR-261 rows (pointers): `const T*` / `T*` parameters and locals (top-level
+const after the star: `T* const p`); `p[i]` (a literal index bare: `p[2]`),
+`*p` for `p[0]` and `p->f` / `p->m(..)` / `p->size()` for its members
+(normal form N16), `p + k`, `v.data()`, `v.data() + k`, `&x`, `this` (the
+address of `*this`), `p += k;` / `++p;`.
+
 FR-257 rows (structs):
 
 * layout: forward declarations `struct S;` (only for a struct named before
@@ -96,6 +102,8 @@ def cxx_ty(t, ns=()):
         return "%s%s&" % ("" if t.mutable else "const ", cxx_ty(t.inner, ns))
     if isinstance(t, K.StructT):
         return cxx_path(t.path, ns)
+    if isinstance(t, K.PtrT):
+        return "%s%s*" % ("" if t.mutable else "const ", cxx_ty(t.inner, ns))
     return CXX_TYPE[t.name]
 
 
@@ -159,7 +167,7 @@ class _Printer:
         return TC.type_of(e, scope, self.sigs)
 
     def note_ty(self, t):
-        if isinstance(t, K.RefT):
+        if isinstance(t, (K.RefT, K.PtrT)):
             t = t.inner
         if isinstance(t, K.VecT):
             self.includes.add("vector")
@@ -171,9 +179,16 @@ class _Printer:
         self.note_ty(t)
         return cxx_ty(t, self.ns)
 
-    @staticmethod
-    def atomic(e):
+    def is_deref(self, e, scope):
+        """FR-261: Index(p, 0usize) on a pointer variable -- printed `*p`
+        (normal form N16), a member of it `p->f`."""
+        return (isinstance(e, K.Index) and e.index == K.IntLit(0, K.USIZE) and scope is not None
+                and isinstance(self.ty(e.base, scope), K.PtrT))
+
+    def atomic(self, e, scope=None):
         if isinstance(e, K.Var) and e.name == "self":
+            return False
+        if self.is_deref(e, scope):
             return False
         return isinstance(e, (K.IntLit, K.FloatLit, K.BoolLit, K.Var, K.Call, K.Cast, K.StrLit, K.Index,
                               K.ByteAt, K.Len, K.IsEmpty, K.VecLit, K.VecFill, K.StrNew, K.StrFrom,
@@ -181,7 +196,7 @@ class _Printer:
 
     def recv(self, e, scope):
         s = self.expr(e, scope)
-        return s if self.atomic(e) else "(" + s + ")"
+        return s if self.atomic(e, scope) else "(" + s + ")"
 
     def consume(self, e, scope, is_return=False):
         """A consuming position: a bare owned non-Copy variable MOVES."""
@@ -196,7 +211,18 @@ class _Printer:
         """`this->` for `self`, otherwise `base.`."""
         if isinstance(base, K.Var) and base.name == "self":
             return "this->"
+        if self.is_deref(base, scope):
+            return self.expr(base.base, scope) + "->"
         return self.recv(base, scope) + "."
+
+    def offset_index(self, e, scope):
+        """FR-261: a pointer index / offset (usize in the Kernel).  A literal
+        is printed as a plain int literal -- C++ pointer arithmetic takes
+        any integer, and cxx_import reads a non-negative int literal back as
+        the usize one (N19)."""
+        if isinstance(e, K.IntLit) and e.ty == K.USIZE and e.value <= 0x7FFFFFFF:
+            return str(e.value)
+        return self.expr(e, scope)
 
     def nc_expr(self, e, scope):
         if isinstance(e, K.Clone):
@@ -209,12 +235,29 @@ class _Printer:
             rt = self.ty(e.recv, scope)
             sig = self.sigs[TC.method_path(rt.path, e.name)]
             return "%s%s(%s)" % (self.member(e.recv, scope), e.name, self.args(sig[0], e.args, scope))
+        if isinstance(e, K.Index) and isinstance(self.ty(e.base, scope), K.PtrT):
+            if self.is_deref(e, scope):
+                return "*" + self.expr(e.base, scope)
+            return "%s[%s]" % (self.expr(e.base, scope), self.offset_index(e.index, scope))
         if isinstance(e, (K.Index, K.ByteAt)):
             return "%s[%s]" % (self.recv(e.base, scope), self.expr(e.index, scope))
+        if isinstance(e, K.Offset):
+            if isinstance(self.ty(e.base, scope), K.PtrT):
+                head = self.expr(e.base, scope)
+            else:
+                head = self.member(e.base, scope) + "data()"
+            if e.start is None:
+                return head
+            st = self.offset_index(e.start, scope)
+            return "%s + %s" % (head, "(" + st + ")" if isinstance(e.start, K.Binary) else st)
+        if isinstance(e, K.AddrOf):
+            if isinstance(e.place, K.Var) and e.place.name == "self":
+                return "this"
+            return "&" + self.expr(e.place, scope)
         if isinstance(e, K.Len):
-            return self.recv(e.base, scope) + ".size()"
+            return self.member(e.base, scope) + "size()"
         if isinstance(e, K.IsEmpty):
-            return self.recv(e.base, scope) + ".empty()"
+            return self.member(e.base, scope) + "empty()"
         if isinstance(e, K.VecLit):
             t = self.tyname(K.VecT(e.elem))
             if not e.elems:
@@ -233,7 +276,7 @@ class _Printer:
             args = self.expr(e.pos, scope)
             if e.count is not None:
                 args += ", " + self.expr(e.count, scope)
-            return "%s.substr(%s)" % (self.recv(e.base, scope), args)
+            return "%ssubstr(%s)" % (self.member(e.base, scope), args)
         if isinstance(e, K.ToStr):
             self.includes.add("string")
             return "std::to_string(%s)" % self.expr(e.operand, scope)
@@ -254,7 +297,7 @@ class _Printer:
             ptys = self.sigs[e.name][0]
             return "%s(%s)" % (self.callee(e.name), self.args(ptys, e.args, scope))
         if isinstance(e, (K.Clone, K.Index, K.ByteAt, K.Len, K.IsEmpty, K.VecLit, K.VecFill, K.StrNew,
-                          K.StrFrom, K.Substr, K.ToStr, K.Field, K.StructLit, K.MethodCall)):
+                          K.StrFrom, K.Substr, K.ToStr, K.Field, K.StructLit, K.MethodCall, K.Offset, K.AddrOf)):
             return self.nc_expr(e, scope)
         if isinstance(e, K.Cast):
             return "static_cast<%s>(%s)" % (CXX_TYPE[e.ty.name], self.expr(e.operand, scope))
@@ -265,7 +308,7 @@ class _Printer:
             else:
                 sym = "!" if t == K.BOOL else "~"
             inner = self.expr(e.operand, scope)
-            return sym + ("(" + inner + ")" if not self.atomic(e.operand) else inner)
+            return sym + ("(" + inner + ")" if not self.atomic(e.operand, scope) else inner)
         if isinstance(e, K.Binary):
             consume = e.op == "add" and self.ty(e.lhs, scope) == K.STRING
             return "%s %s %s" % (self.operand(e, e.lhs, scope, True, consume), CXX_BINOP[e.op],
@@ -300,7 +343,11 @@ class _Printer:
             self.block_body(s, scope, d + 1)
             self.emit(d, "}")
         elif isinstance(s, K.Let):
-            head = "%s%s %s" % ("" if s.mutable else "const ", self.tyname(s.ty), s.name)
+            if isinstance(s.ty, K.PtrT):
+                # FR-261: top-level const follows the pointer (`T* const q`)
+                head = "%s%s %s" % (self.tyname(s.ty), "" if s.mutable else " const", s.name)
+            else:
+                head = "%s%s %s" % ("" if s.mutable else "const ", self.tyname(s.ty), s.name)
             i = s.init
             if isinstance(i, K.VecLit) and not i.elems or isinstance(i, K.StrNew):
                 self.emit(d, head + ";")
@@ -320,7 +367,13 @@ class _Printer:
         elif isinstance(s, K.CompoundAssign):
             t = K.deref(scope.lookup(s.name)[0])
             v = s.value
-            if (s.op in ("add", "sub") and isinstance(v, K.IntLit) and v.value == 1 and v.ty == t
+            if isinstance(t, K.PtrT):
+                # FR-261: a forward re-slice `p += k;` / `++p;`
+                if v == K.IntLit(1, K.USIZE):
+                    self.emit(d, "++%s;" % s.name)
+                else:
+                    self.emit(d, "%s += %s;" % (s.name, self.offset_index(v, scope)))
+            elif (s.op in ("add", "sub") and isinstance(v, K.IntLit) and v.value == 1 and v.ty == t
                     and t in K.ARITH_INT):
                 self.emit(d, "%s%s;" % ("++" if s.op == "add" else "--", s.name))
             else:
@@ -337,18 +390,18 @@ class _Printer:
             else:
                 self.emit(d, "%s %s= %s;" % (tgt, CXX_BINOP[s.op], self.expr(v, scope)))
         elif isinstance(s, K.Push):
-            self.emit(d, "%s.push_back(%s);" % (self.recv(s.target, scope), self.consume(s.value, scope)))
+            self.emit(d, "%spush_back(%s);" % (self.member(s.target, scope), self.consume(s.value, scope)))
         elif isinstance(s, K.Pop):
-            self.emit(d, "%s.pop_back();" % self.recv(s.target, scope))
+            self.emit(d, "%spop_back();" % self.member(s.target, scope))
         elif isinstance(s, K.Clear):
-            self.emit(d, "%s.clear();" % self.recv(s.target, scope))
+            self.emit(d, "%sclear();" % self.member(s.target, scope))
         elif isinstance(s, K.Resize):
-            self.emit(d, "%s.resize(%s, %s);" % (self.recv(s.target, scope), self.expr(s.count, scope),
+            self.emit(d, "%sresize(%s, %s);" % (self.member(s.target, scope), self.expr(s.count, scope),
                                                  self.expr(s.value, scope)))
         elif isinstance(s, K.PushStr):
             self.emit(d, "%s += %s;" % (self.expr(s.target, scope), self.expr(s.value, scope)))
         elif isinstance(s, K.PushByte):
-            self.emit(d, "%s.push_back(%s);" % (self.recv(s.target, scope), self.expr(s.value, scope)))
+            self.emit(d, "%spush_back(%s);" % (self.member(s.target, scope), self.expr(s.value, scope)))
         elif isinstance(s, K.ForEach):
             t = self.ty(s.iterable, scope)
             el = self.tyname(t.elem)
@@ -375,7 +428,7 @@ class _Printer:
                 argty = K.STR if sg.kind == "s" else self.ty(sg.arg, scope)
                 text.append(fmt.c_spec_text(sg, argty))
                 if sg.kind == "s" and not isinstance(sg.arg, K.StrLit):
-                    args.append(self.recv(sg.arg, scope) + ".c_str()")
+                    args.append(self.member(sg.arg, scope) + "c_str()")
                 else:
                     args.append(self.expr(sg.arg, scope))
             self.emit(d, 'std::printf("%s"%s);' % ("".join(text), "".join(", " + a for a in args)))
@@ -430,6 +483,8 @@ class _Printer:
         for p in f.params:
             if isinstance(p.ty, K.RefT):
                 ps.append("%s %s" % (self.tyname(p.ty), p.name))
+            elif isinstance(p.ty, K.PtrT):
+                ps.append("%s%s %s" % (self.tyname(p.ty), "" if p.mutable else " const", p.name))
             else:
                 ps.append("%s%s %s" % ("" if p.mutable else "const ", self.tyname(p.ty), p.name))
             scope.declare(p.name, p.ty, p.mutable)
@@ -506,7 +561,7 @@ def struct_mentions(sd):
     out = []
 
     def add(t):
-        while isinstance(t, (K.VecT, K.RefT)):
+        while isinstance(t, (K.VecT, K.RefT, K.PtrT)):
             t = t.elem if isinstance(t, K.VecT) else t.inner
         if isinstance(t, K.StructT) and t.path != sd.path and t.path not in out:
             out.append(t.path)
