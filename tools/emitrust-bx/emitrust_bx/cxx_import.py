@@ -409,6 +409,7 @@ class CxxImporter:
         self.poisoned = set()  # ids of local decls that became residuals
         # FR-257 structs
         self.records = []  # (node, ns, internal) main-file struct definitions
+        self.bad_records = set()  # ids of records with a residual AT the class
         self.record_path = {}  # record decl id -> absolute path
         self.struct_canon = {}  # canonical clang spelling -> path
         self.struct_paths = set()
@@ -743,6 +744,7 @@ class CxxImporter:
         n_before = len(items)
         if n.get("bases"):
             items.append(K.ResidualItem("class with a base class (inheritance)", L))
+            self.bad_records.add(n["id"])
         access = "private" if n.get("tagUsed") == "class" else "public"
         for m in n.get("inner", []):
             k = m.get("kind")
@@ -776,6 +778,7 @@ class CxxImporter:
             # attributes to every member (the member-level ones above stay
             # where the construct is)
             items.append(K.ResidualItem("struct with members outside the subset", L))
+            self.bad_records.add(n["id"])
         shell = K.StructDef(sh["name"], tuple(sh["fields"]), (), L, ns, internal)
         self.sigs.structs[path] = shell
         return sh
@@ -873,10 +876,18 @@ class CxxImporter:
             return [K.ResidualItem(friendly(n.get("kind")), self.loc(n))]
         prev = n.get("previousDecl")
         if prev in self.method_ids and self.has_body(n):
-            if self.method_ids[prev] is not None:
-                self.defs[prev] = n
-                self.method_ids[n["id"]] = self.method_ids[prev]
-                self.user_funcs[n["id"]] = self.method_ids[prev]
+            # The definition is a separate item from its in-class declaration,
+            # so a rejection of the declaration or of its class is repeated
+            # HERE, located: a per-function census would otherwise count the
+            # body of a rejected member as clean.
+            if self.method_ids[prev] is None:
+                return [K.ResidualItem("definition of a rejected member function", self.loc(n))]
+            self.defs[prev] = n
+            self.method_ids[n["id"]] = self.method_ids[prev]
+            self.user_funcs[n["id"]] = self.method_ids[prev]
+            if rid in self.bad_records:
+                return [K.ResidualItem("member function of a struct with members outside the subset",
+                                       self.loc(n))]
             return []
         if prev in self.method_ids:
             return []  # a redeclaration without a body

@@ -1795,10 +1795,10 @@ anchor = "FR-261 (opened 2026-11-01, from FR-258): **BX POINTER BUFFERS"
 [[items]]
 id = "FR-262"
 kind = "feature"
-status = "open"
+status = "spiked"
 rank = 62
 size = "M"
 title = "BX multi-TU projects: cross-TU calls resolved, one crate"
-summary = "~88 probe-observed functions call other TUs."
+summary = "Spike: header visibility +3..+6 strict EMIT, cross-TU linking +0; one-TU normalizer, not a bijection row. Kill line unreachable."
 blocked_by = ["FR-260"]
 anchor = "FR-262 (opened 2026-11-01, from FR-258): **BX MULTI-TU"
