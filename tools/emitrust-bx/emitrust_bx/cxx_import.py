@@ -58,6 +58,28 @@ FR-260 (namespaces), measured on the same clang:
   becomes an ABSOLUTE Kernel path and using-directives, using-declarations
   of user functions and aliases of this file's namespaces are erased
   (spelling only).  `using std::string;` & co keep FR-251's residual.
+
+FR-257 (structs), measured on the same clang:
+
+* a struct/class definition is a CXXRecordDecl with `completeDefinition`;
+  members carry no access key (AccessSpecDecl entries switch it; `class`
+  starts private); implicit special members are `isImplicit`.  A FieldDecl
+  flags `isBitfield`, `hasInClassInitializer`, `mutable`.
+* a MemberExpr names its member by `referencedMemberDecl` id; implicit
+  member access is a MemberExpr with `isArrow` over an implicit CXXThisExpr.
+* type spellings: `desugaredQualType` is the CANONICAL, fully qualified one
+  (`a::Q`) and is read first; a reference's pointee and a function type's
+  return keep only the WRITTEN spelling (`const Q &` inside namespace a),
+  resolved here with C++'s innermost-namespace-first lookup.
+* an aggregate `S{a, b}` is a NoOp CXXFunctionalCastExpr over an
+  InitListExpr (a CXXBindTemporaryExpr in between when S has a non-trivial
+  destructor); an omitted scalar member is an ImplicitValueInitExpr.
+* a call of the user constructor is a CXXConstructExpr whose `ctorType` is
+  the constructor's own type string; the implicit copy constructor's type
+  may end in `noexcept(false)` (a struct holding a vector of itself), so
+  the parameter list is the FIRST parenthesized group.
+* constructor initializers are listed in initialization (= declaration)
+  order whatever order they are written in.
 """
 
 import bisect
@@ -99,10 +121,11 @@ _STRING_SPELLINGS = (
 )
 
 
-def parse_cxx_type(q):
+def parse_cxx_type(q, struct=None):
     """A clang type spelling -> (Kernel type or None, top-level const).
 
     References become RefT; `const` under a reference makes it shared.
+    FR-257: ``struct(name)`` resolves a record name to a StructT (or None).
     """
     if q is None:
         return None, False
@@ -110,7 +133,7 @@ def parse_cxx_type(q):
     if q.endswith("&&"):
         return None, False
     if q.endswith("&"):
-        inner, const = parse_cxx_type(q[:-1])
+        inner, const = parse_cxx_type(q[:-1], struct)
         if inner is None or isinstance(inner, K.RefT):
             return None, False
         return K.RefT(inner, not const), False
@@ -131,10 +154,15 @@ def parse_cxx_type(q):
             return None, const
         if len(args) not in (1, 2):
             return None, const
-        el, econst = parse_cxx_type(args[0])
+        el, econst = parse_cxx_type(args[0], struct)
         if el is None or econst or isinstance(el, K.RefT):
             return None, const
         return K.VecT(el), const
+    if struct is not None:
+        name = q[len("struct "):] if q.startswith("struct ") else q[len("class "):] if q.startswith("class ") else q
+        st = struct(name.strip())
+        if st is not None:
+            return st, const
     return None, const
 
 
@@ -270,6 +298,22 @@ class CxxImporter:
         self.user_funcs = {}  # decl id -> name
         self.locals = {}  # decl id -> name
         self.poisoned = set()  # ids of local decls that became residuals
+        # FR-257 structs
+        self.records = []  # (node, ns, internal) main-file struct definitions
+        self.record_path = {}  # record decl id -> absolute path
+        self.struct_canon = {}  # canonical clang spelling -> path
+        self.struct_paths = set()
+        self.field_ids = {}  # FieldDecl id -> (struct path, name)
+        self.method_ids = {}  # CXXMethodDecl/ctor id (decl and definition) -> path
+        self.ctor_of = {}  # struct path -> ctor decl node
+        self.defs = {}  # in-class method decl id -> out-of-line definition node
+        self.ctx_ns = ()
+        self.has_using = False
+        self.ambiguous = set()
+        self.cur = None  # (owner path, recv kind) while importing a member function
+        self.cpath = []  # clang's spelling of the enclosing namespaces
+        self.record_cpath = {}
+        self.ctor_types = {}  # struct path -> its user constructor's type string
 
     # -------------------------------------------------------------- utils
     def is_main(self, f):
@@ -327,14 +371,47 @@ class CxxImporter:
                 d = d[len("const "):]
             if d in TYPE_MAP and "volatile" not in q:
                 return TYPE_MAP[d], const, q
-        # FR-251: vectors, strings, references
-        kt, c2 = parse_cxx_type(q)
-        if kt is None and d:
-            kt, c3 = parse_cxx_type(d)
+        # FR-251: vectors, strings, references.  FR-257: the DESUGARED
+        # spelling is canonical (fully qualified `a::Q`) and is read first;
+        # the written one (`Q` inside namespace a) only when clang printed
+        # no desugared form (a reference's pointee, a function type).
+        kt, c2 = (None, False)
+        if d:
+            kt, c2 = parse_cxx_type(d, self.struct_canonical)
+        if kt is None:
+            kt, c3 = parse_cxx_type(q, self.struct_written)
             c2 = c2 or c3
         if kt is not None:
             return kt, const or c2, q
         return None, const, q
+
+    # -------------------------------------------------------------- FR-257
+    def struct_canonical(self, name):
+        p = self.struct_canon.get(name)
+        return K.StructT(p) if p is not None else None
+
+    def struct_written(self, name):
+        """A record name as WRITTEN in namespace ``self.ctx_ns``: C++
+        unqualified/qualified lookup searches the innermost enclosing
+        namespace first (a type can hide only behind a member, and no
+        member may be named like a struct).  A using-directive could make a
+        farther struct win, so with one in the file an ambiguous name is
+        refused rather than guessed."""
+        if name in self.struct_canon and "(anonymous namespace)" in name:
+            return K.StructT(self.struct_canon[name])
+        name = name[2:] if name.startswith("::") else name
+        ns = self.ctx_ns
+        cands = []
+        for i in range(len(ns), -1, -1):
+            p = K.path_of(ns[:i], name) if ns[:i] else name
+            if p in self.struct_paths:
+                cands.append(p)
+        if not cands:
+            return None
+        if len(set(cands)) > 1 and self.has_using:
+            self.ambiguous.add(name)
+            return None
+        return K.StructT(cands[0])
 
     def ty_of(self, e):
         try:
@@ -370,8 +447,16 @@ class CxxImporter:
             self.index_ns(n, (), False)
         items = []
         funcs = []
+        self.out_of_line = []
         for n in mains:
             self.collect(n, (), False, items, funcs)
+        # FR-257: index the structs BEFORE any type is read
+        for n, ns, internal in self.records:
+            path = K.path_of(ns, n["name"])
+            self.record_path[n["id"]] = path
+            self.struct_paths.add(path)
+            canon = "::".join(self.record_cpath[n["id"]] + [n["name"]])
+            self.struct_canon[canon] = path
         # a main-file function redeclaring an earlier (e.g. header) decl:
         # a reference may name either decl id
         for n, ns, internal in funcs:
@@ -379,21 +464,27 @@ class CxxImporter:
             if prev and prev not in self.user_funcs:
                 self.user_funcs[prev] = K.path_of(ns, n.get("name"))
         # signatures (for typing calls)
-        self.sigs = {}
+        self.sigs = TC.Sigs()
         defined = set()
         for n, ns, internal in funcs:
             if self.has_body(n):
+                self.ctx_ns = ns
                 ptys, ret = self.signature_types(n)
                 path = K.path_of(ns, n.get("name"))
                 if path != "main":
                     self.sigs.setdefault(path, (ptys, ret))
                 defined.add(path)
+        structs = [self.struct_shell(n, ns, internal, items) for n, ns, internal in self.records]
+        for n in self.out_of_line:
+            items.extend(self.attach_definition(n))
         for n, ns, internal in funcs:
             if not self.has_body(n):
                 if K.path_of(ns, n.get("name")) not in defined:
                     items.append(K.ResidualItem("function declared but not defined", self.loc(n)))
                 continue
             items.append(self.func(n, ns, internal))
+        for sd in structs:
+            items.append(self.struct_def(sd, items))
         # keep source order
         items.sort(key=lambda it: (it.loc.line, it.loc.col) if it.loc else (0, 0))
         return K.Program(tuple(items))
@@ -422,6 +513,12 @@ class CxxImporter:
                 ns, internal = self.ns_index[pid]
             funcs.append((n, ns, internal))
             self.user_funcs[n["id"]] = K.path_of(ns, n.get("name"))
+        elif k == "CXXRecordDecl":
+            self.collect_record(n, ns, internal, items)
+        elif k in ("CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl"):
+            # an out-of-line member definition; matched to its class once
+            # every class is known (an unknown class keeps the old residual)
+            self.out_of_line.append(n)
         elif k == "NamespaceDecl":
             name = n.get("name") or ""
             if n.get("isInline"):
@@ -437,8 +534,12 @@ class CxxImporter:
                     items.append(K.ResidualItem("namespace name: " + p, self.loc(n)))
                     return
             inner_ns, inner_internal = (ns + (name,), internal) if name else (ns, True)
-            for c in n.get("inner", []):
-                self.collect(c, inner_ns, inner_internal, items, funcs)
+            self.cpath.append(name or "(anonymous namespace)")
+            try:
+                for c in n.get("inner", []):
+                    self.collect(c, inner_ns, inner_internal, items, funcs)
+            finally:
+                self.cpath.pop()
         elif k == "LinkageSpecDecl":
             for c in n.get("inner", []):
                 if (not ns and c.get("kind") == "FunctionDecl" and c.get("name") == "printf"
@@ -452,9 +553,13 @@ class CxxImporter:
             # FR-260: name lookup is RESOLVED by clang (every reference
             # carries its decl id), so a using-directive is pure spelling:
             # erased, like `using namespace std;` always was.
+            if (n.get("nominatedNamespace") or {}).get("id") in self.ns_index \
+                    and self.decl_main.get((n.get("nominatedNamespace") or {}).get("id")):
+                self.has_using = True
             return
         elif k in ("UsingDecl", "UsingShadowDecl"):
             if self.using_is_user(n):
+                self.has_using = True
                 return  # `using a::f;` of a user function: spelling only
             if k == "UsingDecl":
                 items.append(K.ResidualItem(friendly(k), self.loc(n)))
@@ -465,6 +570,190 @@ class CxxImporter:
             items.append(K.ResidualItem("namespace alias of a namespace outside this file", self.loc(n)))
         else:
             items.append(K.ResidualItem(friendly(k), self.loc(n)))
+
+    # -------------------------------------------------------------- FR-257
+    def collect_record(self, n, ns, internal, items):
+        """A main-file struct/class at namespace scope."""
+        if n.get("isImplicit") or not n.get("completeDefinition"):
+            return  # a forward declaration is spelling only
+        L = self.loc(n)
+        if n.get("tagUsed") == "union":
+            items.append(K.ResidualItem("union", L))
+            return
+        if not n.get("name"):
+            items.append(K.ResidualItem("class/struct definition", L))
+            return
+        self.records.append((n, ns, internal))
+        self.record_cpath[n["id"]] = list(self.cpath)
+
+    MEMBER_KINDS = {
+        "FriendDecl": "friend declaration", "FunctionTemplateDecl": "member function template",
+        "CXXRecordDecl": "nested class", "EnumDecl": "enum inside a class", "TypedefDecl": "member typedef",
+        "TypeAliasDecl": "member typedef", "StaticAssertDecl": "static_assert inside a class",
+        "UsingDecl": "using-declaration inside a class", "IndirectFieldDecl": "anonymous union or struct member",
+        "CXXConversionDecl": "conversion operator",
+    }
+
+    def struct_shell(self, n, ns, internal, items):
+        """Fields and member-function SIGNATURES of one struct (bodies are
+        imported later, when every signature is known)."""
+        path = self.record_path[n["id"]]
+        L = self.loc(n)
+        self.ctx_ns = ns
+        sh = {"path": path, "name": n["name"], "ns": ns, "internal": internal, "loc": L, "fields": [],
+              "methods": [], "node": n}
+        n_before = len(items)
+        if n.get("bases"):
+            items.append(K.ResidualItem("class with a base class (inheritance)", L))
+        access = "private" if n.get("tagUsed") == "class" else "public"
+        for m in n.get("inner", []):
+            k = m.get("kind")
+            if m.get("isImplicit"):
+                continue
+            ML = self.lines.at(_off(m.get("loc"))) or L
+            if k == "AccessSpecDecl":
+                access = m.get("access")
+                continue
+            if access != "public" and k in ("FieldDecl", "CXXMethodDecl", "CXXConstructorDecl",
+                                            "CXXDestructorDecl", "VarDecl"):
+                items.append(K.ResidualItem("private or protected member", ML))
+                self.poison_member(m, path)
+                continue
+            if k == "FieldDecl":
+                self.shell_field(m, sh, items, ML)
+            elif k == "VarDecl":
+                items.append(K.ResidualItem("static data member", ML))
+            elif k in ("CXXMethodDecl", "CXXConstructorDecl"):
+                self.shell_method(m, sh, items, ML)
+            elif k == "CXXDestructorDecl":
+                items.append(K.ResidualItem("user-declared destructor", ML))
+                self.poison_member(m, path)
+            else:
+                items.append(K.ResidualItem(self.MEMBER_KINDS.get(k, "%s inside a class" % friendly(k)), ML))
+                self.poison_member(m, path)
+        member_res = [it for it in items[n_before:] if it.loc != L]
+        if member_res and not any(it.loc == L for it in items[n_before:]):
+            # the struct cannot be emitted, so neither can any of its member
+            # functions: one residual AT THE CLASS, which a per-function census
+            # attributes to every member (the member-level ones above stay
+            # where the construct is)
+            items.append(K.ResidualItem("struct with members outside the subset", L))
+        shell = K.StructDef(sh["name"], tuple(sh["fields"]), (), L, ns, internal)
+        self.sigs.structs[path] = shell
+        return sh
+
+    def poison_member(self, m, path):
+        if m.get("kind") == "FieldDecl":
+            self.field_ids[m["id"]] = (path, None)
+        else:
+            self.method_ids[m["id"]] = None
+
+    def shell_field(self, m, sh, items, ML):
+        name = m.get("name")
+        bad = None
+        if m.get("isBitfield"):
+            bad = "bit-field"
+        elif m.get("hasInClassInitializer"):
+            bad = "default member initializer"
+        elif m.get("mutable"):
+            bad = "mutable data member"
+        elif not name:
+            bad = "unnamed data member"
+        ty = None
+        if bad is None:
+            ty, const, spelled = self.map_type(m.get("type"))
+            if const:
+                bad = "const data member"
+            elif ty is None or ty == K.UNIT or isinstance(ty, K.RefT):
+                bad = "data member of type '%s'" % spelled
+            elif isinstance(ty, K.VecT) and not K.elem_ok(ty.elem):
+                bad = "data member of type '%s'" % spelled
+        if bad is not None:
+            items.append(K.ResidualItem(bad, ML))
+            self.field_ids[m["id"]] = (sh["path"], None)
+            return
+        self.field_ids[m["id"]] = (sh["path"], name)
+        sh["fields"].append(K.FieldDef(name, ty, ML))
+
+    def shell_method(self, m, sh, items, ML):
+        k = m.get("kind")
+        name = m.get("name") or ""
+        qt = self.qual(m.get("type")) or ""
+        bad = None
+        if k == "CXXMethodDecl" and name.startswith("operator"):
+            bad = "operator overload"
+        elif m.get("virtual") or m.get("pure"):
+            bad = "virtual member function"
+        elif m.get("explicitlyDeleted") or m.get("explicitlyDefaulted"):
+            bad = "defaulted or deleted member function"
+        elif "volatile" in qt:
+            bad = "volatile member function"
+        elif k == "CXXConstructorDecl":
+            ps = [p for p in m.get("inner", []) if p.get("kind") == "ParmVarDecl"]
+            if len(ps) == 1:
+                pq = (self.qual(ps[0].get("type")) or "").replace(" ", "")
+                if pq in ("const%s&" % sh["name"], "%s&&" % sh["name"], "%s&" % sh["name"]) \
+                        or pq.endswith("::%s&" % sh["name"]) or pq.endswith("::%s&&" % sh["name"]):
+                    bad = "user-declared copy or move constructor"
+            if bad is None and any(x["kind"] == "CXXConstructorDecl" for x, _ in sh["methods"]):
+                bad = "overloaded constructor"
+        if bad is not None:
+            items.append(K.ResidualItem(bad, ML))
+            self.method_ids[m["id"]] = None
+            return
+        if k == "CXXConstructorDecl":
+            recv = "ctor"
+            mpath = sh["path"] + "::new"
+            self.ctor_types[sh["path"]] = qt
+        else:
+            recv = "static" if m.get("storageClass") == "static" else (
+                "ref" if qt.rstrip().endswith("const") else "mut")
+            mpath = sh["path"] + "::" + name
+        self.method_ids[m["id"]] = mpath
+        self.user_funcs[m["id"]] = mpath
+        sh["methods"].append((m, recv))
+        if mpath in self.sigs:
+            return  # (an overload: reported when the struct is checked)
+        ptys = []
+        for p in m.get("inner", []):
+            if p.get("kind") == "ParmVarDecl":
+                ptys.append(self.map_type(p.get("type"))[0])
+        if recv == "ctor":
+            ret = K.StructT(sh["path"])
+        else:
+            rs = self.ret_type_str(m)
+            if rs.endswith("const"):
+                rs = rs[:-len("const")].strip()
+            ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written)[0]
+        self.sigs[mpath] = (tuple(ptys), ret)
+        self.sigs.recv[mpath] = recv
+
+    def attach_definition(self, n):
+        """An out-of-line member definition `int S::f() const {..}`."""
+        rid = n.get("parentDeclContextId")
+        if rid not in self.record_path:
+            return [K.ResidualItem(friendly(n.get("kind")), self.loc(n))]
+        prev = n.get("previousDecl")
+        if prev in self.method_ids and self.has_body(n):
+            if self.method_ids[prev] is not None:
+                self.defs[prev] = n
+                self.method_ids[n["id"]] = self.method_ids[prev]
+                self.user_funcs[n["id"]] = self.method_ids[prev]
+            return []
+        if prev in self.method_ids:
+            return []  # a redeclaration without a body
+        return [K.ResidualItem(friendly(n.get("kind")), self.loc(n))]
+
+    def struct_def(self, sh, items):
+        methods = []
+        for decl, recv in sh["methods"]:
+            body = decl if self.has_body(decl) else self.defs.get(decl["id"])
+            if body is None:
+                items.append(K.ResidualItem("member function declared but not defined", self.loc(decl)))
+                continue
+            methods.append(self.func(body, sh["ns"], False, owner=sh, recv=recv, decl=decl))
+        return K.StructDef(sh["name"], tuple(self.sigs.structs[sh["path"]].fields), tuple(methods), sh["loc"],
+                           sh["ns"], sh["internal"])
 
     def spelling_only(self, d):
         """FR-260: a block-scope using-directive, using-declaration of a
@@ -506,15 +795,21 @@ class CxxImporter:
             if p.get("kind") == "ParmVarDecl":
                 ptys.append(self.map_type(p.get("type"))[0])
         rs = self.ret_type_str(n)
-        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs)[0]
+        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written)[0]
         return tuple(ptys), ret
 
     # -------------------------------------------------------------- funcs
-    def func(self, n, ns=(), internal=False):
+    def func(self, n, ns=(), internal=False, owner=None, recv="", decl=None):
         name = n.get("name")
         floc = self.lines.at(_off(n.get("loc")))
         pre = []
-        if n.get("storageClass") in ("static", "extern"):
+        self.ctx_ns = ns
+        self.cur = (owner["path"], recv) if owner else None
+        if owner is not None:
+            name = "new" if recv == "ctor" else name
+            if n.get("inline"):
+                pre.append(K.ResidualStmt("inline function", floc))
+        elif n.get("storageClass") in ("static", "extern"):
             pre.append(K.ResidualStmt("%s function" % n["storageClass"], floc))
         if n.get("inline"):
             pre.append(K.ResidualStmt("inline function", floc))
@@ -526,6 +821,8 @@ class CxxImporter:
         if "noexcept" in qt or qt.rstrip().endswith("&") or "throw(" in qt:
             pre.append(K.ResidualStmt("exception specification", floc))
         self.scope = TC.Scope()
+        if recv in ("ref", "mut"):
+            self.scope.declare("self", K.RefT(K.StructT(owner["path"]), recv == "mut"), False)
         params = []
         for p in n.get("inner", []):
             if p.get("kind") != "ParmVarDecl":
@@ -546,7 +843,15 @@ class CxxImporter:
             self.scope.declare(pname, ty, mut)
             self.locals[p["id"]] = pname
         rs = self.ret_type_str(n)
-        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs)[0]
+        if rs.endswith(" const") and recv == "ref":
+            rs = rs[:-len(" const")]
+        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written)[0]
+        if recv == "ctor":
+            ret = K.StructT(owner["path"])
+            body = self.ctor_body(n, owner, floc)
+            self.cur = None
+            return K.Func(name, tuple(params), ret, K.Block(tuple(pre) + (body,), self.loc(n)), floc,
+                          tuple(ns), False, owner["name"], recv)
         self.ret_ref = isinstance(ret, K.RefT)
         if isinstance(ret, K.RefT):
             pre.append(K.ResidualStmt("function returning a reference", floc))
@@ -572,8 +877,39 @@ class CxxImporter:
         self.in_main = is_main
         for s in inner:
             stmts.extend(self.stmt(s))
+        self.cur = None
+        if owner is not None:
+            return K.Func(name, tuple(params), ret, K.Block(tuple(pre + stmts), self.loc(body_node)), floc,
+                          tuple(ns), False, owner["name"], recv)
         return K.Func(name, tuple(params), ret, K.Block(tuple(pre + stmts), self.loc(body_node)), floc,
                       tuple(ns), internal)
+
+    def ctor_body(self, n, owner, floc):
+        """`S(..) : f1(e1), f2(e2) {}` -> `return S { f1: e1, f2: e2 };`:
+        every data member initialized, in declaration order (clang lists
+        the initializers in initialization order), and an empty body."""
+        body = [c for c in n.get("inner", []) if c.get("kind") == "CompoundStmt"]
+        inits = [c for c in n.get("inner", []) if c.get("kind") == "CXXCtorInitializer"]
+        fields = self.sigs.structs[owner["path"]].fields
+        bad = "constructor whose body is not a member-initializer list of every data member"
+        if not body or body[-1].get("inner"):
+            return K.ResidualStmt(bad, floc)
+        if any("anyInit" not in i for i in inits):
+            return K.ResidualStmt("delegating or base-class constructor initializer", floc)
+        names = [i["anyInit"].get("name") for i in inits]
+        if names != [f.name for f in fields]:
+            return K.ResidualStmt(bad, floc)
+        vals = []
+        for f, i in zip(fields, inits):
+            e = i["inner"][0]
+            if K.is_owned_nc(f.ty):
+                v = self.consume(e, f.ty)
+            else:
+                v = self.expr(e)
+                if f.ty == K.BOOL:
+                    v = self.truthy(v)
+            vals.append(v)
+        return K.Return(K.StructLit(owner["path"], tuple(vals), floc), floc)
 
     # -------------------------------------------------------------- stmts
     def as_block(self, n):
@@ -658,8 +994,12 @@ class CxxImporter:
             name = self.local_ref(n["inner"][0])
             if name is None:
                 tgt = self.elem_target(n["inner"][0])
-                if isinstance(tgt, K.Index):
-                    return [K.Store(tgt, self.expr(n["inner"][1]), L)]
+                if isinstance(tgt, (K.Index, K.Field)):
+                    T = self.ty_of(tgt)
+                    v = self.expr(n["inner"][1])
+                    if T == K.BOOL:
+                        v = self.truthy(v)
+                    return [K.Store(tgt, v, L)]
                 if isinstance(tgt, K.ResidualStmt):
                     return [tgt]
                 return [self.rstmt(n, "assignment to something other than a local variable")]
@@ -716,6 +1056,23 @@ class CxxImporter:
         if isinstance(ty, K.VecT) and not K.elem_ok(ty.elem):
             return K.ResidualStmt("variable of type '%s' (std::vector<bool> is a bit-packed proxy "
                                   "container)" % spelled if ty.elem == K.BOOL else "variable of type '%s'" % spelled, L)
+        if isinstance(ty, K.StructT) and d.get("init") in ("call", "list"):
+            # FR-257: `S s(a, b);` / `S s{a, b};` (a constructor or an
+            # aggregate) are the same Kernel term as `S s = ...;`
+            c = self.unwrap_ctor((d.get("inner") or [{}])[0])
+            if c.get("kind") == "InitListExpr":
+                init = self.struct_init(c)
+            elif c.get("kind") in ("CXXConstructExpr", "CXXTemporaryObjectExpr"):
+                kind, _ = self.ctor_kind(c)
+                if kind == "default" and self.ctor_of_struct(ty.path) is None:
+                    return K.ResidualStmt("struct variable without an initializer (default-initialized data "
+                                          "members)", L)
+                init = self.class_expr(c) if kind != "copy" else self.consume(d["inner"][0], ty)
+            else:
+                init = self.consume(d["inner"][0], ty)
+            self.scope.declare(name, ty, not const)
+            self.locals[d["id"]] = name
+            return K.Let(name, ty, not const, init, L)
         if K.is_owned_nc(ty) and d.get("init") == "call":
             init = self.class_direct_init(d, ty)
             if isinstance(init, K.ResidualStmt):
@@ -746,7 +1103,7 @@ class CxxImporter:
             tgt = self.elem_target(n["inner"][0])
             if isinstance(tgt, K.ResidualStmt):
                 return tgt
-            if isinstance(tgt, K.Index):
+            if isinstance(tgt, (K.Index, K.Field)):
                 return self.compound_elem(n, tgt)
             return self.rstmt(n, "compound assignment to something other than a local variable")
         op = COMPOUND_OPCODES.get(n.get("opcode"))
@@ -788,7 +1145,7 @@ class CxxImporter:
             tgt = self.elem_target(n["inner"][0])
             if isinstance(tgt, K.ResidualStmt):
                 return tgt
-            if isinstance(tgt, K.Index):
+            if isinstance(tgt, (K.Index, K.Field)):
                 T = self.ty_of(tgt)
                 if T in K.ARITH_INT:
                     return K.CompoundStore(op, tgt, K.IntLit(1, T, L), L)
@@ -986,6 +1343,9 @@ class CxxImporter:
             if K.is_owned_nc(T):
                 if k == "CXXFunctionalCastExpr" and n.get("castKind") == "ConstructorConversion":
                     return self.class_expr(n["inner"][0])
+                if (k == "CXXFunctionalCastExpr" and isinstance(T, K.StructT) and n.get("castKind") == "NoOp"
+                        and self.strip_tmp(n["inner"][0]).get("kind") == "InitListExpr"):
+                    return self.struct_init(self.strip_tmp(n["inner"][0]))
                 return self.rexpr(n, "cast to '%s'" % spelled)
             if n.get("castKind") == "ToVoid":
                 return self.rexpr(n, "cast to void")
@@ -1046,6 +1406,8 @@ class CxxImporter:
             if op == "&":
                 return self.rexpr(n, "address-of")
             if op == "*":
+                if self.is_this_deref(n):
+                    return K.Var("self", L)
                 return self.rexpr(n, "dereference")
             e = self.expr(n["inner"][0])
             if op == "+":
@@ -1075,6 +1437,9 @@ class CxxImporter:
             c = self.strip(n["inner"][0])
             while c.get("kind") == "ImplicitCastExpr" and c.get("castKind") == "FunctionToPointerDecay":
                 c = self.strip(c["inner"][0])
+            if c.get("kind") == "MemberExpr" and self.sigs.recv.get(
+                    self.method_ids.get(c.get("referencedMemberDecl")) or "") == "static":
+                return self.rexpr(n, "static member function called through an object")
             if c.get("kind") != "DeclRefExpr":
                 return self.rexpr(n, "indirect call")
             rd = c.get("referencedDecl", {})
@@ -1086,29 +1451,13 @@ class CxxImporter:
                 if rd.get("name") == "to_string" and len(n["inner"]) == 2:
                     return self.to_string(n)
                 return self.rexpr(n, "call to library function '%s'" % rd.get("name"))
-            ptys = self.sigs.get(fname, ((), None))[0]
-            args = []
-            for i, a in enumerate(n["inner"][1:]):
-                if a.get("kind") == "CXXDefaultArgExpr":
-                    return self.rexpr(a, "default argument")
-                pt = ptys[i] if i < len(ptys) else None
-                if isinstance(pt, K.RefT):
-                    name = self.local_ref(a)
-                    if name is not None:
-                        args.append(K.Var(name, self.loc(a)))
-                        continue
-                    tgt = self.elem_target(a)
-                    if isinstance(tgt, K.Index):
-                        args.append(tgt)
-                        continue
-                    if pt.mutable:
-                        return self.rexpr(a, "argument %d of '%s' binds a non-const reference to something "
-                                             "other than a variable or element" % (i + 1, fname))
-                    args.append(self.borrowed(a) if K.is_owned_nc(pt.inner) else self.expr(a))
-                elif K.is_owned_nc(pt):
-                    args.append(self.consume(a, pt))
-                else:
-                    args.append(self.expr(a))
+            if self.method_ids.get(rd.get("id"), "") is None:
+                return K.ResidualExpr("use of a rejected member function", L)
+            if self.sigs.recv.get(fname) in ("ref", "mut"):
+                return self.rexpr(n, "member function call")
+            args = self.import_args(fname, n["inner"][1:])
+            if isinstance(args, K.ResidualExpr):
+                return args
             return K.Call(fname, tuple(args), L)
         if k == "CXXMemberCallExpr":
             return self.member_expr(n)
@@ -1119,7 +1468,123 @@ class CxxImporter:
             T = self.map_type(n.get("type"))[0]
             if K.is_owned_nc(T) or k in ("CXXBindTemporaryExpr", "MaterializeTemporaryExpr"):
                 return self.class_expr(n)
+        if k == "MemberExpr":
+            return self.member_access(n)
+        if k == "InitListExpr" and isinstance(self.map_type(n.get("type"))[0], K.StructT):
+            return self.struct_init(n)
         return self.rexpr(n, friendly(k))
+
+    def import_args(self, fname, nodes):
+        """Kernel arguments for a call of ``fname`` (or a ResidualExpr)."""
+        ptys = self.sigs.get(fname, ((), None))[0]
+        args = []
+        for i, a in enumerate(nodes):
+            if a.get("kind") == "CXXDefaultArgExpr":
+                return self.rexpr(a, "default argument")
+            pt = ptys[i] if i < len(ptys) else None
+            if isinstance(pt, K.RefT):
+                name = self.local_ref(a)
+                if name is not None:
+                    args.append(K.Var(name, self.loc(a)))
+                    continue
+                if self.is_this_deref(self.strip_tmp(a)):
+                    args.append(K.Var("self", self.loc(a)))
+                    continue
+                tgt = self.elem_target(a)
+                if isinstance(tgt, (K.Index, K.Field)):
+                    args.append(tgt)
+                    continue
+                if isinstance(tgt, K.ResidualStmt):
+                    return K.ResidualExpr(tgt.reason, tgt.loc)
+                if pt.mutable:
+                    return self.rexpr(a, "argument %d of '%s' binds a non-const reference to something "
+                                         "other than a variable or element" % (i + 1, fname))
+                args.append(self.borrowed(a) if K.is_owned_nc(pt.inner) else self.expr(a))
+            elif K.is_owned_nc(pt):
+                args.append(self.consume(a, pt))
+            else:
+                args.append(self.expr(a))
+        return args
+
+    # ================================================== FR-257: structs
+    def is_this_deref(self, n):
+        n = self.strip(n) if isinstance(n, dict) else n
+        return (isinstance(n, dict) and n.get("kind") == "UnaryOperator" and n.get("opcode") == "*"
+                and self.strip(n["inner"][0]).get("kind") == "CXXThisExpr"
+                and self.cur is not None and self.cur[1] in ("ref", "mut"))
+
+    def member_access(self, n):
+        """`p.f` / `this->f` / implicit `f` (a MemberExpr over CXXThisExpr)."""
+        L = self.loc(n)
+        fid = n.get("referencedMemberDecl")
+        info = self.field_ids.get(fid)
+        if info is None:
+            if fid in self.method_ids:
+                return self.rexpr(n, "member function used as a value")
+            return self.rexpr(n, "member access")
+        path, fname = info
+        if fname is None:
+            return K.ResidualExpr("use of a rejected data member", L)
+        base = self.strip(n["inner"][0])
+        if n.get("isArrow"):
+            if base.get("kind") == "CXXThisExpr" and self.cur is not None and self.cur[1] in ("ref", "mut"):
+                return K.Field(K.Var("self", L), fname, L)
+            return self.rexpr(n, "member access through a pointer")
+        u = self.strip_tmp(n["inner"][0])
+        if u.get("valueCategory") != "lvalue" and not self.is_this_deref(u):
+            return self.rexpr(n, "member access on a temporary")
+        b = self.place(u)
+        if isinstance(b, K.ResidualExpr):
+            return b
+        return K.Field(b, fname, L)
+
+    def struct_init(self, il):
+        """Aggregate initialization `{a, b}` / `S{a, b}` of a struct: every
+        data member, in declaration order."""
+        L = self.loc(il)
+        T = self.map_type(il.get("type"))[0]
+        if not isinstance(T, K.StructT) or T.path not in self.sigs.structs:
+            return self.rexpr(il, "initializer list")
+        sd = self.sigs.structs[T.path]
+        elems = il.get("inner", []) or []
+        if any(e.get("kind") == "ImplicitValueInitExpr" for e in elems) or "array_filler" in il:
+            return self.rexpr(il, "aggregate initialization that omits data members")
+        if self.ctor_of_struct(T.path) is not None:
+            return self.rexpr(il, "initializer list")
+        if len(elems) != len(sd.fields):
+            return self.rexpr(il, "aggregate initialization of a struct with rejected data members")
+        vals = []
+        for f, e in zip(sd.fields, elems):
+            if K.is_owned_nc(f.ty):
+                u = self.strip_tmp(e)
+                v = self.struct_init(u) if u.get("kind") == "InitListExpr" else self.consume(e, f.ty)
+            else:
+                v = self.expr(e)
+                if f.ty == K.BOOL:
+                    v = self.truthy(v)
+            vals.append(v)
+        return K.StructLit(T.path, tuple(vals), L)
+
+    def is_user_ctor(self, n, T):
+        """Does this construct-expression call T's user constructor (rather
+        than the implicit copy / move / default one)?  Its ctorType is the
+        constructor's own type string."""
+        ct = (n.get("ctorType") or {}).get("qualType")
+        return ct is not None and ct == self.ctor_types.get(T.path)
+
+    def ctor_of_struct(self, path):
+        p = path + "::new"
+        return p if self.sigs.recv.get(p) == "ctor" else None
+
+    def ctor_call(self, n, T):
+        """`S(a, b)` / `S{a, b}` / `S s(a, b);` through the user constructor."""
+        cp = self.ctor_of_struct(T.path)
+        if cp is None:
+            return None
+        args = self.import_args(cp, self.real_args(n))
+        if isinstance(args, K.ResidualExpr):
+            return args
+        return K.Call(cp, tuple(args), self.loc(n))
 
     # ================================================== FR-251: vector/string
     TMP_KINDS = ("ParenExpr", "ExprWithCleanups", "ConstantExpr", "CXXBindTemporaryExpr",
@@ -1165,7 +1630,17 @@ class CxxImporter:
             return "default", args
         if len(args) == 1 and self.strip_tmp(args[0]).get("kind") == "CXXStdInitializerListExpr":
             return "ilist", args
-        params = ct[ct.find("(") + 1:ct.rfind(")")] if "(" in ct else ""
+        params = ""
+        if "(" in ct:
+            # the FIRST parenthesized group (a trailing `noexcept(false)` --
+            # measured on the implicit copy constructor of a struct holding a
+            # vector of itself -- has its own parentheses)
+            depth, start = 0, ct.find("(")
+            for j in range(start, len(ct)):
+                depth += {"(": 1, ")": -1}.get(ct[j], 0)
+                if depth == 0:
+                    params = ct[start + 1:j]
+                    break
         if len(args) == 1 and "&&" in params and "," not in params:
             return "move", args
         if len(args) == 1 and params.startswith("const ") and params.endswith("&") and "," not in params:
@@ -1185,6 +1660,9 @@ class CxxImporter:
                 n = n["inner"][0]
             elif k == "CXXFunctionalCastExpr" and n.get("castKind") == "ConstructorConversion":
                 n = n["inner"][0]
+            elif (k == "CXXFunctionalCastExpr" and n.get("castKind") == "NoOp"
+                  and self.strip_tmp(n["inner"][0]).get("kind") == "InitListExpr"):
+                n = self.strip_tmp(n["inner"][0])  # `S{a, b}`
             else:
                 return n
 
@@ -1212,6 +1690,12 @@ class CxxImporter:
             if not K.is_owned_nc(T):
                 return self.rexpr(n, "construction of '%s'" % spelled)
             kind, args = self.ctor_kind(n)
+            if isinstance(T, K.StructT) and self.is_user_ctor(n, T):
+                return self.ctor_call(n, T)
+            if isinstance(T, K.StructT) and kind not in ("copy", "move"):
+                if kind == "default":
+                    return self.rexpr(n, "value-initialized or default-initialized struct (`S()`, `S s;`)")
+                return self.rexpr(n, "construction of '%s'" % spelled)
             if kind == "default":
                 return K.VecLit(T.elem, (), L) if isinstance(T, K.VecT) else K.StrNew(L)
             if kind == "ilist" and isinstance(T, K.VecT):
@@ -1233,6 +1717,8 @@ class CxxImporter:
             if kind == "move":
                 return self.moved(args[0])
             return self.rexpr(n, "%s constructor" % ("std::string" if T == K.STRING else "std::vector"))
+        if k == "InitListExpr" and isinstance(self.map_type(n.get("type"))[0], K.StructT):
+            return self.struct_init(n)
         return self.expr(n)
 
     def moved(self, a):
@@ -1256,6 +1742,9 @@ class CxxImporter:
         k = u.get("kind")
         if k in ("CXXConstructExpr", "CXXTemporaryObjectExpr"):
             kind, args = self.ctor_kind(u)
+            T = self.map_type(u.get("type"))[0]
+            if isinstance(T, K.StructT) and self.is_user_ctor(u, T):
+                kind = "user"
             if kind == "copy":
                 if self.std_move_arg(args[0]) is not None:
                     return self.rexpr(args[0], "std::move of a const object (it copies)")
@@ -1276,7 +1765,8 @@ class CxxImporter:
         u = self.unwrap_ctor(n)
         if u.get("kind") in ("CXXConstructExpr", "CXXTemporaryObjectExpr"):
             kind, args = self.ctor_kind(u)
-            if kind == "copy":
+            T = self.map_type(u.get("type"))[0]
+            if kind == "copy" and not (isinstance(T, K.StructT) and self.is_user_ctor(u, T)):
                 return self.place(args[0])
             return self.class_expr(u)
         if u.get("valueCategory") == "lvalue":
@@ -1300,6 +1790,10 @@ class CxxImporter:
         k = u.get("kind")
         if k == "DeclRefExpr":
             return self.expr(u)
+        if k == "MemberExpr":
+            return self.member_access(u)
+        if self.is_this_deref(u):
+            return K.Var("self", L)
         if k == "CXXOperatorCallExpr" and self.op_name(u) == "operator[]":
             e = self.operator_expr(u)
             if isinstance(e, K.ByteAt):
@@ -1344,6 +1838,9 @@ class CxxImporter:
         if me.get("kind") != "MemberExpr":
             return None, None, None, self.rexpr(n, "member function call")
         if me.get("isArrow"):
+            base = self.strip(me["inner"][0])
+            if base.get("kind") == "CXXThisExpr" and self.cur is not None and self.cur[1] in ("ref", "mut"):
+                return me.get("name"), K.Var("self", self.loc(me)), self.real_args(n)[1:], None
             return None, None, None, self.rexpr(n, "member access through a pointer")
         recv = self.borrowed(me["inner"][0])
         if isinstance(recv, K.ResidualExpr):
@@ -1356,6 +1853,21 @@ class CxxImporter:
         if bad is not None:
             return bad
         rt = self.ty_of(recv)
+        if isinstance(rt, K.StructT):
+            mid = self.strip(n["inner"][0]).get("referencedMemberDecl")
+            mpath = self.method_ids.get(mid, "")
+            if mpath is None:
+                return K.ResidualExpr("use of a rejected member function", L)
+            if not mpath:
+                return self.rexpr(n, "member function call")
+            if self.sigs.recv.get(mpath) not in ("ref", "mut"):
+                return self.rexpr(n, "static member function called through an object")
+            if not TC.is_place(recv):
+                return self.rexpr(n, "member function call on a temporary")
+            a = self.import_args(mpath, args)
+            if isinstance(a, K.ResidualExpr):
+                return a
+            return K.MethodCall(recv, name, tuple(a), L)
         if isinstance(rt, K.VecT):
             if name == "size" and not args:
                 return K.Len(recv, L)
@@ -1407,6 +1919,8 @@ class CxxImporter:
             if name == "clear" and not args:
                 return K.Clear(recv, L)
         e = self.member_expr(n)
+        if isinstance(e, K.MethodCall):
+            return K.ExprStmt(e, L)
         if isinstance(e, K.ResidualExpr):
             return K.ResidualStmt(e.reason, e.loc)
         return self.rstmt(n, "expression statement without effect")
@@ -1480,9 +1994,15 @@ class CxxImporter:
         return self.rexpr(n, "overloaded operator call")
 
     def elem_target(self, n):
-        """Index for an assignable `v[i]` / `v.back()`, a ResidualStmt, or None."""
+        """Index for an assignable `v[i]` / `v.back()` (FR-257: Field for
+        `p.f` / `this->f`), a ResidualStmt, or None."""
         u = self.strip_tmp(n)
         k = u.get("kind")
+        if k == "MemberExpr":
+            e = self.member_access(u)
+            if isinstance(e, K.ResidualExpr):
+                return K.ResidualStmt(e.reason, e.loc)
+            return e
         if k == "CXXOperatorCallExpr" and self.op_name(u) == "operator[]":
             e = self.operator_expr(u)
             if isinstance(e, K.ByteAt):
@@ -1505,6 +2025,8 @@ class CxxImporter:
         args = n.get("inner", [])[1:]
         if name in ("operator=", "operator+=") and len(args) == 2:
             lname = self.local_ref(args[0])
+            if lname is None and name == "operator=" and self.is_this_deref(self.strip_tmp(args[0])):
+                lname = "self"  # FR-257: `*this = e;` <=> `*self = e;`
             tgt = K.Var(lname, self.loc(args[0])) if lname is not None else self.elem_target(args[0])
             if isinstance(tgt, K.ResidualStmt):
                 return tgt

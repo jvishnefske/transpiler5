@@ -13,8 +13,10 @@
 // CHECK: multi.cpp:[[@LINE+1]]:1: error: unsupported: global variable
 int counter = 0;
 
-// CHECK-NEXT: multi.cpp:[[@LINE+1]]:1: error: unsupported: class/struct definition
-struct Point {
+// FR-257 moved this pin forward: an aggregate `struct` is in the subset; a
+// union (one storage for several members) is its item-level neighbour.
+// CHECK-NEXT: multi.cpp:[[@LINE+1]]:1: error: unsupported: union
+union Point {
     int x;
 };
 
