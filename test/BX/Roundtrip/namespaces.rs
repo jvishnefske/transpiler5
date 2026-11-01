@@ -55,6 +55,24 @@ fn main() {
     print!("{} {}\n", text::deep::sum(), crate::math::tag() + tag());
 }
 
+mod bx {
+    pub fn fmt_f(x: f64, prec: usize) -> String {
+        if x.is_nan() {
+            if x.is_sign_negative() {
+                return String::from("-nan");
+            }
+            return String::from("nan");
+        }
+        format!("{:.*}", prec, x)
+    }
+
+    pub fn substr(s: &str, pos: usize, n: usize) -> String {
+        assert!(pos <= s.len(), "bx::substr: position past the end (std::out_of_range in C++)");
+        let end: usize = pos + std::cmp::min(n, s.len() - pos);
+        String::from(&s[pos..end])
+    }
+}
+
 // CHECK: fn tag() -> i32 {
 // CHECK-NEXT:     return 1;
 // CHECK-NEXT: }

@@ -262,6 +262,8 @@ RULES = [
      "struct: name clash", None),
     (r"^identifier '.*' is reserved by the canonical Rust spelling", "identifier: reserved by canonical spelling", None),
     (r"^struct '.*' contains itself by value", "struct: contains itself", None),
+    (r"^member access through a pointer$", "member access through a pointer", None),
+    (r"^use of a rejected declaration$", "cascade: use of a rejected declaration", None),
     # clang kinds with no FRIENDLY name (friendly() falls back to the kind)
     (r"^([A-Z][A-Za-z]*(Expr|Stmt|Decl|Operator|Literal))$", None, None),
     # ---- typecheck.py ------------------------------------------------------

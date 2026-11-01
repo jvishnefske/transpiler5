@@ -74,3 +74,11 @@ fn main() {
     let moved: Vec<Vec<i64>> = grid;
     print!("{} {} {} {}\n", v[2usize], lens[2usize], (copy == moved) as i32, bx::substr(&v[0usize], 1usize, 5usize));
 }
+
+mod bx {
+    pub fn substr(s: &str, pos: usize, n: usize) -> String {
+        assert!(pos <= s.len(), "bx::substr: position past the end (std::out_of_range in C++)");
+        let end: usize = pos + std::cmp::min(n, s.len() - pos);
+        String::from(&s[pos..end])
+    }
+}
