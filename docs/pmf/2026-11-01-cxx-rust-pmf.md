@@ -211,3 +211,29 @@ URL: https://github.com/DARPA-TRACTOR-Program/Reports/blob/main/First_TRACTOR_Ev
 - Medium (reputable secondary): IEEE Spectrum, InfoQ giflib, CRA law-firm summaries, Safe C++ vote coverage.
 - Weak or UNVERIFIED: Galois $7.8M figure (GovTribe); ForCLift $5M; the 52% exceptions-banned figure; the ACM C++-LLM template accuracy numbers (snippet only); C++ container frequency (no study exists that I found); whether any regulated-industry buyer wants an automated translator (no quotes found).
 - Date caution: several sources are dated 2026 and were fetched via search tools that summarise. Spot-check before external citation.
+
+## Steering log
+
+### 2026-11-01 ~13:30 CST -- kill criterion 1 measured as not reachable by breadth
+
+- **Measured.** Function-level EMIT on pinned WOFF2+Brunsli (392 functions, `docs/pmf/frontier/`)
+  went 1 → 1 → 6 → 18 over FR-260, FR-257 (structs), FR-261 (pointers as slices) and FR-259
+  (typedefs, `?:`, `x++`). That is **4.6%**. The FR-262 spike gives the ceiling for the next
+  tier: making project headers visible adds +3..+6 strict EMIT; cross-TU linking adds +0. The
+  census upper bound for everything the importer could reach is **28.3% raw, ~14% after the
+  repo's halving rule**.
+- **Reading.** Criterion 1 asks for ≥30% after classes plus FR-252/253, with ~50% reachable by
+  normalization. The breadth path on these two modules does **not** reach it. This is not yet a
+  kill. The criterion names a third module, and FR-254 (normalization) is unmeasured. But it
+  stops further woff2/brunsli-specific breadth from being the default next step.
+- **Decision.** Build the parts of the original request that were still open: closures
+  (FR-252, landed 7f5477e) and `<algorithm>` (FR-253, in progress). Then FR-254's seam, which is
+  the only lever on criterion 1 that is left. Each FR that lands adds a frontier data point
+  only when it can move the number.
+- **Found on the way (the verifier thesis).** FR-263 (73241e5): the subset accepted programs
+  with **two legal C++ outputs**. g++ and clang print different bytes, and a clang-only
+  byte-diff oracle could not see it. It was caught by an adversarial probe, not by the oracle.
+  For the "sell the verifier" positioning, the rule needs **multiple compilers** in the
+  oracle, not one.
+- **Not actionable by the build loop:** criteria 2 and 4 (buyer interviews, a design partner).
+  These are the user's to run. Nothing measured here substitutes for them.
