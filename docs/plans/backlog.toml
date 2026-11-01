@@ -1649,3 +1649,69 @@ title = "Clippy debt count is environment-sensitive by exactly one needless_late
 summary = "Opened 2026-09-12, found by ratchets.yml's first dispatch. Same commit 703cf85, same flake.lock, same epoch pin, same 294-crate corpus, 0 skipped both sides: GitHub runner counts 58 total warnings, local counts 57, and the whole delta is clippy::needless_late_init 8 vs 7 with every other lint identical (json report diff retained). Local is stable at 57 across days (FR-241 recorded 57 +0). Ratchet fires on CI, passes locally, baseline itself was measured locally. Hypotheses, untested: (a) a caching asymmetry in clippy_eval's cargo clippy invocation suppressing one repeat warning locally (58 would be the truth and local UNDERCOUNTS); (b) genuine clippy nondeterminism on one crate; (c) an environment-dependent difference in one emitted crate, which would violate the byte-identity doctrine and outrank the lint question entirely. First diagnostic is cheap and decisive: emit the corpus in both environments and hash the crates -- identical hashes kill (c); a per-crate warning dump then names the crate. ACCEPTANCE: crate identified, correct count established, the wrong instrument fixed so CI and local agree, baseline re-pinned only if 58 is the truth. Until then ratchets.yml is EXPECTED RED on the clippy step."
 blocked_by = []
 anchor = "FR-248 (opened 2026-09-12, found by ratchets.yml's FIRST dispatch"
+
+[[items]]
+id = "FR-249"
+kind = "tooling"
+status = "open"
+rank = 58
+size = "M"
+title = "emitrust-bx umbrella: bijective C++-subset <=> safe-Rust-subset path in Python over clang JSON AST"
+summary = "Spike GO 2026-11-01: 168MB/3.7s dump, 0.63s load; lambda capture kind from closure FieldDecl types; copy vs move via ctorType; std::sort+comparator diverges from Rust sort_unstable_by, fixed by a safe libstdc++ introsort port byte-identical over 3000 cases. Expected TRACTOR +0."
+blocked_by = []
+anchor = "FR-249 (opened 2026-11-01): **EMITRUST-BX"
+
+[[items]]
+id = "FR-250"
+kind = "feature"
+status = "open"
+rank = 59
+size = "L"
+title = "BX kernel core: scalars, control flow, functions, printf; both printers/parsers; property round-trip; crate emission"
+summary = "Kernel IR + cxx_import/cxx_print/rs_parse/rs_print, Surface IR seam, argv-compatible --emit=crate. Expected TRACTOR +0."
+blocked_by = ["FR-249"]
+anchor = "FR-250 (opened 2026-11-01, child of FR-249): **BX KERNEL CORE"
+
+[[items]]
+id = "FR-251"
+kind = "feature"
+status = "open"
+rank = 60
+size = "M"
+title = "BX std::vector + std::string rows"
+summary = "Vector and String rows with clone/move, bx::push_byte ASCII assertion, alias check. Expected TRACTOR +0."
+blocked_by = ["FR-250"]
+anchor = "FR-251 (opened 2026-11-01, child of FR-249): **BX std::vector"
+
+[[items]]
+id = "FR-252"
+kind = "feature"
+status = "open"
+rank = 61
+size = "M"
+title = "BX closures: copy/ref captures, FnMut, impl Fn params"
+summary = "Explicit captures only; default/mixed captures rejected naming the normalizer rewrite. Expected TRACTOR +0."
+blocked_by = ["FR-250"]
+anchor = "FR-252 (opened 2026-11-01, child of FR-249): **BX closures"
+
+[[items]]
+id = "FR-253"
+kind = "feature"
+status = "open"
+rank = 62
+size = "M"
+title = "BX <algorithm>/<numeric> over whole containers"
+summary = "Includes the bx::sort_by_less libstdc++ introsort port and a depth-limit killer input. Expected TRACTOR +0."
+blocked_by = ["FR-251", "FR-252"]
+anchor = "FR-253 (opened 2026-11-01, child of FR-249): **BX <algorithm>"
+
+[[items]]
+id = "FR-254"
+kind = "feature"
+status = "open"
+rank = 63
+size = "L"
+title = "BX normalizer search: arbitrary C++ -> Kernel subset via validated rewrite rules"
+summary = "Design recorded; residual census first; A* over byte-diff-validated rules. Expected TRACTOR +0."
+blocked_by = ["FR-253"]
+anchor = "FR-254 (opened 2026-11-01, child of FR-249): **BX NORMALIZER SEARCH"
