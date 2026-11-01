@@ -147,7 +147,7 @@ def main(argv=None):
         out = CP.cxx_print(prog)
 
     if emit == "crate":
-        if not any(f.name == "main" for f in prog.funcs()):
+        if not any(f.path == "main" for f in prog.funcs()):
             sys.stderr.write("%s:1:1: error: --emit=crate needs a `main` function\n" % a.src)
             return 1
         crate.write_crate(a.out, a.src, out)

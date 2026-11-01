@@ -109,6 +109,17 @@ class _Printer:
         self.sigs = TC.sigs_of(program)
         self.lines = []
         self.includes = set()
+        self.ns = ()  # the namespace of the function being printed
+
+    def callee(self, path):
+        """FR-260: bare in the same namespace (unqualified lookup finds the
+        innermost declaration first, and a prototype always precedes the
+        use), otherwise global-qualified `::a::b::f` -- which never searches
+        enclosing scopes and suppresses argument-dependent lookup."""
+        ns, leaf = K.split_path(path)
+        if ns == self.ns:
+            return leaf
+        return "::" + path
 
     def ty(self, e, scope):
         return TC.type_of(e, scope, self.sigs)
@@ -191,7 +202,7 @@ class _Printer:
             return e.name
         if isinstance(e, K.Call):
             ptys = self.sigs[e.name][0]
-            return "%s(%s)" % (e.name, ", ".join(
+            return "%s(%s)" % (self.callee(e.name), ", ".join(
                 self.expr(a, scope) if isinstance(pt, K.RefT) else self.consume(a, scope)
                 for pt, a in zip(ptys, e.args)))
         if isinstance(e, (K.Clone, K.Index, K.ByteAt, K.Len, K.IsEmpty, K.VecLit, K.VecFill, K.StrNew,
@@ -363,7 +374,7 @@ class _Printer:
             else:
                 ps.append("%s%s %s" % ("" if p.mutable else "const ", self.tyname(p.ty), p.name))
             scope.declare(p.name, p.ty, p.mutable)
-        if f.name == "main":
+        if f.path == "main":
             return "int main()", scope
         return "%s %s(%s)" % (self.tyname(f.ret), f.name, ", ".join(ps)), scope
 
@@ -371,20 +382,62 @@ class _Printer:
         sig, scope = self.signature(f)
         self.emit(0, sig + " {")
         self.block_body(f.body, scope, 1, same=True)
-        if f.name == "main":
+        if f.path == "main":
             self.emit(1, "return 0;")
         self.emit(0, "}")
 
 
 def needs_prototype(program):
     funcs = program.funcs()
-    index = {f.name: i for i, f in enumerate(funcs)}
+    index = {f.path: i for i, f in enumerate(funcs)}
     need = set()
     for i, f in enumerate(funcs):
         for n in K.walk(f.body):
             if isinstance(n, K.Call) and n.name in index and index[n.name] > i:
                 need.add(n.name)
-    return [f for f in funcs if f.name in need]
+    return [f for f in funcs if f.path in need]
+
+
+def _block_path(f):
+    """The C++ block nesting of ``f``: its namespaces, then '' (an anonymous
+    namespace) when it is internal."""
+    return f.ns + (("",) if f.internal else ())
+
+
+def _close_comment(name):
+    return "}  // namespace" + (" " + name if name else "")
+
+
+def emit_nested(p, funcs, body, spaced):
+    """Print ``funcs`` (in N13 order) opening and closing namespace blocks
+    as the block path changes.  ``spaced``: a blank line around every item
+    and block edge (definitions); none (prototypes)."""
+    open_ = ()
+
+    def line(text):
+        if spaced and p.lines and p.lines[-1] != "":
+            p.lines.append("")
+        p.lines.append(text)
+
+    for f in funcs:
+        want = _block_path(f)
+        common = 0
+        while common < min(len(open_), len(want)) and open_[common] == want[common]:
+            common += 1
+        while len(open_) > common:
+            line(_close_comment(open_[-1]))
+            open_ = open_[:-1]
+        while len(open_) < len(want):
+            name = want[len(open_)]
+            line("namespace %s{" % (name + " " if name else ""))
+            open_ = open_ + (name,)
+        p.ns = f.ns
+        if spaced and p.lines and p.lines[-1] != "":
+            p.lines.append("")
+        body(f)
+    while open_:
+        line(_close_comment(open_[-1]))
+        open_ = open_[:-1]
 
 
 def cxx_print(program):
@@ -399,10 +452,9 @@ def cxx_print(program):
     protos = needs_prototype(program)
     if protos:
         p.lines.append("")
-        for f in protos:
-            p.emit(0, p.signature(f)[0] + ";")
-    for f in program.funcs():
+        emit_nested(p, protos, lambda f: p.emit(0, p.signature(f)[0] + ";"), spaced=False)
+    if program.funcs():
         p.lines.append("")
-        p.func(f)
+    emit_nested(p, program.funcs(), p.func, spaced=True)
     head = ["#include <cstdio>"] + ["#include <%s>" % h for h in sorted(p.includes)]
     return "\n".join(head + p.lines) + "\n"

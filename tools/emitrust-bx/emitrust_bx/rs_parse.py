@@ -16,6 +16,15 @@ spelling puts them, and normalize drops them.  Statement-only methods
 the range-for iterator adaptors (`.iter()`, `.iter_mut()`,
 `.iter().copied()`, `.iter().cloned()`) parse to private markers that
 are only legal in their statement / `for` position.
+
+FR-260: `mod a { .. }` at the root, `pub mod b { .. }` nested, `pub fn`
+(or a private `fn`, a C++ anonymous-namespace member) inside a module.
+Calls are RESOLVED here with Rust's own rules, to the absolute Kernel path:
+a bare `f` names a function of the CURRENT module only (a Rust path never
+searches enclosing modules -- C++ unqualified lookup would, so such a call
+is a located error, not a guess); `crate::`, `self::`, `super::` and a
+relative child-module path `b::f` are accepted.  `use`, restricted
+visibility and a reopened module (E0428 in Rust) are located errors.
 """
 
 from dataclasses import dataclass, field
@@ -78,6 +87,7 @@ class _Parser:
     def __init__(self, toks):
         self.toks = toks
         self.i = 0
+        self.ns = ()  # FR-260: the module being parsed
 
     # -------------------------------------------------------------- helpers
     @property
@@ -168,13 +178,54 @@ class _Parser:
 
     # -------------------------------------------------------------- items
     def program(self):
+        return K.Program(tuple(self.items(top=True)))
+
+    def items(self, top):
         items = []
-        while self.tok.kind != "eof":
+        seen_mods = set()
+        while not (self.tok.kind == "eof" if top else self.at("}")):
             t = self.tok
+            if self.tok.kind == "eof":
+                raise ParseError(t.loc, "expected `}`, found end of file")
+            pub = False
+            if self.at("pub"):
+                if self.peek().text == "(":
+                    self.unsupported(t, "restricted visibility `pub(..)`")
+                if top:
+                    self.unsupported(t, "`pub` at the crate root (the subset spells root items without it)")
+                pub = True
+                self.next()
             if self.at("fn"):
-                items.append(self.func())
-            elif self.at("mod") and self.peek().text == "bx":
+                f = self.func()
+                items.append(K.Func(f.name, f.params, f.ret, f.body, f.loc, self.ns, bool(self.ns) and not pub))
+            elif self.at("mod") and top and not pub and self.peek().text == "bx":
                 self.bx_module()
+            elif self.at("mod"):
+                if not top and not pub:
+                    self.unsupported(t, "private nested module (the subset spells it `pub mod`: a private "
+                                        "one is unreachable from the crate root)")
+                self.next()
+                name = self.ident()
+                p = _tc().ident_problem(name.text) or (
+                    "identifier '%s' names a Rust prelude type" % name.text
+                    if name.text in _tc().NS_RESERVED else None)
+                if p:
+                    raise ParseError(name.loc, "unsupported: module name: " + p)
+                if name.text in seen_mods:
+                    raise ParseError(name.loc, "unsupported: module '%s' defined twice (a Rust module cannot be "
+                                               "reopened; the subset merges a reopened C++ namespace into one "
+                                               "`mod`)" % name.text)
+                seen_mods.add(name.text)
+                self.expect("{")
+                saved = self.ns
+                self.ns = saved + (name.text,)
+                try:
+                    items.extend(self.items(top=False))
+                finally:
+                    self.ns = saved
+                self.expect("}")
+            elif pub:
+                self.unsupported(self.tok, "`pub` item other than `pub fn` / `pub mod`")
             elif t.text == "#":
                 self.unsupported(t, "attribute")
             elif t.kind == "ident" and t.text in ("use", "struct", "enum", "impl", "trait", "static",
@@ -183,7 +234,7 @@ class _Parser:
                 self.unsupported(t, "item `%s`" % t.text)
             else:
                 raise ParseError(t.loc, "expected an item, found %s" % self.describe(t))
-        return K.Program(tuple(items))
+        return items
 
     def bx_module(self):
         start = self.tok
@@ -440,7 +491,24 @@ class _Parser:
             segs.append(K.Spec(kind, arg, flag, width, prec))
         return K.Print(tuple(segs), t.loc)
 
+    def take_crate_bx(self):
+        """FR-260: `crate::bx::` leaves the cursor on `bx`; a bare `bx::`
+        inside a module would resolve relative to it (rustc E0433)."""
+        t = self.tok
+        if t.kind != "ident":
+            return
+        if (t.text == "crate" and self.peek().text == "::" and self.peek(2).text == "bx"
+                and self.peek(3).text == "::"):
+            self.next()
+            self.next()
+        elif (t.text == "bx" and self.peek().text == "::" and self.ns
+              and not (self.i >= 2 and self.toks[self.i - 2].text == "crate"
+                       and self.toks[self.i - 1].text == "::")):
+            self.unsupported(t, "`bx::` inside a module resolves relative to it (the subset spells it "
+                                "`crate::bx::`)")
+
     def print_arg(self):
+        self.take_crate_bx()
         t = self.tok
         if (t.kind == "ident" and t.text == "bx" and self.peek().text == "::"
                 and self.peek(2).text in ("fmt_f", "chr")):
@@ -701,6 +769,7 @@ class _Parser:
         return K.VecLit(None, tuple(elems), t.loc)
 
     def primary(self):
+        self.take_crate_bx()
         t = self.tok
         if t.kind == "int":
             self.next()
@@ -731,7 +800,13 @@ class _Parser:
             if self.at("::"):
                 if t.text in ("Vec", "String", "bx"):
                     return self.path_expr(t)
-                self.unsupported(t, "path expression `%s::..`" % t.text)
+                segs = [t.text]
+                while self.at("::"):
+                    self.next()
+                    segs.append(self.ident().text)
+                if not self.at("("):
+                    self.unsupported(t, "path expression `%s`" % "::".join(segs))
+                return K.Call("::".join(segs), tuple(self.call_args()), t.loc)
             if self.at("!"):
                 if t.text == "vec" and self.peek().text == "[":
                     return self.vec_macro(t)
@@ -762,6 +837,74 @@ class _Parser:
         raise ParseError(t.loc, "expected an expression, found %s" % self.describe(t))
 
 
+def _tc():
+    # typecheck imports this module's siblings; import it lazily, like
+    # rs_parse_all does
+    from . import typecheck
+    return typecheck
+
+
+PATH_KEYWORDS = ("crate", "self", "super")
+
+
+def _resolve(raw, ns, funcs, loc):
+    """Rust's resolution of a call path written in module ``ns``, as an
+    absolute Kernel path.  ``funcs``: every absolute function path."""
+    segs = raw.split("::")
+    lead = 0
+    while lead < len(segs) and segs[lead] == "super":
+        lead += 1
+    if any(x in PATH_KEYWORDS for x in segs[max(lead, 1):]):
+        raise ParseError(loc, "unsupported: `crate`/`self`/`super` in the middle of the path `%s`" % raw)
+    head = segs[0]
+    if head == "crate":
+        absolute = segs[1:]
+    elif head == "self":
+        absolute = list(ns) + segs[1:]
+    elif head == "super":
+        k = 0
+        while k < len(segs) and segs[k] == "super":
+            k += 1
+        if k > len(ns):
+            raise ParseError(loc, "unsupported: `super` above the crate root")
+        absolute = list(ns[:len(ns) - k]) + segs[k:]
+    else:
+        absolute = list(ns) + segs
+    if not absolute:
+        raise ParseError(loc, "unsupported: path `%s` names no function" % raw)
+    path = "::".join(absolute)
+    if len(segs) == 1 and path not in funcs and ns:
+        # C++ would search the enclosing namespaces; Rust does not.
+        for i in range(len(ns) - 1, -1, -1):
+            outer = K.path_of(ns[:i], raw)
+            if outer in funcs:
+                raise ParseError(loc, "unsupported: `%s` is not defined in module `%s`: a Rust path does not "
+                                      "search enclosing modules (C++ unqualified lookup would find `%s`); spell "
+                                      "it `crate::%s`" % (raw, "::".join(ns), outer, outer))
+    return path
+
+
+def _resolve_calls(node, ns, funcs):
+    """Rebuild ``node`` with every Call's raw path resolved."""
+    from dataclasses import fields as dfields, is_dataclass, replace
+    if isinstance(node, tuple):
+        out = tuple(_resolve_calls(x, ns, funcs) for x in node)
+        return node if all(a is b for a, b in zip(out, node)) else out
+    if not is_dataclass(node) or isinstance(node, (K.Loc,) + K.TYPE_CLASSES):
+        return node
+    changes = {}
+    for f in dfields(node):
+        if f.name in ("loc", "spelling"):
+            continue
+        v = getattr(node, f.name)
+        nv = _resolve_calls(v, ns, funcs)
+        if nv is not v:
+            changes[f.name] = nv
+    if isinstance(node, K.Call):
+        changes["name"] = _resolve(node.name, ns, funcs, node.loc)
+    return replace(node, **changes) if changes else node
+
+
 def rs_parse_surface(src):
     """Parse Rust source to an UN-normalized Kernel (raises ParseError)."""
     try:
@@ -769,6 +912,9 @@ def rs_parse_surface(src):
     except LexError as ex:
         raise ParseError(ex.loc, ex.msg)
     prog = _Parser(toks).program()
+    funcs = {f.path for f in prog.funcs()}
+    prog = K.Program(tuple(K.Func(f.name, f.params, f.ret, _resolve_calls(f.body, f.ns, funcs), f.loc, f.ns,
+                                  f.internal) for f in prog.items))
     for n in K.walk(prog):
         if isinstance(n, _MStmt):
             raise ParseError(n.loc, "unsupported: `.%s()` used as a value" % n.kind)

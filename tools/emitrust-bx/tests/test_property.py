@@ -14,6 +14,14 @@
 # consuming position) all occur, and the rustc subset below now also
 # exercises the borrow checker (`--emit=metadata` runs borrowck), which is
 # what makes the alias / move / self-index rules load-bearing.
+# FR-260: the same programs place ~60% of their functions in namespaces (up
+# to three deep, one leaf name recurring in sibling namespaces and in a
+# namespace and its ancestors, internal functions); the coverage test below
+# pins that every lookup shape the printers spell differently -- a bare
+# same-namespace call that must find the INNER function, an absolute call
+# into / out of / across namespaces, a call to an internal function -- is
+# exercised, so laws 1-2 and the rustc subset (module privacy included)
+# cover them.
 import collections
 import os
 import shutil
@@ -96,6 +104,47 @@ def test_generator_covers_fr251(programs):
               "ref:shared", "byvalue-nc", "ret-nc", "strlit-cmp"):
         assert seen[k] >= 10, k
     assert seen["move"] >= 30
+
+
+def test_generator_covers_fr260(programs):
+    seen = collections.Counter()
+    for p in programs:
+        paths = {f.path for f in p.funcs()}
+        leaves = collections.defaultdict(set)
+        for f in p.funcs():
+            leaves[f.name].add(f.ns)
+            seen["depth%d" % len(f.ns)] += 1
+            if f.internal:
+                seen["internal"] += 1
+        for name, nss in leaves.items():
+            for a in nss:
+                for b in nss:
+                    if a != b and len(a) == len(b) and a[:-1] == b[:-1]:
+                        seen["sibling-same-name"] += 1
+                    if len(a) < len(b) and b[:len(a)] == a:
+                        seen["inner-and-outer"] += 1
+        internal = {f.path for f in p.funcs() if f.internal}
+        for f in p.funcs():
+            for n in K.walk(f.body):
+                if not isinstance(n, K.Call):
+                    continue
+                ns, leaf = K.split_path(n.name)
+                if ns == f.ns:
+                    seen["call-same-ns"] += 1
+                    if f.ns and any(K.path_of(f.ns[:i], leaf) in paths for i in range(len(f.ns))):
+                        seen["call-inner-hides-outer"] += 1
+                elif f.ns[:len(ns)] == ns:
+                    seen["call-outward"] += 1
+                elif ns[:len(f.ns)] == f.ns:
+                    seen["call-inward"] += 1
+                else:
+                    seen["call-across"] += 1
+                if n.name in internal:
+                    seen["call-internal"] += 1
+    for k in ("depth0", "depth1", "depth2", "depth3", "internal", "sibling-same-name", "inner-and-outer",
+              "call-same-ns", "call-inner-hides-outer", "call-outward", "call-inward", "call-across",
+              "call-internal"):
+        assert seen[k] >= 10, (k, seen[k])
 
 
 def test_law1_and_law2_rust(programs):

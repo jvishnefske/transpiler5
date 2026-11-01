@@ -43,6 +43,20 @@ FR-251 (vectors, strings, references):
   N5' N5 on elements: Store(v[i], Binary(op, v[i], e)) -> CompoundStore
       when v[i] contains no call (else the index would be evaluated twice).
       N5 itself only fires on scalar variables (never `s = s + t`).
+
+FR-260 (namespaces <=> modules).  Every Call names an ABSOLUTE path
+('a::b::f'); lookup is resolved by the parsers, so item order carries no
+meaning and the printers re-derive every spelling (same namespace: bare
+`f`; otherwise `::a::b::f` / `crate::a::b::f`) and every C++ prototype.
+
+  N13 Program items are in NAMESPACE-TREE order: the items of a namespace
+      form one contiguous block (a reopened namespace is merged into its
+      first appearance), and siblings -- functions and nested namespaces
+      alike -- keep their first-appearance order.  Meaning-preserving
+      because no Kernel reference depends on declaration order.
+  N14 Func.internal is False at the root: a C++ anonymous namespace at
+      global scope only changes LINKAGE, which a single-TU program cannot
+      observe, and every crate-root Rust item is already private.
 """
 
 from . import kernel as K
@@ -85,6 +99,11 @@ CXX_KEYWORDS = {
     "final", "override", "import", "module",
 }
 # Names the canonical outputs themselves use or that <cstdio> declares.
+# FR-260: names a namespace (a Rust module) may not take on top of RESERVED:
+# a root `mod Vec` would shadow the prelude type every canonical
+# `Vec<T>` / `Vec::new()` spells.
+NS_RESERVED = {"Vec"}
+
 RESERVED = {
     "std", "bx", "printf", "fprintf", "sprintf", "snprintf", "puts",
     "putchar", "getchar", "scanf", "perror", "fflush", "fopen", "fclose",
@@ -145,11 +164,41 @@ class Scope:
 
 
 def sigs_of(program):
+    """Absolute function path -> (param types, return type)."""
     sigs = {}
     for f in program.funcs():
-        if f.name not in sigs:
-            sigs[f.name] = (tuple(p.ty for p in f.params), f.ret)
+        if f.path not in sigs:
+            sigs[f.path] = (tuple(p.ty for p in f.params), f.ret)
     return sigs
+
+
+def tree_order(items):
+    """N13: ``items`` (Funcs and ResidualItems) in namespace-tree order."""
+    root = ([], {})  # (ordered children, name -> child node)
+
+    def node(ns):
+        n = root
+        for c in ns:
+            if c not in n[1]:
+                child = ([], {})
+                n[1][c] = child
+                n[0].append(child)
+            n = n[1][c]
+        return n
+
+    for it in items:
+        node(getattr(it, "ns", ()))[0].append(it)
+    out = []
+
+    def flat(n):
+        for x in n[0]:
+            if isinstance(x, tuple):
+                flat(x)
+            else:
+                out.append(x)
+
+    flat(root)
+    return tuple(out)
 
 
 LITERAL_TYPES = K.INT_TYPES
@@ -506,6 +555,8 @@ class _Checker:
         self.surface = surface
         self.sigs = sigs_of(program)
         self.errors = []
+        self.ns = ()  # FR-260: the namespace of the function being checked
+        self.internal = {}
 
     def err(self, loc, msg):
         self.errors.append((loc, msg))
@@ -514,7 +565,9 @@ class _Checker:
         p = ident_problem(name)
         if p:
             self.err(loc, p)
-        elif name in self.sigs:
+        elif K.path_of(self.ns, name) in self.sigs:
+            # only a SAME-namespace function is spelled bare (FR-260), so
+            # only it can be hidden by a local of the same name
             self.err(loc, "variable '%s' has the name of a function" % name)
 
     def expr(self, e, scope, want=None, pos="value"):
@@ -743,23 +796,58 @@ class _Checker:
 
     def run(self):
         seen = set()
-        for it in self.program.items:
-            if isinstance(it, K.ResidualItem):
-                continue
-            f = it
-            if f.name in seen:
-                self.err(f.loc, "function '%s' defined twice" % f.name)
-            seen.add(f.name)
-            if f.name != "main":
+        funcs = self.program.funcs()
+        # FR-260: namespaces declared in each scope (C++ forbids a function
+        # and a namespace of one name in one scope; Rust would allow it)
+        ns_names = set()
+        self.internal = {}
+        for f in funcs:
+            for i in range(len(f.ns)):
+                ns_names.add(f.ns[:i + 1])
+            if f.internal:
+                self.internal[f.path] = f.ns
+        bad_ns = set()
+        for f in funcs:
+            for i, c in enumerate(f.ns):
+                p = ident_problem(c) or (("identifier '%s' names a Rust prelude type" % c) if c in NS_RESERVED else None)
+                if p and f.ns[:i + 1] not in bad_ns:
+                    bad_ns.add(f.ns[:i + 1])
+                    self.err(f.loc, "namespace name: " + p)
+        for f in funcs:
+            if f.path in seen:
+                self.err(f.loc, "function '%s' defined twice" % f.path)
+            seen.add(f.path)
+            if f.name == "main" and f.ns:
+                self.err(f.loc, "function 'main' inside a namespace")
+            elif f.name != "main":
                 p = ident_problem(f.name)
                 if p:
                     self.err(f.loc, p)
+            if f.ns + (f.name,) in ns_names:
+                self.err(f.loc, "function '%s' has the name of a namespace declared in the same scope" % f.path)
+            if f.internal and not f.ns:
+                self.err(f.loc, "internal function at the root (normal form N14)")
             self.func(f)
         return self.errors
+
+    def check_visibility(self, call):
+        """An internal function (C++ anonymous-namespace member, Rust private
+        `fn` in a `mod`) may only be referenced from inside its namespace:
+        Rust's privacy rule (E0603).  C++ would also accept `::a::h` from
+        outside, which has no 1:1 Rust spelling, so it is a residual."""
+        owner = self.internal.get(call.name)
+        if owner is not None and self.ns[:len(owner)] != owner:
+            self.err(call.loc, "unsupported: '%s' is internal to namespace '%s' (a C++ anonymous-namespace "
+                               "member, a private Rust `fn`) and is referenced from outside it"
+                     % (call.name, "::".join(owner)))
 
     def func(self, f):
         self.moves = []
         self.borrow_ok = set()
+        self.ns = f.ns
+        for n in K.walk(f.body):
+            if isinstance(n, K.Call):
+                self.check_visibility(n)
         if not (f.ret in K.ALL_PRIMS or f.ret == K.UNIT or K.is_owned_nc(f.ret)):
             if isinstance(f.ret, K.RefT):
                 self.err(f.loc, "unsupported: function returning a reference")
@@ -767,7 +855,7 @@ class _Checker:
                 self.err(f.loc, "return type %s" % f.ret)
         if isinstance(f.ret, K.VecT) and not K.elem_ok(f.ret.elem):
             self.err(f.loc, "return type %s" % f.ret)
-        if f.name == "main":
+        if f.path == "main":
             if f.params:
                 self.err(f.loc, "main with parameters")
             if f.ret != K.UNIT:
@@ -787,7 +875,7 @@ class _Checker:
         self.ret = K.deref(f.ret)  # a returned reference is reported above, once
         self.block(f.body, scope, loop=False, same_scope=True)
         if f.ret != K.UNIT and not definitely_returns(f.body):
-            self.err(f.loc, "function '%s' may reach its end without returning a value" % f.name)
+            self.err(f.loc, "function '%s' may reach its end without returning a value" % f.path)
         self.check_moves(f)
 
     @staticmethod
@@ -1450,9 +1538,13 @@ class _Normalizer:
         for p in f.params:
             scope.declare(p.name, p.ty, p.mutable)
         self.ret = f.ret
-        return K.Func(f.name, f.params, f.ret, self.block(f.body, scope, same=True), f.loc)
+        internal = f.internal and bool(f.ns)  # N14
+        return K.Func(f.name, f.params, f.ret, self.block(f.body, scope, same=True), f.loc, f.ns, internal)
 
 
 def normalize(program, keep_surface=False):
     n = _Normalizer(program, keep_surface)
-    return K.Program(tuple(n.func(i) if isinstance(i, K.Func) else i for i in program.items))
+    items = tuple(n.func(i) if isinstance(i, K.Func) else i for i in program.items)
+    if not keep_surface:
+        items = tree_order(items)  # N13
+    return K.Program(items)

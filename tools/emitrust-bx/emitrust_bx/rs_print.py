@@ -57,6 +57,17 @@ style lint, not a typing rule):
   `v.resize(n, x);`, `for x in v.iter().copied()` (`.cloned()` for a
   non-Copy element; `for mut x` when the C++ copy is non-const),
   `for x in v.iter()`, `for x in v.iter_mut()`.
+
+FR-260 rows (namespaces): a C++ named namespace is a `mod`, one block per
+namespace (N13), contents indented one level; a nested one is `pub mod`
+(a private nested module is unreachable from the root, E0603).  A function
+in a module is `pub fn`, or plain `fn` when it is internal (a C++
+anonymous-namespace member).  A call to a function of the SAME module is
+bare `f(..)`; every other call is absolute, `crate::a::b::f(..)` (C++
+`::a::b::f(..)`) -- both languages then resolve it with no dependence on
+declaration order, enclosing-scope search, or using-directives.  Inside a
+module the safe helpers are `crate::bx::..` (`bx::` resolves relative to
+the current module).
 """
 
 from . import fmt
@@ -101,6 +112,19 @@ class _Printer:
         # unsuffixed literal there from the cast TARGET (`-74 as u8` makes
         # 74 a u8), so i32 literals are suffixed `74i32` in that context.
         self.in_cast = 0
+        self.ns = ()  # the namespace of the function being printed
+        self.base = 0  # module nesting depth (indentation)
+
+    @property
+    def bxp(self):
+        return "crate::bx::" if self.ns else "bx::"
+
+    def callee(self, path):
+        """FR-260: bare in the same module, otherwise `crate::`-absolute."""
+        ns, leaf = K.split_path(path)
+        if ns == self.ns:
+            return leaf
+        return "crate::" + path
 
     def ty(self, e, scope):
         return TC.type_of(e, scope, self.sigs)
@@ -144,7 +168,8 @@ class _Printer:
             saved, self.in_cast = self.in_cast, 0
             try:
                 sig = self.sigs.get(e.name)
-                return "%s(%s)" % (e.name, ", ".join(self.arg(pt, a, scope) for pt, a in zip(sig[0], e.args)))
+                return "%s(%s)" % (self.callee(e.name), ", ".join(self.arg(pt, a, scope)
+                                                                 for pt, a in zip(sig[0], e.args)))
             finally:
                 self.in_cast = saved
         if isinstance(e, (K.Clone, K.Index, K.ByteAt, K.Len, K.IsEmpty, K.VecLit, K.VecFill, K.StrNew,
@@ -246,9 +271,9 @@ class _Printer:
         if isinstance(e, K.Substr):
             if e.count is None:
                 self.used.add("substr_from")
-                return "bx::substr_from(%s, %s)" % (self.borrow(e.base, scope, False), self.expr(e.pos, scope))
+                return self.bxp + "substr_from(%s, %s)" % (self.borrow(e.base, scope, False), self.expr(e.pos, scope))
             self.used.add("substr")
-            return "bx::substr(%s, %s, %s)" % (self.borrow(e.base, scope, False), self.expr(e.pos, scope),
+            return self.bxp + "substr(%s, %s, %s)" % (self.borrow(e.base, scope, False), self.expr(e.pos, scope),
                                                self.expr(e.count, scope))
         if isinstance(e, K.ToStr):
             return self.recv(e.operand, scope) + ".to_string()"
@@ -266,7 +291,7 @@ class _Printer:
     # -------------------------------------------------------------- stmts
 
     def emit(self, depth, text):
-        self.lines.append("    " * depth + text)
+        self.lines.append("    " * (self.base + depth) + text)
 
     def block_body(self, b, scope, depth, same=False):
         inner = scope if same else scope.child()
@@ -314,7 +339,7 @@ class _Printer:
             self.emit(d, "%s.push_str(%s);" % (self.recv(s.target, scope), self.borrow(s.value, scope, False)))
         elif isinstance(s, K.PushByte):
             self.used.add("push_byte")
-            self.emit(d, "bx::push_byte(%s, %s);" % (self.borrow(s.target, scope, True),
+            self.emit(d, self.bxp + "push_byte(%s, %s);" % (self.borrow(s.target, scope, True),
                                                      self.expr(s.value, scope)))
         elif isinstance(s, K.ForEach):
             t = self.ty(s.iterable, scope)
@@ -345,10 +370,10 @@ class _Printer:
                     a = self.expr(sg.arg, scope)
                 if sg.kind == "f":
                     self.used.add("fmt_f")
-                    a = "bx::fmt_f(%s, %d)" % (a, sg.prec)
+                    a = self.bxp + "fmt_f(%s, %d)" % (a, sg.prec)
                 elif sg.kind == "c":
                     self.used.add("chr")
-                    a = "bx::chr(%s)" % a
+                    a = self.bxp + "chr(%s)" % a
                 args.append(a)
             self.emit(d, 'print!("%s"%s);' % ("".join(text), "".join(", " + a for a in args)))
         elif isinstance(s, K.If):
@@ -412,7 +437,8 @@ class _Printer:
             ps.append("%s%s: %s" % ("mut " if p.mutable else "", p.name, rs_ty(p.ty)))
             scope.declare(p.name, p.ty, p.mutable)
         ret = "" if f.ret == K.UNIT else " -> " + rs_ty(f.ret)
-        self.emit(0, "fn %s(%s)%s {" % (f.name, ", ".join(ps), ret))
+        vis = "pub " if f.ns and not f.internal else ""
+        self.emit(0, "%sfn %s(%s)%s {" % (vis, f.name, ", ".join(ps), ret))
         self.block_body(f.body, scope, 1, same=True)
         self.emit(0, "}")
 
@@ -426,12 +452,37 @@ def rs_print(program):
         loc, msg = errs[0]
         raise PrintError("ill-formed kernel at %s: %s" % (loc, msg))
     p = _Printer(program)
-    first = True
-    for f in program.funcs():
-        if not first:
+    open_ns = ()
+
+    def gap():
+        # a blank line between items, none right after a `mod .. {`
+        if p.lines and not p.lines[-1].endswith("{"):
             p.lines.append("")
-        first = False
+
+    for f in program.funcs():
+        # N13 makes each module's items contiguous, so one walk opens and
+        # closes every `mod` block exactly once.
+        common = 0
+        while common < min(len(open_ns), len(f.ns)) and open_ns[common] == f.ns[common]:
+            common += 1
+        while len(open_ns) > common:
+            open_ns = open_ns[:-1]
+            p.base = len(open_ns)
+            p.emit(0, "}")
+        while len(open_ns) < len(f.ns):
+            gap()
+            p.base = len(open_ns)
+            name = f.ns[len(open_ns)]
+            p.emit(0, "%smod %s {" % ("pub " if open_ns else "", name))
+            open_ns = open_ns + (name,)
+        p.base = len(open_ns)
+        p.ns = f.ns
+        gap()
         p.func(f)
+    while open_ns:
+        open_ns = open_ns[:-1]
+        p.base = len(open_ns)
+        p.emit(0, "}")
     out = "\n".join(p.lines) + "\n"
     mod = fmt.bx_module(p.used)
     if mod:

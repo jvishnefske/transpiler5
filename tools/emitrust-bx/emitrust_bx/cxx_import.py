@@ -45,6 +45,19 @@ FR-251 (std::vector / std::string), measured on the same clang:
   `v.front()` -> `v[0]`, `v.back()` -> `v[v.size() - 1]` (both UB on an
   empty vector; the Rust index panics), `s.length()` -> `s.size()`,
   `s += c` (char) -> `s.push_back(c)`, `"lit" + s` -> `std::string("lit") + s`.
+
+FR-260 (namespaces), measured on the same clang:
+
+* a NamespaceDecl nests its members; C++17 `namespace a::b {` is a NamespaceDecl
+  `a` holding `b` with `isNested`; an anonymous namespace has no name and is
+  followed by an implicit UsingDirectiveDecl; an out-of-line `int a::f() {..}`
+  is a top-level FunctionDecl whose `parentDeclContextId` is namespace a;
+  a definition redeclaring a header decl carries `previousDecl`.
+* a DeclRefExpr's `referencedDecl` id names the function whatever the
+  spelling (`f`, `a::f`, `::a::f`, via `using`, via an alias), so every call
+  becomes an ABSOLUTE Kernel path and using-directives, using-declarations
+  of user functions and aliases of this file's namespaces are erased
+  (spelling only).  `using std::string;` & co keep FR-251's residual.
 """
 
 import bisect
@@ -165,6 +178,7 @@ FRIENDLY = {
     "NamespaceDecl": "namespace", "FunctionTemplateDecl": "function template",
     "ClassTemplateDecl": "class template", "TypedefDecl": "typedef",
     "TypeAliasDecl": "type alias", "EnumDecl": "enum", "UsingDecl": "using-declaration",
+    "UsingDirectiveDecl": "using-directive", "NamespaceAliasDecl": "namespace alias",
     "StaticAssertDecl": "static_assert", "CXXMethodDecl": "member function",
     "BinaryConditionalOperator": "conditional operator `?:`",
     "CompoundLiteralExpr": "compound literal", "StmtExpr": "statement expression",
@@ -350,46 +364,132 @@ class CxxImporter:
             trk.node(rest, visit)
             if in_main and not n.get("isImplicit"):
                 mains.append(n)
+        # FR-260: every namespace decl (any file) -> (path, internal)
+        self.ns_index = {}
+        for n in top:
+            self.index_ns(n, (), False)
         items = []
         funcs = []
         for n in mains:
-            k = n.get("kind")
-            if k == "FunctionDecl":
-                funcs.append(n)
-                self.user_funcs[n["id"]] = n.get("name")
-            elif k == "LinkageSpecDecl":
-                for c in n.get("inner", []):
-                    if (c.get("kind") == "FunctionDecl" and c.get("name") == "printf"
-                            and not any(x.get("kind") == "CompoundStmt" for x in c.get("inner", []))
-                            and (self.qual(c.get("type")) or "").replace(" ", "")
-                            in ("int(constchar*,...)", "int(constchar*__restrict,...)")):
-                        self.libc_printf.add(c["id"])
-                    else:
-                        items.append(K.ResidualItem("extern \"C\" declaration", self.loc(c)))
-            elif k == "UsingDirectiveDecl":
-                ns = n.get("nominatedNamespace", {}).get("name")
-                if ns != "std":
-                    items.append(K.ResidualItem("using-directive", self.loc(n)))
-            else:
-                items.append(K.ResidualItem(friendly(k), self.loc(n)))
+            self.collect(n, (), False, items, funcs)
+        # a main-file function redeclaring an earlier (e.g. header) decl:
+        # a reference may name either decl id
+        for n, ns, internal in funcs:
+            prev = n.get("previousDecl")
+            if prev and prev not in self.user_funcs:
+                self.user_funcs[prev] = K.path_of(ns, n.get("name"))
         # signatures (for typing calls)
         self.sigs = {}
         defined = set()
-        for n in funcs:
+        for n, ns, internal in funcs:
             if self.has_body(n):
                 ptys, ret = self.signature_types(n)
-                if n.get("name") != "main":
-                    self.sigs.setdefault(n["name"], (ptys, ret))
-                defined.add(n.get("name"))
-        for n in funcs:
+                path = K.path_of(ns, n.get("name"))
+                if path != "main":
+                    self.sigs.setdefault(path, (ptys, ret))
+                defined.add(path)
+        for n, ns, internal in funcs:
             if not self.has_body(n):
-                if n.get("name") not in defined:
+                if K.path_of(ns, n.get("name")) not in defined:
                     items.append(K.ResidualItem("function declared but not defined", self.loc(n)))
                 continue
-            items.append(self.func(n))
+            items.append(self.func(n, ns, internal))
         # keep source order
         items.sort(key=lambda it: (it.loc.line, it.loc.col) if it.loc else (0, 0))
         return K.Program(tuple(items))
+
+    # -------------------------------------------------------------- FR-260
+    def index_ns(self, n, path, internal):
+        if not isinstance(n, dict) or n.get("kind") != "NamespaceDecl":
+            return
+        name = n.get("name") or ""
+        if name:
+            path = path + (name,)
+        else:
+            internal = True
+        self.ns_index[n["id"]] = (path, internal)
+        for c in n.get("inner", []):
+            self.index_ns(c, path, internal)
+
+    def collect(self, n, ns, internal, items, funcs):
+        """One main-file declaration at namespace scope ``ns``."""
+        if n.get("isImplicit"):
+            return
+        k = n.get("kind")
+        if k == "FunctionDecl":
+            pid = n.get("parentDeclContextId")
+            if pid in self.ns_index:  # an out-of-line `int a::f() {..}`
+                ns, internal = self.ns_index[pid]
+            funcs.append((n, ns, internal))
+            self.user_funcs[n["id"]] = K.path_of(ns, n.get("name"))
+        elif k == "NamespaceDecl":
+            name = n.get("name") or ""
+            if n.get("isInline"):
+                items.append(K.ResidualItem("inline namespace", self.loc(n)))
+                return
+            if name and internal:
+                items.append(K.ResidualItem("named namespace inside an anonymous namespace", self.loc(n)))
+                return
+            if name:
+                p = TC.ident_problem(name) or (
+                    "identifier '%s' names a Rust prelude type" % name if name in TC.NS_RESERVED else None)
+                if p:
+                    items.append(K.ResidualItem("namespace name: " + p, self.loc(n)))
+                    return
+            inner_ns, inner_internal = (ns + (name,), internal) if name else (ns, True)
+            for c in n.get("inner", []):
+                self.collect(c, inner_ns, inner_internal, items, funcs)
+        elif k == "LinkageSpecDecl":
+            for c in n.get("inner", []):
+                if (not ns and c.get("kind") == "FunctionDecl" and c.get("name") == "printf"
+                        and not any(x.get("kind") == "CompoundStmt" for x in c.get("inner", []))
+                        and (self.qual(c.get("type")) or "").replace(" ", "")
+                        in ("int(constchar*,...)", "int(constchar*__restrict,...)")):
+                    self.libc_printf.add(c["id"])
+                else:
+                    items.append(K.ResidualItem("extern \"C\" declaration", self.loc(c)))
+        elif k == "UsingDirectiveDecl":
+            # FR-260: name lookup is RESOLVED by clang (every reference
+            # carries its decl id), so a using-directive is pure spelling:
+            # erased, like `using namespace std;` always was.
+            return
+        elif k in ("UsingDecl", "UsingShadowDecl"):
+            if self.using_is_user(n):
+                return  # `using a::f;` of a user function: spelling only
+            if k == "UsingDecl":
+                items.append(K.ResidualItem(friendly(k), self.loc(n)))
+        elif k == "NamespaceAliasDecl":
+            al = n.get("aliasedNamespace", {}).get("id")
+            if al in self.ns_index and self.decl_main.get(al):
+                return  # an alias of a namespace of this file: spelling only
+            items.append(K.ResidualItem("namespace alias of a namespace outside this file", self.loc(n)))
+        else:
+            items.append(K.ResidualItem(friendly(k), self.loc(n)))
+
+    def spelling_only(self, d):
+        """FR-260: a block-scope using-directive, using-declaration of a
+        user function, or alias of a user namespace changes only how names
+        are SPELLED -- every reference is resolved by clang -- so it is
+        erased like its namespace-scope counterpart."""
+        k = d.get("kind")
+        if k == "UsingDirectiveDecl":
+            return True
+        if k in ("UsingDecl", "UsingShadowDecl"):
+            return self.using_is_user(d)
+        if k == "NamespaceAliasDecl":
+            al = d.get("aliasedNamespace", {}).get("id")
+            return al in self.ns_index and bool(self.decl_main.get(al))
+        return False
+
+    def using_is_user(self, n):
+        """Is this using-declaration (or its shadow) about a main-file
+        function?  (`using std::string;` & co keep FR-251's residual.)"""
+        if n.get("kind") == "UsingShadowDecl":
+            t = n.get("target", {})
+            return t.get("kind") == "FunctionDecl" and bool(self.decl_main.get(t.get("id")))
+        name = (n.get("name") or "").lstrip(":")
+        head = name.split("::")[0]
+        return any(path and path[0] == head and self.decl_main.get(i) for i, (path, _) in self.ns_index.items())
 
     @staticmethod
     def has_body(n):
@@ -410,7 +510,7 @@ class CxxImporter:
         return tuple(ptys), ret
 
     # -------------------------------------------------------------- funcs
-    def func(self, n):
+    def func(self, n, ns=(), internal=False):
         name = n.get("name")
         floc = self.lines.at(_off(n.get("loc")))
         pre = []
@@ -457,7 +557,7 @@ class CxxImporter:
         self.ret = ret
         body_node = [c for c in n.get("inner", []) if c.get("kind") == "CompoundStmt"][-1]
         stmts = []
-        is_main = name == "main"
+        is_main = name == "main" and not ns
         inner = list(body_node.get("inner", []))
         if is_main:
             if ret != K.I32:
@@ -472,7 +572,8 @@ class CxxImporter:
         self.in_main = is_main
         for s in inner:
             stmts.extend(self.stmt(s))
-        return K.Func(name, tuple(params), ret, K.Block(tuple(pre + stmts), self.loc(body_node)), floc)
+        return K.Func(name, tuple(params), ret, K.Block(tuple(pre + stmts), self.loc(body_node)), floc,
+                      tuple(ns), internal)
 
     # -------------------------------------------------------------- stmts
     def as_block(self, n):
@@ -514,7 +615,7 @@ class CxxImporter:
         if k == "NullStmt":
             return []
         if k == "DeclStmt":
-            return [self.decl(d) for d in n.get("inner", [])]
+            return [self.decl(d) for d in n.get("inner", []) if not self.spelling_only(d)]
         if k == "ReturnStmt":
             if self.in_main:
                 return [self.rstmt(n, "return inside main other than the final `return 0;`")]
