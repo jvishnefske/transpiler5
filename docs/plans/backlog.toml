@@ -1740,11 +1740,11 @@ anchor = "FR-256 (opened 2026-11-01): **PMF THESIS"
 [[items]]
 id = "FR-257"
 kind = "feature"
-status = "open"
+status = "landed"
 rank = 63
 size = "L"
 title = "BX value-semantic structs and classes"
-summary = "Opens 63 blocked programs and 1680 hidden functions; expect newly exposed tags."
+summary = "Clone structs, impl methods, all-field ctors <=> fn new; fixed FR-251 path-bound miscompile. Frontier EMIT +0 (inspected 323 -> 340). Expected TRACTOR +0."
 blocked_by = ["FR-251"]
 anchor = "FR-257 (opened 2026-11-01, from FR-256): **BX VALUE-SEMANTIC"
 

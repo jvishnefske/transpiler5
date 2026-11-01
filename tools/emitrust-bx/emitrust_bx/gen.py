@@ -26,6 +26,19 @@ its ancestors (inner hides outer -- a bare same-namespace call must find the
 inner one on both sides); a quarter of namespaced functions are internal
 (anonymous-namespace / private `fn`) and are only called from inside their
 namespace, as the subset requires.
+
+FR-257: with ``structs`` (the default) every program also defines 2-4
+structs (drawn from a THIRD stream), placed like functions, whose data
+members are scalars, String, Vec<scalar>, an earlier struct by value, or a
+vector of any struct (itself included: recursion through Vec is legal in
+both languages).  Each has 1-3 member functions (`&self`, `&mut self`,
+static) and sometimes a constructor (then aggregate initialization of it is
+not in the subset, so values come from `S::new`).  Bodies read and write
+data members through every place shape (`p.f`, `v[i].f`, `p.v[i]`,
+`self.f`), call member functions on places, and pass structs by value
+(moved or cloned) and by `&` / `&mut`.  The alias discipline extends to
+receivers: the receiver's variable is not mentioned elsewhere in the
+statement when the call may modify it, and arguments never modify it.
 """
 
 import random
@@ -44,12 +57,18 @@ VALUE_TYPES = K.ALL_PRIMS + NC_TYPES
 
 
 class Gen:
-    def __init__(self, seed, namespaces=True):
+    def __init__(self, seed, namespaces=True, structs=True):
         self.r = random.Random(seed)
         self.namespaces = namespaces
         self.nsr = random.Random(seed * 7919 + 17)  # FR-260's own stream
+        self.sr = random.Random(seed * 104729 + 31)  # FR-257's own stream
+        self.structs_on = structs
         self.meta = {}  # path -> (ns, leaf, internal)
         self.cur_ns = ()
+        self.sdefs = []  # FR-257: StructDef shells (fields; methods filled later)
+        self.sd_by = {}
+        self.msigs = []  # (path, params, ret, recv, struct path)
+        self._sigmap = None
 
     def placement(self, i, nfuncs, prefix, taken):
         """(ns, leaf, internal) for the i-th generated function."""
@@ -76,50 +95,158 @@ class Gen:
             ns, _, internal = self.meta.get(s[0], ((), s[0], False))
             if internal and self.cur_ns[:len(ns)] != ns:
                 continue
+            if not self.types_visible([p.ty for p in s[1]] + [s[2]]):
+                continue
             out.append(s)
+        for mp, params, ret, recv, owner in self.msigs:
+            if recv in ("static", "ctor") and self.types_visible([K.StructT(owner)] + [p.ty for p in params] + [ret]):
+                out.append((mp, params, ret))
         return out
 
     def choice(self, xs):
         return self.r.choice(xs)
 
     # -------------------------------------------------------------- program
-    def param_type(self):
-        r = self.r
+    def struct_visible(self, path, ns=None):
+        """May a function (or struct) in namespace ``ns`` NAME struct
+        ``path``?  An internal struct only from inside its namespace."""
+        ns = self.cur_ns if ns is None else ns
+        sd = self.sd_by[path]
+        return not sd.internal or tuple(ns[:len(sd.ns)]) == tuple(sd.ns)
+
+    def types_visible(self, types, ns=None, seen=None):
+        """Are ``types`` NAMEABLE from ``ns``: every struct in them visible,
+        and (since a fresh value spells every member's type, e.g. an empty
+        `Vec::<T>::new()`) every struct reachable through their members too."""
+        seen = set() if seen is None else seen
+        for t in types:
+            while isinstance(t, (K.VecT, K.RefT)):
+                t = t.elem if isinstance(t, K.VecT) else t.inner
+            if isinstance(t, K.StructT) and t.path not in seen:
+                seen.add(t.path)
+                if not self.struct_visible(t.path, ns):
+                    return False
+                if not self.types_visible([f.ty for f in self.sd_by[t.path].fields], ns, seen):
+                    return False
+        return True
+
+    def struct_types(self):
+        return tuple(K.StructT(sd.path) for sd in self.sdefs if self.types_visible([K.StructT(sd.path)]))
+
+    def param_type(self, r=None):
+        r = r or self.r
         roll = r.random()
         if roll < 0.55:
-            return self.choice(K.ALL_PRIMS), r.random() < 0.6
-        if roll < 0.75:
-            return self.choice(NC_TYPES), r.random() < 0.6
-        inner = self.choice(NC_TYPES + (K.I32, K.I64, K.U32, K.F64, K.BOOL))
+            return r.choice(K.ALL_PRIMS), r.random() < 0.6
+        sts = self.struct_types()
+        if sts and roll < 0.65:
+            if r.random() < 0.5:
+                return r.choice(sts), r.random() < 0.6
+            return K.RefT(r.choice(sts), r.random() < 0.5), False
+        if roll < 0.8:
+            return r.choice(NC_TYPES), r.random() < 0.6
+        inner = r.choice(NC_TYPES + (K.I32, K.I64, K.U32, K.F64, K.BOOL))
         return K.RefT(inner, r.random() < 0.5), False
+
+    def ret_type(self, r=None):
+        r = r or self.r
+        sts = self.struct_types()
+        if sts and r.random() < 0.12:
+            return r.choice(sts)
+        return r.choice(K.ALL_PRIMS + (K.UNIT, K.UNIT) + NC_TYPES[:4])
+
+    # ------------------------------------------------------------ FR-257
+    def make_structs(self):
+        """Struct shells: names, placement, data members, member-function
+        signatures (bodies are generated with the free functions)."""
+        r = self.sr
+        if not self.structs_on:
+            return
+        for i in range(r.randint(2, 4)):
+            ns = () if (not self.namespaces or r.random() < 0.4) else r.choice(NS_POOL[1:])
+            internal = bool(ns) and r.random() < 0.3
+            name = "S%d" % i
+            path = K.path_of(ns, name)
+            earlier = [sd.path for sd in self.sdefs if self.types_visible([K.StructT(sd.path)], ns)]
+            fields = []
+            for j in range(r.randint(1, 4)):
+                roll = r.random()
+                if roll < 0.4 or (roll >= 0.6 and not earlier and roll < 0.82):
+                    ty = r.choice(K.ALL_PRIMS)
+                elif roll < 0.6:
+                    ty = r.choice(NC_TYPES[:8])
+                elif roll < 0.82:
+                    ty = K.StructT(r.choice(earlier))
+                else:
+                    ty = K.VecT(K.StructT(r.choice(earlier + [path])))
+                fields.append(K.FieldDef("g%d" % j, ty))
+            sd = K.StructDef(name, tuple(fields), (), None, ns, internal)
+            self.sdefs.append(sd)
+            self.sd_by[path] = sd
+        for sd in self.sdefs:
+            ms = []
+            self.cur_ns = sd.ns
+            if r.random() < 0.35:
+                ms.append((sd.path + "::new", tuple(K.Param("p%d" % j, f.ty, True) for j, f in enumerate(sd.fields)),
+                           K.StructT(sd.path), "ctor"))
+            for j in range(r.randint(1, 3)):
+                recv = r.choice(("ref", "ref", "mut", "mut", "static"))
+                params = []
+                for k in range(r.randint(0, 3)):
+                    t, m = self.param_type(r)
+                    params.append(K.Param("p%d" % k, t, m))
+                ms.append((sd.path + "::m%d" % j, tuple(params), self.ret_type(r), recv))
+            for mp, params, ret, recv in ms:
+                self.msigs.append((mp, params, ret, recv, sd.path))
+                self.meta[mp] = (sd.ns, mp.rsplit("::", 1)[1], False)
+        self.cur_ns = ()
+
+    def has_ctor(self, path):
+        return any(m[3] == "ctor" and m[4] == path for m in self.msigs)
 
     def program(self, nfuncs, prefix="f"):
         r = self.r
+        self.make_structs()
         sigs = []
         for i in range(nfuncs):
+            # (placement draws from its own stream, so drawing it first leaves
+            # the main stream's sequence as it was)
+            ns, leaf, internal = self.placement(i, nfuncs, prefix, self.meta)
+            self.cur_ns = ns
             nparams = r.randint(0, 4)
             params = []
             for j in range(nparams):
                 t, m = self.param_type()
                 params.append(K.Param("p%d" % j, t, m))
-            ret = self.choice(K.ALL_PRIMS + (K.UNIT, K.UNIT) + NC_TYPES[:4])
-            ns, leaf, internal = self.placement(i, nfuncs, prefix, self.meta)
+            ret = self.ret_type()
             path = K.path_of(ns, leaf)
             self.meta[path] = (ns, leaf, internal)
             sigs.append((path, tuple(params), ret))
         self.sigs = sigs
+        self._sigmap = None
         funcs = []
         for name, params, ret in sigs:
             ns, leaf, internal = self.meta[name]
             self.cur_ns = ns
             f = self.func(name, params, ret)
             funcs.append(K.Func(leaf, f.params, f.ret, f.body, None, ns, internal))
-        prog = TC.normalize(K.Program(tuple(funcs)))
+        structs = []
+        for sd in self.sdefs:
+            ms = []
+            self.cur_ns = sd.ns
+            for mp, params, ret, recv, owner in self.msigs:
+                if owner != sd.path:
+                    continue
+                leaf = mp.rsplit("::", 1)[1]
+                f = self.func(mp, params, ret, recv=recv, owner=sd)
+                ms.append(K.Func(leaf, f.params, f.ret, f.body, None, sd.ns, False, sd.name, recv))
+            structs.append(K.StructDef(sd.name, sd.fields, tuple(ms), None, sd.ns, sd.internal))
+        prog = TC.normalize(K.Program(tuple(structs) + tuple(funcs)))
         errs = TC.check(prog)
         assert not errs, errs[:3]
         return prog
 
-    def func(self, name, params, ret):
+    def func(self, name, params, ret, recv="", owner=None):
         self.counter = 0
         self.ret = ret
         self.dead = set()
@@ -130,9 +257,17 @@ class Gen:
         self.stmt_seen = set()
         self.stmt_hidden = set()
         scope = TC.Scope()
+        if recv in ("ref", "mut"):
+            scope.declare("self", K.RefT(K.StructT(owner.path), recv == "mut"), False)
+            self.decl_depth["self"] = 0
         for p in params:
             scope.declare(p.name, p.ty, p.mutable)
             self.decl_depth[p.name] = 0
+        if recv == "ctor":
+            # a member-initializer list: `return S { every field };`
+            self.begin_stmt()
+            lit = K.StructLit(owner.path, tuple(self.value(f.ty, scope, 2, "consume") for f in owner.fields))
+            return K.Func(name, params, ret, K.Block((K.Return(lit),)))
         stmts = self.stmts(scope, depth=0, loop=False, n=self.r.randint(1, 6))
         if ret != K.UNIT:
             self.begin_stmt()
@@ -204,6 +339,9 @@ class Gen:
         r = self.r
         kinds = ["let", "let", "assign", "compound", "print", "call", "nlet", "nlet", "vecop", "vecop",
                  "strop", "strop", "strop", "store"]
+        if self.sdefs:
+            # (one more `nlet` keeps FR-251's move coverage undiluted)
+            kinds += ["mcall", "mcall", "mcall", "store", "slet", "nlet"]
         if depth < 3:
             kinds += ["if", "if", "while", "for", "block", "foreach", "foreach"]
         if loop:
@@ -256,11 +394,25 @@ class Gen:
         if k == "print":
             return self.print_(scope)
         if k == "call":
-            name, params, ret = self.choice(self.callable_sigs())
+            name, params, ret = self.choice([c for c in self.callable_sigs() if not c[0].endswith("::new")])
             try:
                 return K.ExprStmt(self.call(name, params, scope, 2))
             except _NoCall:
                 return self.print_(scope)
+        if k == "mcall":
+            try:
+                return K.ExprStmt(self.mcall(scope, 2, None))
+            except _NoCall:
+                return self.print_(scope)
+        if k == "slet":
+            if not self.struct_types():
+                return self.print_(scope)
+            t = self.choice(self.struct_types())
+            e = self.value(t, scope, 3, "consume")
+            name = self.fresh()
+            mut = r.random() < 0.8
+            self.declare(scope, name, t, mut)
+            return K.Let(name, t, mut, e)
         if k == "vecop":
             return self.vecop(scope)
         if k == "strop":
@@ -316,7 +468,7 @@ class Gen:
         frozen = None
         if t == K.USIZE and r.random() < 0.35:
             places = [p for p in self.places(scope, lambda tt: isinstance(tt, K.VecT) or tt == K.STRING, 1,
-                                             index_ok=False) if p.name not in lo_hidden]
+                                             index_ok=False) if TC.base_var(p) not in lo_hidden]
             if places:
                 pl = self.choice(places)
                 hi = K.Len(pl)
@@ -343,7 +495,15 @@ class Gen:
         return K.For(var, lo, hi, body)
 
     def sig_map(self):
-        return {n: (tuple(p.ty for p in ps), ret) for n, ps, ret in self.sigs}
+        if self._sigmap is None:
+            sm = TC.Sigs({n: (tuple(p.ty for p in ps), ret) for n, ps, ret in self.sigs})
+            for mp, params, ret, recv, owner in self.msigs:
+                sm[mp] = (tuple(p.ty for p in params), ret)
+                sm.recv[mp] = recv
+            for sd in self.sdefs:
+                sm.structs[sd.path] = sd
+            self._sigmap = sm
+        return self._sigmap
 
     def foreach(self, scope, depth):
         r = self.r
@@ -385,16 +545,38 @@ class Gen:
         return TC.type_of(e, scope, self.sig_map())
 
     # ------------------------------------------------ FR-251 statements
+    def access_paths(self, name, t, depth):
+        """(steps, type) of the places rooted at variable ``name`` -- FR-257:
+        through data members as well as elements; at most one index."""
+        out = [((), t)]
+        if depth <= 0:
+            return out
+        if isinstance(t, K.VecT):
+            out += [(("[]",) + st, tt) for st, tt in self.access_paths(name, t.elem, depth - 1)
+                    if "[]" not in st]
+        elif isinstance(t, K.StructT) and t.path in self.sd_by:
+            for f in self.sd_by[t.path].fields:
+                out += [((f.name,) + st, tt) for st, tt in self.access_paths(name, f.ty, depth - 1)]
+        return out
+
+    def place_of(self, name, steps, idx):
+        e = K.Var(name)
+        for st in steps:
+            e = K.Index(e, idx()) if st == "[]" else K.Field(e, st)
+        return e
+
     def write_places(self, scope, pred, depth):
-        """Writable places (Var or element) whose type satisfies pred."""
+        """Writable places (Var, element, FR-257 data member) whose type
+        satisfies pred."""
         out = []
         for name, t, w in self.vars_of(scope, lambda t, m: True, write=True):
             if name in self.stmt_seen:
                 continue
-            if pred(t):
-                out.append(K.Var(name))
-            if depth > 0 and isinstance(t, K.VecT) and pred(t.elem):
-                out.append(K.Index(K.Var(name), self.index_for(scope, name)))
+            for steps, tt in self.access_paths(name, t, depth + (1 if self.sdefs else 0)):
+                if steps and "[]" in steps and depth <= 0:
+                    continue
+                if pred(tt):
+                    out.append(self.place_of(name, steps, lambda: self.index_for(scope, name)))
         return out
 
     def index_for(self, scope, base):
@@ -407,13 +589,19 @@ class Gen:
             if added:
                 self.stmt_hidden.discard(base)
 
-    def places(self, scope, pred, depth, index_ok=True):
+    def places(self, scope, pred, depth, index_ok=True, hide_root=False):
         out = []
         for name, t, w in self.vars_of(scope, lambda t, m: True):
-            if pred(t):
-                out.append(K.Var(name))
-            if index_ok and depth > 0 and isinstance(t, K.VecT) and pred(t.elem):
-                out.append(K.Index(K.Var(name), self.expr(K.USIZE, scope, 1)))
+            for steps, tt in self.access_paths(name, t, depth + (1 if self.sdefs else 0)):
+                if "[]" in steps and (not index_ok or depth <= 0):
+                    continue
+                if pred(tt):
+                    # the root is SEEN before its index is drawn: an index may
+                    # read it but never modify it (`v[f(&mut v)]`, `v[v.m()]`)
+                    self.stmt_seen.add(name)
+                    idx = (lambda n=name: self.index_for(scope, n)) if hide_root else \
+                        (lambda: self.expr(K.USIZE, scope, 1))
+                    out.append(self.place_of(name, steps, idx))
         for p in out:
             for n in K.walk(p):
                 if isinstance(n, K.Var):
@@ -457,7 +645,7 @@ class Gen:
         return K.Clear(tgt)
 
     def store(self, scope):
-        places = [p for p in self.write_places(scope, lambda tt: True, 1) if isinstance(p, K.Index)]
+        places = [p for p in self.write_places(scope, lambda tt: True, 1) if isinstance(p, (K.Index, K.Field))]
         if not places:
             return self.print_(scope)
         tgt = self.choice(places)
@@ -547,6 +735,33 @@ class Gen:
                 args[i] = self.value(p.ty, scope, d - 1, "consume")
         return K.Call(name, tuple(args))
 
+    def mcall(self, scope, d, want):
+        """FR-257: `r.m(args)` on a place, obeying the receiver alias rules:
+        a non-const member function's receiver variable is not mentioned
+        anywhere else in the statement (and not by the arguments, which also
+        rules out `v[0].m(v[1])` E0502 and `s.m(&s)`); a const one's is not
+        MODIFIED by the arguments (they may read it)."""
+        cands = [m for m in self.msigs if m[3] in ("ref", "mut") and (want is None or m[2] == want)
+                 and self.types_visible([K.StructT(m[4])] + [p.ty for p in m[1]] + [m[2]])]
+        if not cands:
+            raise _NoCall()
+        mp, params, ret, recv, owner = self.choice(cands)
+        st = K.StructT(owner)
+        if recv == "mut":
+            places = self.write_places(scope, lambda tt: tt == st, 1)
+        else:
+            places = self.places(scope, lambda tt: tt == st, 1, hide_root=True)
+        if not places:
+            raise _NoCall()
+        fields = [p for p in places if isinstance(p, K.Field)]
+        rv = self.choice(fields) if fields and self.r.random() < 0.5 else self.choice(places)
+        b = TC.base_var(rv)
+        self.stmt_seen.add(b)
+        if recv == "mut":
+            self.stmt_hidden.add(b)
+        c = self.call(mp, params, scope, d)
+        return K.MethodCall(rv, mp.rsplit("::", 1)[1], c.args)
+
     def value(self, t, scope, depth, pos, is_return=False):
         """An expression of type t for a position: 'consume' (moved into a
         new owner), 'copy' (C++ copies from const T&), 'borrow' (read)."""
@@ -577,13 +792,27 @@ class Gen:
     def temp(self, t, scope, depth):
         r = self.r
         d = depth - 1
-        fs = [s for s in self.callable_sigs() if s[2] == t]
+        fs = [s for s in self.callable_sigs() if s[2] == t and not s[0].endswith("::new")]
         if fs and depth > 1 and r.random() < 0.2:
             try:
                 name, params, _ = self.choice(fs)
                 return self.call(name, params, scope, d)
             except _NoCall:
                 pass
+        if isinstance(t, K.StructT):
+            if depth > 1 and r.random() < 0.15:
+                try:
+                    return self.mcall(scope, d, t)
+                except _NoCall:
+                    pass
+            sd = self.sd_by[t.path]
+            if self.has_ctor(t.path):
+                ctor = [m for m in self.msigs if m[3] == "ctor" and m[4] == t.path][0]
+                try:
+                    return self.call(ctor[0], ctor[1], scope, max(d, 0))
+                except _NoCall:
+                    pass
+            return K.StructLit(t.path, tuple(self.value(f.ty, scope, max(d, 0), "consume") for f in sd.fields))
         if t == K.STRING:
             k = self.choice(("new", "from", "from", "to_string", "substr", "add", "add") if depth > 0
                             else ("new", "from"))
@@ -628,7 +857,26 @@ class Gen:
             opts += ["byte"]
         if K.elem_ok(t):
             opts += ["index"]
+        if self.sdefs:
+            opts += ["field", "mcall"]
+            if t == K.BOOL:
+                opts += ["slcmp"]  # keeps FR-251's string-literal comparison coverage undiluted
         k = self.choice(opts)
+        if k == "slcmp":
+            a = self.value(K.STRING, scope, d, "borrow")
+            lit = K.StrLit(self.ascii())
+            op = self.choice(("eq", "ne"))
+            return K.Binary(op, lit, a) if r.random() < 0.5 else K.Binary(op, a, lit)
+        if k == "field":
+            pl = [p for p in self.places(scope, lambda tt: tt == t, 1) if isinstance(p, K.Field)]
+            if pl:
+                return self.choice(pl)
+            return self.lit(t)
+        if k == "mcall":
+            try:
+                return self.mcall(scope, d, t)
+            except _NoCall:
+                return self.lit(t)
         if k == "cast":
             if t == K.BOOL:
                 return self.expr(t, scope, d)

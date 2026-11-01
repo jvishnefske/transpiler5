@@ -57,6 +57,27 @@ meaning and the printers re-derive every spelling (same namespace: bare
   N14 Func.internal is False at the root: a C++ anonymous namespace at
       global scope only changes LINKAGE, which a single-TU program cannot
       observe, and every crate-root Rust item is already private.
+      (FR-257: likewise StructDef.internal.)
+
+FR-257 (structs and member functions).  A StructDef holds its data members
+and its member functions (Funcs with ``owner``/``recv``); a struct type is
+its ABSOLUTE path, resolved by the parsers like a call.  Structs are not
+Copy (FR-251's Clone/move rule applies unchanged); `self` is a reference
+variable (`&self` / `&mut self`, C++ `this` / `const this`).  The checker
+adds: receiver alias rules measured on rustc 1.98's two-phase borrows (see
+``method_call``), a counting loop's `x.size()` bound protected over ACCESS
+PATHS (``resizes``), struct/member naming rules, no by-value recursion, a
+constructor that is exactly `return S { every field };`, aggregate
+initialization only of a struct without a constructor, and internal
+(anonymous-namespace) structs named only inside their namespace.
+
+  N15 Struct definitions come first, in a canonical order that depends only
+      on the SET of structs: topological over by-value containment (C++
+      needs a member's type complete), smallest absolute path first among
+      the ready ones; then N13 places them in their namespace blocks.
+      Meaning-preserving because no Kernel reference depends on declaration
+      order; it is what makes law 1 hold for Rust input (any order) and for
+      C++ input (define-before-use order) alike.
 """
 
 from . import kernel as K
@@ -103,6 +124,22 @@ CXX_KEYWORDS = {
 # a root `mod Vec` would shadow the prelude type every canonical
 # `Vec<T>` / `Vec::new()` spells.
 NS_RESERVED = {"Vec"}
+# FR-257: names a struct may not take.  A struct named like a prelude item
+# shadows it for the whole module: `Clone` would break `#[derive(Clone)]` /
+# `.clone()`, `Iterator` `.iter().copied()`, `ToString` `.to_string()`.
+STRUCT_RESERVED = {
+    "Vec", "String", "Clone", "Copy", "Send", "Sync", "Sized", "Unpin", "Drop", "Fn", "FnMut", "FnOnce",
+    "Box", "ToOwned", "ToString", "Option", "Some", "None", "Result", "Ok", "Err", "Iterator",
+    "IntoIterator", "DoubleEndedIterator", "ExactSizeIterator", "Extend", "Default", "Eq", "PartialEq",
+    "Ord", "PartialOrd", "AsRef", "AsMut", "Into", "From", "TryFrom", "TryInto", "FromIterator", "Debug",
+}
+# FR-257: member-function names rs_parse reads as a Vec/String/Clone method
+# (or that the derived Clone already defines).
+METHOD_RESERVED = {
+    "len", "is_empty", "clone", "clone_from", "to_string", "as_bytes", "iter", "iter_mut", "push", "pop",
+    "clear", "resize", "push_str", "wrapping_add", "wrapping_sub", "wrapping_mul", "wrapping_neg",
+    "copied", "cloned",
+}
 
 RESERVED = {
     "std", "bx", "printf", "fprintf", "sprintf", "snprintf", "puts",
@@ -163,13 +200,41 @@ class Scope:
         self.vars[name] = (ty, mutable)
 
 
+class Sigs(dict):
+    """Absolute function path -> (param types, return type), plus FR-257's
+    ``structs`` (struct path -> StructDef) and ``recv`` (member-function
+    path -> receiver kind).  A plain dict also works where no struct
+    occurs (every lookup below goes through ``getattr(.., {})``)."""
+
+    def __init__(self, *a):
+        dict.__init__(self, *a)
+        self.structs = {}
+        self.recv = {}
+
+
+def structs_of(sigs):
+    return getattr(sigs, "structs", None) or {}
+
+
+def recv_of(sigs):
+    return getattr(sigs, "recv", None) or {}
+
+
 def sigs_of(program):
     """Absolute function path -> (param types, return type)."""
-    sigs = {}
-    for f in program.funcs():
+    sigs = Sigs()
+    for f in program.all_funcs():
         if f.path not in sigs:
             sigs[f.path] = (tuple(p.ty for p in f.params), f.ret)
+        if f.owner:
+            sigs.recv.setdefault(f.path, f.recv)
+    for sd in program.structs():
+        sigs.structs.setdefault(sd.path, sd)
     return sigs
+
+
+def method_path(struct_path, name):
+    return struct_path + "::" + name
 
 
 def tree_order(items):
@@ -204,22 +269,48 @@ def tree_order(items):
 LITERAL_TYPES = K.INT_TYPES
 
 # Places: what can be borrowed, indexed, cloned or written through.
-PLACES = (K.Var, K.Index)
+PLACES = (K.Var, K.Index, K.Field)
 
 
 def is_place(e):
     if isinstance(e, K.Var):
         return True
-    if isinstance(e, K.Index):
+    if isinstance(e, (K.Index, K.Field)):
         return is_place(e.base)
     return False
 
 
 def base_var(e):
-    """The variable a place is rooted at (``v`` for ``v[i][j]``), or None."""
-    while isinstance(e, K.Index):
+    """The variable a place is rooted at (``v`` for ``v[i].f[j]``), or None."""
+    while isinstance(e, (K.Index, K.Field)):
         e = e.base
     return e.name if isinstance(e, K.Var) else None
+
+
+def place_path(e):
+    """FR-257: a place as a comparable access path: ('v', '[]', 'f', ..).
+    Every index is the same wildcard '[]' (two indices may be equal)."""
+    out = []
+    while isinstance(e, (K.Index, K.Field)):
+        out.append("[]" if isinstance(e, K.Index) else e.name)
+        e = e.base
+    if not isinstance(e, K.Var):
+        return None
+    out.append(e.name)
+    return tuple(reversed(out))
+
+
+def path_prefix(a, b):
+    """Is place path ``a`` a prefix of (or equal to) place path ``b``?"""
+    return a is not None and b is not None and len(a) <= len(b) and b[:len(a)] == a
+
+
+def has_index(e):
+    while isinstance(e, (K.Index, K.Field)):
+        if isinstance(e, K.Index):
+            return True
+        e = e.base
+    return False
 
 
 def var_type(scope, name):
@@ -272,7 +363,7 @@ def type_of(e, scope, sigs):
         a = type_of(e.lhs, scope, sigs)
         b = type_of(e.rhs, scope, sigs)
         op = e.op
-        if a == K.STRING or b == K.STRING or isinstance(a, K.VecT) or isinstance(b, K.VecT):
+        if K.is_owned_nc(a) or K.is_owned_nc(b):
             return _nc_binary(e, a, b)
         if op in K.SHIFT_OPS:
             if a not in K.ARITH_INT or b not in K.ARITH_INT:
@@ -312,15 +403,46 @@ def type_of(e, scope, sigs):
             raise KernelTypeError(e.loc, "call to undeclared function '%s'" % e.name)
         if e.name == "main":
             raise KernelTypeError(e.loc, "call to main")
-        ptys, ret = sig
-        if len(ptys) != len(e.args):
-            raise KernelTypeError(e.loc, "'%s' takes %d arguments, %d given" % (e.name, len(ptys), len(e.args)))
-        for i, (pt, a) in enumerate(zip(ptys, e.args)):
-            at = type_of(a, scope, sigs)
-            if at != K.deref(pt):
-                raise KernelTypeError(getattr(a, "loc", None) or e.loc,
-                                      "argument %d of '%s' has type %s, expected %s" % (i + 1, e.name, at, K.deref(pt)))
-        return ret
+        if recv_of(sigs).get(e.name) in ("ref", "mut"):
+            raise KernelTypeError(e.loc, "member function '%s' called without an object" % e.name)
+        return _call_type(e, e.name, sig, e.args, scope, sigs)
+    if isinstance(e, K.MethodCall):
+        rt = type_of(e.recv, scope, sigs)
+        if not isinstance(rt, K.StructT):
+            raise KernelTypeError(e.loc, "unsupported: method call `.%s()`" % e.name)
+        mp = method_path(rt.path, e.name)
+        sig = sigs.get(mp)
+        kind = recv_of(sigs).get(mp)
+        if sig is None or kind is None:
+            raise KernelTypeError(e.loc, "struct '%s' has no member function '%s'" % (rt.path, e.name))
+        if kind not in ("ref", "mut"):
+            raise KernelTypeError(e.loc, "%s '%s' called on an object" % (
+                "constructor" if kind == "ctor" else "static member function", mp))
+        return _call_type(e, mp, sig, e.args, scope, sigs)
+    if isinstance(e, K.Field):
+        bt = type_of(e.base, scope, sigs)
+        if not isinstance(bt, K.StructT):
+            raise KernelTypeError(e.loc, "member access on a value of type %s" % bt)
+        sd = structs_of(sigs).get(bt.path)
+        if sd is None:
+            raise KernelTypeError(e.loc, "use of undeclared struct '%s'" % bt.path)
+        ft = sd.field_ty(e.name)
+        if ft is None:
+            raise KernelTypeError(e.loc, "struct '%s' has no field '%s'" % (bt.path, e.name))
+        return ft
+    if isinstance(e, K.StructLit):
+        sd = structs_of(sigs).get(e.path)
+        if sd is None:
+            raise KernelTypeError(e.loc, "use of undeclared struct '%s'" % e.path)
+        if len(e.values) != len(sd.fields):
+            raise KernelTypeError(e.loc, "initializer of '%s' has %d values for %d fields" % (
+                e.path, len(e.values), len(sd.fields)))
+        for fd, v in zip(sd.fields, e.values):
+            t = type_of(v, scope, sigs)
+            if t != fd.ty:
+                raise KernelTypeError(getattr(v, "loc", None) or e.loc,
+                                      "field '%s' of '%s' initialized with %s, expected %s" % (fd.name, e.path, t, fd.ty))
+        return K.StructT(e.path)
     if isinstance(e, K.Clone):
         t = type_of(e.operand, scope, sigs)
         if K.is_copy(t):
@@ -389,6 +511,18 @@ def type_of(e, scope, sigs):
     raise KernelTypeError(None, "not an expression: %r" % (e,))
 
 
+def _call_type(e, name, sig, args, scope, sigs):
+    ptys, ret = sig
+    if len(ptys) != len(args):
+        raise KernelTypeError(e.loc, "'%s' takes %d arguments, %d given" % (name, len(ptys), len(args)))
+    for i, (pt, a) in enumerate(zip(ptys, args)):
+        at = type_of(a, scope, sigs)
+        if at != K.deref(pt):
+            raise KernelTypeError(getattr(a, "loc", None) or e.loc,
+                                  "argument %d of '%s' has type %s, expected %s" % (i + 1, name, at, K.deref(pt)))
+    return ret
+
+
 def _nc_binary(e, a, b):
     """Binary operators on String / Vec operands (FR-251)."""
     op = e.op
@@ -399,7 +533,7 @@ def _nc_binary(e, a, b):
     if op in ("eq", "ne"):
         if (a == K.STRING and _str_operand(b)) or (b == K.STRING and _str_operand(a)):
             return K.BOOL
-        if isinstance(a, K.VecT) and a == b:
+        if isinstance(a, K.VecT) and a == b and not K.has_struct(a):
             return K.BOOL
     if op in ("lt", "le", "gt", "ge") and a == K.STRING and b == K.STRING:
         return K.BOOL
@@ -411,10 +545,19 @@ def value_type(e, scope, sigs):
     t = type_of(e, scope, sigs)
     if t == K.UNIT:
         raise KernelTypeError(e.loc, "call to void function '%s' used as a value" % getattr(e, "name", "?"))
+    if isinstance(e, K.StructLit) or K.has_struct(t):
+        _struct_known(t, e, sigs)
     if t == K.STR:
         raise KernelTypeError(e.loc, "string literal outside a printf %s argument")
     _check_value_subexprs(e, scope, sigs)
     return t
+
+
+def _struct_known(t, e, sigs):
+    while isinstance(t, (K.VecT, K.RefT)):
+        t = t.elem if isinstance(t, K.VecT) else t.inner
+    if isinstance(t, K.StructT) and t.path not in structs_of(sigs):
+        raise KernelTypeError(getattr(e, "loc", None), "use of undeclared struct '%s'" % t.path)
 
 
 def _strlit_slots(e, scope, sigs):
@@ -444,6 +587,8 @@ def _check_value_subexprs(e, scope, sigs):
             raise KernelTypeError(n.loc, "string literal outside a printf %s argument")
         if isinstance(n, K.Call) and sigs.get(n.name, (None, None))[1] == K.UNIT:
             raise KernelTypeError(n.loc, "call to void function '%s' used as a value" % n.name)
+        if isinstance(n, K.MethodCall) and type_of(n, scope, sigs) == K.UNIT:
+            raise KernelTypeError(n.loc, "call to void function '%s' used as a value" % n.name)
 
 
 def definitely_returns(s):
@@ -468,9 +613,44 @@ def mut_ref_args(call, sigs):
         return out
     for pt, a in zip(sig[0], call.args):
         a = a.operand if isinstance(a, K.Borrow) else a
-        if isinstance(pt, K.RefT) and pt.mutable and isinstance(a, K.Var):
-            out.add(a.name)
+        if isinstance(pt, K.RefT) and pt.mutable and is_place(a):
+            out.add(base_var(a))
     return out
+
+
+def call_sig(n, scope, sigs):
+    """(path, signature) of a Call or MethodCall, or (None, None)."""
+    if isinstance(n, K.Call):
+        return n.name, sigs.get(n.name)
+    if isinstance(n, K.MethodCall) and scope is not None:
+        try:
+            rt = type_of(n.recv, scope, sigs)
+        except KernelTypeError:
+            return None, None
+        if isinstance(rt, K.StructT):
+            mp = method_path(rt.path, n.name)
+            return mp, sigs.get(mp)
+    return None, None
+
+
+def mut_receivers(block, sigs):
+    """FR-257: places that receive a `&mut self` member-function call (by
+    name: a call on a place rooted at `self` mutates `self`).  Resolved by
+    name without a scope: ANY struct's non-const member function of that
+    name counts (conservative)."""
+    names = {p.rsplit("::", 1)[1] for p, k in recv_of(sigs).items() if k == "mut"}
+    return [n.recv for n in K.walk(block) if isinstance(n, K.MethodCall)
+            and (recv_of(sigs).get(method_path(n.owner, n.name)) == "mut" if n.owner else n.name in names)]
+
+
+def method_sigs(n, sigs):
+    """Signatures a MethodCall may call: exact when normalize resolved its
+    owner, otherwise every member function of that name (conservative)."""
+    if n.owner:
+        sig = (sigs or {}).get(method_path(n.owner, n.name))
+        return [sig] if sig else []
+    return [sg for pth, sg in (sigs or {}).items()
+            if recv_of(sigs).get(pth) in ("ref", "mut") and pth.rsplit("::", 1)[1] == n.name]
 
 
 def assigned_names(block, sigs=None):
@@ -480,6 +660,21 @@ def assigned_names(block, sigs=None):
             out.add(n.name)
         elif isinstance(n, K.Call):
             out |= mut_ref_args(n, sigs)
+        elif isinstance(n, K.MethodCall):
+            out |= _method_mut_ref_args(n, sigs)
+    return out
+
+
+def _method_mut_ref_args(n, sigs):
+    """Names passed to `T&` parameters of ANY member function named like
+    ``n`` (no scope here: conservative over every struct)."""
+    out = set()
+    for sig in method_sigs(n, sigs):
+        if len(sig[0]) == len(n.args):
+            for pt, a in zip(sig[0], n.args):
+                a = a.operand if isinstance(a, K.Borrow) else a
+                if isinstance(pt, K.RefT) and pt.mutable and is_place(a):
+                    out.add(base_var(a))
     return out
 
 
@@ -496,7 +691,45 @@ def mutated_bases(block, sigs):
             b = base_var(n.iterable)
             if b:
                 out.add(b)
+    for r in mut_receivers(block, sigs):
+        b = base_var(r)
+        if b:
+            out.add(b)
     return out
+
+
+def resizes(block, sigs, bound):
+    """FR-257 (generalizing FR-251's resized_vars): may ``block`` change the
+    SIZE of the place ``bound`` (the `v` / `p.v` / `v[0]` of a counting
+    loop's `i < v.size()`)?  Yes when it assigns the root variable, or when
+    a mutating statement, a store, a `T&` argument or a `&mut self`
+    receiver reaches a place that is a PREFIX of the bound (every index is
+    a wildcard: `v[i] = w` may replace `v[0]`); writing an element of the
+    bound itself (`v[i] = x` under `i < v.size()`) does not."""
+    P = place_path(bound)
+    if P is None:
+        return True
+    if P[0] in assigned_names(block, None):
+        return True
+    targets = []
+    for n in K.walk(block):
+        if isinstance(n, (K.Store, K.CompoundStore) + K.MUTATING_STMTS):
+            targets.append(n.target.operand if isinstance(n.target, K.Borrow) else n.target)
+        elif isinstance(n, (K.Call, K.MethodCall)):
+            if isinstance(n, K.Call):
+                sig = (sigs or {}).get(n.name)
+                sig_list = [sig] if sig else []
+            else:
+                sig_list = method_sigs(n, sigs)
+            for sig in sig_list:
+                for pt, a in zip(sig[0], n.args):
+                    a = a.operand if isinstance(a, K.Borrow) else a
+                    if isinstance(pt, K.RefT) and pt.mutable and is_place(a):
+                        targets.append(a)
+        elif isinstance(n, K.ForEach) and n.mode == "mut":
+            targets.append(K.Index(n.iterable, K.IntLit(0, K.USIZE)))
+    targets += mut_receivers(block, sigs)
+    return any(path_prefix(place_path(t), P) for t in targets if place_path(t) is not None)
 
 
 def resized_vars(block, sigs):
@@ -557,6 +790,10 @@ class _Checker:
         self.errors = []
         self.ns = ()  # FR-260: the namespace of the function being checked
         self.internal = {}
+        self.structs = structs_of(self.sigs)
+        self.struct_leaves = {sd.name for sd in program.structs()}
+        self.cur = None  # FR-257: the function being checked
+        self.ctor_lit = None
 
     def err(self, loc, msg):
         self.errors.append((loc, msg))
@@ -565,6 +802,10 @@ class _Checker:
         p = ident_problem(name)
         if p:
             self.err(loc, p)
+        elif name in self.struct_leaves:
+            # FR-257: a C++ variable hides a type of its name (`S S = ..;`
+            # makes a later `S{..}` an error); the subset keeps them apart
+            self.err(loc, "variable '%s' has the name of a struct" % name)
         elif K.path_of(self.ns, name) in self.sigs:
             # only a SAME-namespace function is spelled bare (FR-260), so
             # only it can be hidden by a local of the same name
@@ -604,6 +845,9 @@ class _Checker:
         if pos == "consume" and not K.is_copy(t):
             if isinstance(e, K.Index):
                 self.err(L, "unsupported: move out of an indexed element (the subset copies it: "
+                            "C++ copy, Rust `.clone()`)")
+            elif isinstance(e, K.Field):
+                self.err(L, "unsupported: move out of a data member (the subset copies it: "
                             "C++ copy, Rust `.clone()`)")
             elif isinstance(e, K.Var):
                 v = scope.lookup(e.name)
@@ -669,14 +913,29 @@ class _Checker:
                 self.err(e.lhs.loc, "string literal outside a printf %s argument")
         elif isinstance(e, K.Call):
             self.call_args(e, scope)
+        elif isinstance(e, K.Field):
+            self.wf(e.base, scope, "borrow")
+        elif isinstance(e, K.StructLit):
+            sd = self.structs.get(e.path)
+            if sd is not None:
+                if sd.ctor() is not None and e is not self.ctor_lit:
+                    self.err(L, "unsupported: aggregate initialization of '%s', which has a constructor "
+                                "(C++ would call the constructor)" % e.path)
+                for fd, v in zip(sd.fields, e.values):
+                    self.wf(v, scope, self.consume_pos(fd.ty))
+        elif isinstance(e, K.MethodCall):
+            self.method_call(e, scope)
         elif isinstance(e, K.StrLit):
             pass
 
-    def call_args(self, e, scope):
-        sig = self.sigs.get(e.name)
+    def call_args(self, e, scope, name=None, sig=None, recv_use=None):
+        if sig is None:
+            sig = self.sigs.get(e.name)
+            name = e.name
         if sig is None:
             return
-        uses = []
+        e_name = name
+        uses = [] if recv_use is None else [recv_use]
         for i, (pt, a) in enumerate(zip(sig[0], e.args)):
             raw = a
             if isinstance(pt, K.RefT):
@@ -684,7 +943,7 @@ class _Checker:
                 L = getattr(inner, "loc", None) or e.loc
                 if pt.mutable and not is_place(inner):
                     self.err(L, "unsupported: argument %d of '%s' binds a non-const reference to something "
-                                "other than a variable or element" % (i + 1, e.name))
+                                "other than a variable or element" % (i + 1, e_name))
                     continue
                 b = base_var(inner) if is_place(inner) else None
                 v = scope.lookup(b) if b is not None else None
@@ -693,17 +952,17 @@ class _Checker:
                     self.self_indexed(inner)
                 if pt.mutable and v is not None and not (
                         (isinstance(v[0], K.RefT) and v[0].mutable) or (not isinstance(v[0], K.RefT) and v[1])):
-                    self.err(L, "argument %d of '%s' binds a non-const reference to immutable '%s'" % (i + 1, e.name, b))
+                    self.err(L, "argument %d of '%s' binds a non-const reference to immutable '%s'" % (i + 1, e_name, b))
                 if self.surface == "rust":
                     if isinstance(raw, K.Borrow):
                         if is_refvar or raw.mutable != pt.mutable:
                             self.err(raw.loc, "unsupported: argument %d of '%s' is not spelled the canonical "
-                                              "way (`%s`)" % (i + 1, e.name, "x" if is_refvar else
+                                              "way (`%s`)" % (i + 1, e_name, "x" if is_refvar else
                                                               ("&mut x" if pt.mutable else "&x")))
                         self.borrow_ok.add(id(raw))
                     elif not is_refvar:
                         self.err(L, "unsupported: argument %d of '%s' binds a reference; the subset spells it "
-                                    "`%s`" % (i + 1, e.name, "&mut x" if pt.mutable else "&x"))
+                                    "`%s`" % (i + 1, e_name, "&mut x" if pt.mutable else "&x"))
                 self.wf(raw, scope, "borrow")
                 if b is not None:
                     uses.append((b, "mut" if pt.mutable else "shared", i))
@@ -719,13 +978,76 @@ class _Checker:
                 if isinstance(n, K.Var):
                     uses.append((n.name, "read", i))
         for name, kind, i in uses:
-            if kind != "mut":
+            if kind != "mut" or i == -1:
                 continue
             others = [u for u in uses if u[0] == name and u[2] != i]
             if others:
                 self.err(e.loc, "unsupported: '%s' is passed to '%s' by non-const reference and also used "
-                                "by another argument of the same call (aliasing)" % (name, e.name))
+                                "by another argument of the same call (aliasing)" % (name, e_name))
                 break
+        return uses
+
+    def method_call(self, e, scope):
+        """FR-257: `r.m(args)`.  Measured on rustc 1.98 (two-phase borrows):
+        with `&mut self`, arguments may READ the receiver when it is a
+        variable or a field chain (`s.set(s.get())`, `p.q.set(p.q.x)`,
+        `self.set(self.x + 1)` compile) but not when the receiver goes
+        through an index (`v[0].set(v[0].get())` and `v[0].set(v.len())`
+        are E0502: IndexMut is not two-phase); an argument that is itself a
+        reference to the receiver's variable (`s.absorb(&s)`) is E0502, and
+        one that mutates it (`s.set(bump(&mut s))`) E0499.  With `&self`,
+        an argument that mutates the receiver's variable is E0502.  Each of
+        those shapes is a located residual."""
+        try:
+            rt = type_of(e.recv, scope, self.sigs)
+        except KernelTypeError:
+            return
+        mp = method_path(rt.path, e.name)
+        kind = recv_of(self.sigs).get(mp)
+        sig = self.sigs.get(mp)
+        L = e.loc
+        if not is_place(e.recv):
+            self.err(getattr(e.recv, "loc", None) or L,
+                     "unsupported: member function call on something other than a variable, element or "
+                     "data member")
+            return
+        if kind == "mut":
+            self.writable(e.recv, scope, "call of non-const member function '%s'" % e.name)
+        self.wf(e.recv, scope, "borrow")
+        b = base_var(e.recv)
+        uses = self.call_args(e, scope, mp, sig) or []
+        if b is None:
+            return
+        direct_ref = [u for u in uses if u[0] == b and u[1] in ("shared", "mut")]
+        mutating = [u for u in uses if u[0] == b and u[1] == "mut"]
+        for a in e.args:
+            for n in K.walk(a):
+                if isinstance(n, (K.Call, K.MethodCall)) and b in self.call_mutates(n, scope):
+                    mutating.append(n)
+        if mutating:
+            self.err(L, "unsupported: an argument of '%s' modifies '%s', the object it is called on "
+                        "(a second borrow in Rust)" % (e.name, b))
+        elif kind == "mut" and direct_ref:
+            self.err(L, "unsupported: '%s' is passed by reference to '%s', a non-const member function "
+                        "called on it (aliasing)" % (b, e.name))
+        elif kind == "mut" and has_index(e.recv) and any(mentions(a, b) for a in e.args):
+            self.err(L, "unsupported: non-const member function '%s' is called on an element of '%s' "
+                        "with an argument that reads '%s' (a second borrow in Rust)" % (e.name, b, b))
+
+    def call_mutates(self, n, scope):
+        """Variables a single call node may modify itself: `T&` arguments
+        and the receiver of a non-const member function."""
+        out = set()
+        path, sig = call_sig(n, scope, self.sigs)
+        if sig is None:
+            return out
+        for pt, a in zip(sig[0], n.args):
+            a = a.operand if isinstance(a, K.Borrow) else a
+            if isinstance(pt, K.RefT) and pt.mutable and is_place(a):
+                out.add(base_var(a))
+        if isinstance(n, K.MethodCall) and recv_of(self.sigs).get(path) == "mut":
+            out.add(base_var(n.recv))
+        return out
 
     @staticmethod
     def ref_arg_spelling(pt, owned, name):
@@ -755,8 +1077,8 @@ class _Checker:
         desugars to exactly this, so it lands here too."""
         b = base_var(place)
         p = place
-        while isinstance(p, K.Index):
-            if mentions(p.index, b):
+        while isinstance(p, (K.Index, K.Field)):
+            if isinstance(p, K.Index) and mentions(p.index, b):
                 self.err(getattr(place, "loc", None),
                          "unsupported: an element of '%s' is written through an index that reads '%s' "
                          "(a second borrow in Rust)" % (b, b))
@@ -797,17 +1119,18 @@ class _Checker:
     def run(self):
         seen = set()
         funcs = self.program.funcs()
+        structs = self.program.structs()
         # FR-260: namespaces declared in each scope (C++ forbids a function
         # and a namespace of one name in one scope; Rust would allow it)
         ns_names = set()
         self.internal = {}
-        for f in funcs:
+        for f in funcs + structs:
             for i in range(len(f.ns)):
                 ns_names.add(f.ns[:i + 1])
-            if f.internal:
+            if f.internal and isinstance(f, K.Func):
                 self.internal[f.path] = f.ns
         bad_ns = set()
-        for f in funcs:
+        for f in funcs + structs:
             for i, c in enumerate(f.ns):
                 p = ident_problem(c) or (("identifier '%s' names a Rust prelude type" % c) if c in NS_RESERVED else None)
                 if p and f.ns[:i + 1] not in bad_ns:
@@ -827,8 +1150,122 @@ class _Checker:
                 self.err(f.loc, "function '%s' has the name of a namespace declared in the same scope" % f.path)
             if f.internal and not f.ns:
                 self.err(f.loc, "internal function at the root (normal form N14)")
+            if f.owner or f.recv:
+                self.err(f.loc, "member function '%s' outside its struct" % f.path)
             self.func(f)
+        self.check_structs(structs, ns_names, {f.path for f in funcs})
         return self.errors
+
+    # ---------------------------------------------------- FR-257 structs
+    def check_structs(self, structs, ns_names, free_paths):
+        seen = set()
+        for sd in structs:
+            if sd.path in seen:
+                self.err(sd.loc, "struct '%s' defined twice" % sd.path)
+            seen.add(sd.path)
+            p = ident_problem(sd.name) or (
+                "identifier '%s' names a Rust prelude item" % sd.name if sd.name in STRUCT_RESERVED else None)
+            if p:
+                self.err(sd.loc, "struct name: " + p)
+            if sd.path in free_paths:
+                self.err(sd.loc, "struct '%s' has the name of a function declared in the same scope" % sd.path)
+            if sd.ns + (sd.name,) in ns_names:
+                self.err(sd.loc, "struct '%s' has the name of a namespace declared in the same scope" % sd.path)
+            if sd.internal and not sd.ns:
+                self.err(sd.loc, "internal struct at the root (normal form N14)")
+            self.struct_visibility(sd.ns, [fd.ty for fd in sd.fields], sd.loc)
+            names = set()
+            for fd in sd.fields:
+                p = ident_problem(fd.name)
+                if p:
+                    self.err(fd.loc or sd.loc, p)
+                elif fd.name in self.struct_leaves:
+                    self.err(fd.loc or sd.loc, "data member '%s' has the name of a struct" % fd.name)
+                if fd.name in names:
+                    self.err(fd.loc or sd.loc, "data member '%s' declared twice" % fd.name)
+                names.add(fd.name)
+                if not self.type_ok(fd.ty, fd.loc or sd.loc):
+                    self.err(fd.loc or sd.loc, "data member type %s" % fd.ty)
+            mnames = set()
+            for m in sd.methods:
+                if m.owner != sd.name or tuple(m.ns) != tuple(sd.ns) or m.recv not in K.RECV_KINDS:
+                    self.err(m.loc, "malformed member function '%s'" % m.path)
+                    continue
+                if m.recv == "ctor":
+                    if m.name != "new":
+                        self.err(m.loc, "constructor not named 'new'")
+                else:
+                    p = ident_problem(m.name) or (
+                        "identifier '%s' is reserved by the canonical Rust spelling (a method of Vec/String or "
+                        "of the derived Clone)" % m.name if m.name in METHOD_RESERVED else None)
+                    if p:
+                        self.err(m.loc, p)
+                    elif m.name in self.struct_leaves:
+                        self.err(m.loc, "member function '%s' has the name of a struct" % m.name)
+                if m.name in mnames:
+                    self.err(m.loc, "member function '%s' defined twice" % m.path)
+                mnames.add(m.name)
+                if m.name in names:
+                    self.err(m.loc, "member function '%s' has the name of a data member" % m.path)
+                self.func(m)
+        self.check_recursion(structs)
+
+    def check_recursion(self, structs):
+        by = {sd.path: sd for sd in structs}
+
+        def direct(sd):
+            return {fd.ty.path for fd in sd.fields if isinstance(fd.ty, K.StructT) and fd.ty.path in by}
+
+        for sd in structs:
+            stack, seen = list(direct(sd)), set()
+            while stack:
+                x = stack.pop()
+                if x == sd.path:
+                    self.err(sd.loc, "struct '%s' contains itself by value (infinite size)" % sd.path)
+                    break
+                if x in seen:
+                    continue
+                seen.add(x)
+                stack.extend(direct(by[x]))
+
+    def type_ok(self, t, loc=None, ref_ok=False):
+        if isinstance(t, K.RefT):
+            return ref_ok and self.type_ok(t.inner, loc)
+        if isinstance(t, K.StructT):
+            return t.path in self.structs
+        if isinstance(t, K.VecT):
+            return K.elem_ok(t.elem) and self.type_ok(t.elem, loc)
+        return t in K.ALL_PRIMS or t == K.STRING
+
+    def struct_visibility(self, ns, types, loc, paths=()):
+        """FR-257: an internal struct (C++ anonymous-namespace member, a
+        private Rust `struct` in a `mod`) may only be NAMED from inside its
+        namespace (rustc E0603); C++ would also accept `::a::S` from outside."""
+        names = []
+        for t in types:
+            while isinstance(t, (K.VecT, K.RefT)):
+                t = t.elem if isinstance(t, K.VecT) else t.inner
+            if isinstance(t, K.StructT):
+                names.append(t.path)
+        for p in list(names) + list(paths):
+            sd = self.structs.get(p)
+            if sd is not None and sd.internal and tuple(ns[:len(sd.ns)]) != tuple(sd.ns):
+                self.err(loc, "unsupported: '%s' is internal to namespace '%s' (a C++ anonymous-namespace member, "
+                              "a private Rust `struct`) and is named outside it" % (p, "::".join(sd.ns)))
+
+    def func_struct_visibility(self, f):
+        types = [p.ty for p in f.params] + [f.ret]
+        paths = []
+        for n in K.walk(f.body):
+            if isinstance(n, K.Let):
+                types.append(n.ty)
+            elif isinstance(n, K.VecLit) and n.elem is not None:
+                types.append(n.elem)
+            elif isinstance(n, K.StructLit):
+                paths.append(n.path)
+            elif isinstance(n, K.Call) and recv_of(self.sigs).get(n.name):
+                paths.append(n.name.rsplit("::", 1)[0])
+        self.struct_visibility(f.ns, types, f.loc, paths)
 
     def check_visibility(self, call):
         """An internal function (C++ anonymous-namespace member, Rust private
@@ -845,15 +1282,17 @@ class _Checker:
         self.moves = []
         self.borrow_ok = set()
         self.ns = f.ns
+        self.cur = f
         for n in K.walk(f.body):
             if isinstance(n, K.Call):
                 self.check_visibility(n)
+        self.func_struct_visibility(f)
         if not (f.ret in K.ALL_PRIMS or f.ret == K.UNIT or K.is_owned_nc(f.ret)):
             if isinstance(f.ret, K.RefT):
                 self.err(f.loc, "unsupported: function returning a reference")
             else:
                 self.err(f.loc, "return type %s" % f.ret)
-        if isinstance(f.ret, K.VecT) and not K.elem_ok(f.ret.elem):
+        elif f.ret != K.UNIT and not self.type_ok(f.ret):
             self.err(f.loc, "return type %s" % f.ret)
         if f.path == "main":
             if f.params:
@@ -863,9 +1302,24 @@ class _Checker:
             if any(isinstance(n, K.Return) for n in K.walk(f.body)):
                 self.err(f.loc, "main may not contain return")
         scope = Scope()
+        if f.recv in ("ref", "mut"):
+            # FR-257: C++ `this` (const in a const member function) <=> Rust
+            # `&self` / `&mut self`; `self` is a Rust keyword, so no Kernel
+            # identifier can collide with it
+            scope.declare("self", K.RefT(K.StructT(K.path_of(f.ns, f.owner)), f.recv == "mut"), False)
+        self.ctor_lit = None
+        has_res = any(isinstance(x, K.ResidualStmt) for x in f.body.stmts)
+        if f.recv == "ctor" and not has_res:
+            self.ctor_shape(f)
+        if f.recv == "ctor":
+            st = f.body.stmts
+            if st and isinstance(st[-1], K.Return) and isinstance(st[-1].value, K.StructLit):
+                # only the returned literal itself is the member-initializer
+                # list; a nested `S{..}` would call the constructor in C++
+                self.ctor_lit = st[-1].value
         for p in f.params:
             self.ident(p.name, p.loc)
-            if not self.param_type_ok(p.ty):
+            if not self.type_ok(p.ty, p.loc, ref_ok=True):
                 self.err(p.loc, "parameter type %s" % p.ty)
             if isinstance(p.ty, K.RefT) and p.mutable:
                 self.err(p.loc, "reference parameter '%s' declared mutable" % p.name)
@@ -874,9 +1328,19 @@ class _Checker:
             scope.declare(p.name, p.ty, p.mutable)
         self.ret = K.deref(f.ret)  # a returned reference is reported above, once
         self.block(f.body, scope, loop=False, same_scope=True)
-        if f.ret != K.UNIT and not definitely_returns(f.body):
+        if f.ret != K.UNIT and not definitely_returns(f.body) and not (f.recv == "ctor" and has_res):
             self.err(f.loc, "function '%s' may reach its end without returning a value" % f.path)
         self.check_moves(f)
+
+    def ctor_shape(self, f):
+        """A constructor is a member-initializer list: its body is exactly
+        `return S { every field };` and it returns its own struct."""
+        owner = K.path_of(f.ns, f.owner)
+        st = f.body.stmts
+        if (f.ret != K.StructT(owner) or len(st) != 1 or not isinstance(st[0], K.Return)
+                or not isinstance(st[0].value, K.StructLit) or st[0].value.path != owner):
+            self.err(f.loc, "unsupported: constructor of '%s' whose body is not a member-initializer list "
+                            "of every data member" % owner)
 
     @staticmethod
     def param_type_ok(t):
@@ -885,9 +1349,8 @@ class _Checker:
             return t in K.ALL_PRIMS or t == K.STRING or (isinstance(t, K.VecT) and K.elem_ok(t.elem))
         return t in K.ALL_PRIMS or t == K.STRING or (isinstance(t, K.VecT) and K.elem_ok(t.elem))
 
-    @staticmethod
-    def local_type_ok(t):
-        return t in K.ALL_PRIMS or t == K.STRING or (isinstance(t, K.VecT) and K.elem_ok(t.elem))
+    def local_type_ok(self, t):
+        return self.type_ok(t)
 
     # ---------------------------------------------------- the move rule
     def check_moves(self, f):
@@ -966,6 +1429,7 @@ class _Checker:
         return "value" if t is None or K.is_copy(t) else "consume"
 
     def stmt(self, s, scope, loop):
+        self.scope_now = scope
         self.stmt_alias(s)
         self.stmt_inner(s, scope, loop)
 
@@ -976,9 +1440,9 @@ class _Checker:
         exprs = stmt_exprs(s)
         if not exprs:
             return
-        calls = [n for e in exprs for n in K.walk(e) if isinstance(n, K.Call)]
+        calls = [n for e in exprs for n in K.walk(e) if isinstance(n, (K.Call, K.MethodCall))]
         for c in calls:
-            sig = self.sigs.get(c.name)
+            path, sig = call_sig(c, self.scope_now, self.sigs)
             if sig is None:
                 continue
             for pt, a in zip(sig[0], c.args):
@@ -991,7 +1455,18 @@ class _Checker:
                 if total > inside:
                     self.err(c.loc or s.loc, "unsupported: '%s' is passed to '%s' by non-const reference and "
                                              "also used elsewhere in the statement (C++ leaves the order "
-                                             "unspecified)" % (b, c.name))
+                                             "unspecified)" % (b, path))
+                    return
+            if isinstance(c, K.MethodCall) and recv_of(self.sigs).get(path) == "mut" and is_place(c.recv):
+                # FR-257: the receiver of a non-const member function is
+                # modified exactly like a `T&` argument
+                b = base_var(c.recv)
+                inside = sum(1 for n in K.walk(c) if isinstance(n, K.Var) and n.name == b)
+                total = sum(1 for e in exprs for n in K.walk(e) if isinstance(n, K.Var) and n.name == b)
+                if total > inside:
+                    self.err(c.loc or s.loc, "unsupported: non-const member function '%s' is called on '%s', "
+                                             "which is also used elsewhere in the statement (C++ leaves the "
+                                             "order unspecified)" % (c.name, b))
                     return
 
     def stmt_inner(self, s, scope, loop):
@@ -1026,7 +1501,7 @@ class _Checker:
                 return
             self.compound(s, ty, scope)
         elif isinstance(s, K.Store):
-            if not isinstance(s.target, K.Index):
+            if not isinstance(s.target, (K.Index, K.Field)) or not is_place(s.target):
                 self.err(s.loc, "store to something other than an element")
                 return
             self.writable(s.target, scope, "assignment")
@@ -1035,7 +1510,7 @@ class _Checker:
                 self.wf(s.target, scope, "borrow")
                 self.expr(s.value, scope, ty, self.consume_pos(ty))
         elif isinstance(s, K.CompoundStore):
-            if not isinstance(s.target, K.Index):
+            if not isinstance(s.target, (K.Index, K.Field)) or not is_place(s.target):
                 self.err(s.loc, "store to something other than an element")
                 return
             self.writable(s.target, scope, "assignment")
@@ -1119,8 +1594,12 @@ class _Checker:
             self.expr(s.value, scope, K.I8)
             self.elem_arg_alias(s, [s.value])
         elif isinstance(s, K.ExprStmt):
-            if not isinstance(s.expr, K.Call):
+            if not isinstance(s.expr, (K.Call, K.MethodCall)):
                 self.err(s.loc, "expression statement that is not a call")
+                return
+            if isinstance(s.expr, K.Call) and recv_of(sigs).get(s.expr.name) == "ctor":
+                # C++ `S(x);` DECLARES a variable x (the most vexing parse)
+                self.err(s.loc, "unsupported: constructor call evaluated only for its effect")
                 return
             try:
                 type_of(s.expr, scope, sigs)
@@ -1164,7 +1643,7 @@ class _Checker:
                 # the body leaves v's SIZE alone (element writes are fine,
                 # and Rust holds no borrow of v across the loop)
                 b = base_var(s.hi.base)
-                if b in resized_vars(s.body, sigs) or b in declared_names(s.body):
+                if resizes(s.body, sigs, s.hi.base) or b in declared_names(s.body):
                     self.err(s.loc, "unsupported: counting loop body modifies or shadows '%s', whose size is "
                                     "the bound" % b)
             if s.var in assigned:
@@ -1395,6 +1874,21 @@ class _Normalizer:
                             None if e.count is None else self.expr(e.count, scope), e.loc)
         if isinstance(e, K.ToStr):
             return K.ToStr(self.expr(e.operand, scope), e.loc)
+        if isinstance(e, K.Field):
+            return K.Field(self.expr(e.base, scope), e.name, e.loc)
+        if isinstance(e, K.StructLit):
+            sd = structs_of(self.sigs).get(e.path)
+            ftys = [f.ty for f in sd.fields] if sd is not None and len(sd.fields) == len(e.values) \
+                else [None] * len(e.values)
+            return K.StructLit(e.path, tuple(self.expr(v, scope, t) for t, v in zip(ftys, e.values)), e.loc,
+                               e.names)
+        if isinstance(e, K.MethodCall):
+            recv = self.expr(e.recv, scope)
+            path, sig = call_sig(K.MethodCall(recv, e.name, e.args), scope, self.sigs)
+            ptys = sig[0] if sig and len(sig[0]) == len(e.args) else (None,) * len(e.args)
+            owner = path.rsplit("::", 1)[0] if path else ""
+            return K.MethodCall(recv, e.name, tuple(self.expr(a, scope, None if pt is None else K.deref(pt))
+                                                    for pt, a in zip(ptys, e.args)), e.loc, owner)
         if isinstance(e, K.Cast):
             inner = self.expr(e.operand, scope)
             T = e.ty
@@ -1535,16 +2029,47 @@ class _Normalizer:
 
     def func(self, f):
         scope = Scope()
+        if f.recv in ("ref", "mut"):
+            scope.declare("self", K.RefT(K.StructT(K.path_of(f.ns, f.owner)), f.recv == "mut"), False)
         for p in f.params:
             scope.declare(p.name, p.ty, p.mutable)
         self.ret = f.ret
-        internal = f.internal and bool(f.ns)  # N14
-        return K.Func(f.name, f.params, f.ret, self.block(f.body, scope, same=True), f.loc, f.ns, internal)
+        internal = f.internal and bool(f.ns) and not f.owner  # N14
+        return K.Func(f.name, f.params, f.ret, self.block(f.body, scope, same=True), f.loc, f.ns, internal,
+                      f.owner, f.recv)
+
+    def struct(self, sd):
+        return K.StructDef(sd.name, sd.fields, tuple(self.func(m) for m in sd.methods), sd.loc, sd.ns,
+                           sd.internal and bool(sd.ns))  # N14
+
+
+def struct_order(structs):
+    """N15: the canonical order of struct definitions -- a topological
+    order of the BY-VALUE containment graph (C++ needs a data member's type
+    complete), choosing the smallest absolute path among the ready ones.
+    It depends only on the SET of structs, so neither language's source
+    order (C++ must define before use; Rust does not care) survives."""
+    by = {sd.path: sd for sd in structs}
+    deps = {p: {f.ty.path for f in sd.fields if isinstance(f.ty, K.StructT) and f.ty.path in by and f.ty.path != p}
+            for p, sd in by.items()}
+    out, done = [], set()
+    while len(done) < len(by):
+        ready = sorted(p for p in by if p not in done and deps[p] <= done)
+        if not ready:  # a by-value cycle: check() reports it; keep a total order
+            ready = sorted(p for p in by if p not in done)
+        out.append(by[ready[0]])
+        done.add(ready[0])
+    # duplicates (reported by check) keep their relative order after the first
+    seen = set(id(x) for x in out)
+    return out + [sd for sd in structs if id(sd) not in seen]
 
 
 def normalize(program, keep_surface=False):
     n = _Normalizer(program, keep_surface)
-    items = tuple(n.func(i) if isinstance(i, K.Func) else i for i in program.items)
+    items = tuple(n.func(i) if isinstance(i, K.Func) else n.struct(i) if isinstance(i, K.StructDef) else i
+                  for i in program.items)
     if not keep_surface:
-        items = tree_order(items)  # N13
+        structs = struct_order([i for i in items if isinstance(i, K.StructDef)])
+        rest = [i for i in items if not isinstance(i, K.StructDef)]
+        items = tree_order(tuple(structs) + tuple(rest))  # N15, then N13
     return K.Program(items)

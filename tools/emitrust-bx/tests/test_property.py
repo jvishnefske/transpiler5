@@ -22,6 +22,13 @@
 # into / out of / across namespaces, a call to an internal function -- is
 # exercised, so laws 1-2 and the rustc subset (module privacy included)
 # cover them.
+# FR-257: every program also defines structs (in namespaces too) with every
+# receiver kind and sometimes a constructor; the coverage test below pins that
+# member reads/writes through every place shape, member calls on locals,
+# elements, members and `self`, struct-typed parameters by value / `&` /
+# `&mut`, struct returns, constructor and static calls, and a struct holding
+# a vector of itself all occur -- so laws 1-2 and the rustc subset (borrowck
+# over the receiver alias rules) cover them.
 import collections
 import os
 import shutil
@@ -145,6 +152,69 @@ def test_generator_covers_fr260(programs):
               "call-same-ns", "call-inner-hides-outer", "call-outward", "call-inward", "call-across",
               "call-internal"):
         assert seen[k] >= 10, (k, seen[k])
+
+
+def test_generator_covers_fr257(programs):
+    seen = collections.Counter()
+    for p in programs:
+        recv = {f.path: f.recv for f in p.all_funcs() if f.owner}
+        for sd in p.structs():
+            seen["struct"] += 1
+            if sd.ns:
+                seen["struct-in-ns"] += 1
+            for fd in sd.fields:
+                if isinstance(fd.ty, K.StructT):
+                    seen["field-struct"] += 1
+                if isinstance(fd.ty, K.VecT) and fd.ty.elem == K.StructT(sd.path):
+                    seen["field-vec-self"] += 1
+            for m in sd.methods:
+                seen["recv:" + m.recv] += 1
+        for f in p.all_funcs():
+            for prm in f.params:
+                t = prm.ty
+                if isinstance(t, K.StructT):
+                    seen["param-struct"] += 1
+                elif isinstance(t, K.RefT) and isinstance(t.inner, K.StructT):
+                    seen["param-ref-struct-" + ("mut" if t.mutable else "shared")] += 1
+            if isinstance(f.ret, K.StructT):
+                seen["ret-struct"] += 1
+            for n in K.walk(f.body):
+                if isinstance(n, (K.Field, K.MethodCall, K.StructLit)):
+                    seen[type(n).__name__] += 1
+                if isinstance(n, K.MethodCall):
+                    r = n.recv
+                    if isinstance(r, K.Var) and r.name == "self":
+                        seen["mcall-self"] += 1
+                    elif isinstance(r, K.Field):
+                        seen["mcall-field"] += 1
+                    elif isinstance(r, K.Index):
+                        seen["mcall-elem"] += 1
+                if isinstance(n, (K.Store, K.CompoundStore)) and isinstance(n.target, K.Field):
+                    seen["store-field"] += 1
+                if isinstance(n, K.Field) and isinstance(n.base, K.Var) and n.base.name == "self":
+                    seen["field-self"] += 1
+                if isinstance(n, K.MUTATING_STMTS) and isinstance(n.target, K.Field):
+                    seen["mutop-field"] += 1
+                if isinstance(n, K.Call) and recv.get(n.name) in ("ctor", "static"):
+                    seen["call:" + recv[n.name]] += 1
+    for k in ("struct", "struct-in-ns", "field-struct", "field-vec-self", "recv:ref", "recv:mut", "recv:static",
+              "recv:ctor", "param-struct", "param-ref-struct-mut", "param-ref-struct-shared", "ret-struct",
+              "mcall-self", "mcall-field", "mcall-elem", "store-field", "field-self", "mutop-field", "call:ctor",
+              "call:static"):
+        assert seen[k] >= 10, (k, seen[k])
+    for k in ("Field", "MethodCall", "StructLit"):
+        assert seen[k] >= 50, (k, seen[k])
+    # internal structs (C++ anonymous namespace <=> private Rust `struct`) are
+    # rarer by construction: only their own namespace may name them
+    internal = 0
+    for p in programs:
+        paths = {sd.path for sd in p.structs() if sd.internal}
+        for f in p.all_funcs():
+            for n in K.walk(f):
+                if (isinstance(n, K.StructLit) and n.path in paths) or (
+                        isinstance(n, K.Let) and isinstance(n.ty, K.StructT) and n.ty.path in paths):
+                    internal += 1
+    assert internal >= 5, internal
 
 
 def test_law1_and_law2_rust(programs):

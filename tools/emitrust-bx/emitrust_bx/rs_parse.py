@@ -25,6 +25,16 @@ searches enclosing modules -- C++ unqualified lookup would, so such a call
 is a located error, not a guess); `crate::`, `self::`, `super::` and a
 relative child-module path `b::f` are accepted.  `use`, restricted
 visibility and a reopened module (E0428 in Rust) are located errors.
+
+FR-257: `#[derive(Clone)] [pub] struct S { pub f: T, .. }` (exactly that
+attribute; every field `pub`; a private struct in a module is internal),
+one `impl S { pub fn .. }` per struct in its module (`&self`, `&mut self`,
+none; `new` is the constructor), field access `e.f`, method calls `e.m(..)`
+(any name that is not a Vec/String/iterator row), struct literals
+`Path { f: e, g }` (not at the top level of an `if`/`while` condition or a
+`for` iterable, like rustc).  Struct types and literal paths are resolved
+after the whole crate is read, with the rules calls use; a literal must list
+every field in declaration order.
 """
 
 from dataclasses import dataclass, field
@@ -76,6 +86,18 @@ class _Iter:
 STMT_METHODS = {"push": 1, "pop": 0, "clear": 0, "resize": 2, "push_str": 1}
 
 
+@dataclass(frozen=True)
+class _RawPath:
+    """FR-257: a struct path as written, before resolution (never in a Kernel)."""
+
+    raw: str
+    ns: Tuple[str, ...]
+    loc: Optional[Loc] = field(default=None, compare=False)
+
+    def __str__(self):
+        return self.raw
+
+
 class ParseError(Exception):
     def __init__(self, loc, msg):
         Exception.__init__(self, msg)
@@ -88,6 +110,8 @@ class _Parser:
         self.toks = toks
         self.i = 0
         self.ns = ()  # FR-260: the module being parsed
+        self.no_struct = False  # FR-257: an if/while condition or for iterable
+        self.impls = []  # FR-257: (struct raw name, ns, [Func], loc)
 
     # -------------------------------------------------------------- helpers
     @property
@@ -172,9 +196,25 @@ class _Parser:
             self.unsupported(t, "reference type")
         if t.text == "(":
             self.unsupported(t, "tuple or unit type")
+        if t.kind == "ident" and t.text not in _tc().RUST_KEYWORDS | {"crate", "self", "super"} \
+                and self.peek().text != "<":
+            # FR-257: a struct, by a path resolved after the whole crate is
+            # read (an unknown name is reported then, as `type `X``)
+            raw = self.path_segments()
+            return K.StructT(_RawPath(raw, self.ns, t.loc))
+        if t.kind == "ident" and t.text in ("crate", "self", "super"):
+            raw = self.path_segments()
+            return K.StructT(_RawPath(raw, self.ns, t.loc))
         if t.kind == "ident":
             self.unsupported(t, "type `%s`" % t.text)
         raise ParseError(t.loc, "expected a type, found %s" % self.describe(t))
+
+    def path_segments(self):
+        segs = [self.ident().text]
+        while self.at("::") and self.peek().kind == "ident":
+            self.next()
+            segs.append(self.ident().text)
+        return "::".join(segs)
 
     # -------------------------------------------------------------- items
     def program(self):
@@ -187,6 +227,10 @@ class _Parser:
             t = self.tok
             if self.tok.kind == "eof":
                 raise ParseError(t.loc, "expected `}`, found end of file")
+            derive = None
+            if t.text == "#" and t.kind == "punct":
+                derive = self.attribute()
+                t = self.tok
             pub = False
             if self.at("pub"):
                 if self.peek().text == "(":
@@ -195,7 +239,20 @@ class _Parser:
                     self.unsupported(t, "`pub` at the crate root (the subset spells root items without it)")
                 pub = True
                 self.next()
-            if self.at("fn"):
+            if derive is not None and not self.at("struct"):
+                self.unsupported(derive, "attribute on something other than a struct")
+            if self.at("struct"):
+                if derive is None:
+                    self.unsupported(t, "struct without `#[derive(Clone)]` (the subset's structs are Clone, "
+                                        "like every copyable C++ aggregate)")
+                sd = self.struct_()
+                # a private struct in a module is a C++ anonymous-namespace member
+                items.append(K.StructDef(sd.name, sd.fields, sd.methods, sd.loc, sd.ns, bool(self.ns) and not pub))
+            elif self.at("impl"):
+                if pub:
+                    self.unsupported(t, "`pub impl`")
+                self.impl_()
+            elif self.at("fn"):
                 f = self.func()
                 items.append(K.Func(f.name, f.params, f.ret, f.body, f.loc, self.ns, bool(self.ns) and not pub))
             elif self.at("mod") and top and not pub and self.peek().text == "bx":
@@ -226,8 +283,6 @@ class _Parser:
                 self.expect("}")
             elif pub:
                 self.unsupported(self.tok, "`pub` item other than `pub fn` / `pub mod`")
-            elif t.text == "#":
-                self.unsupported(t, "attribute")
             elif t.kind == "ident" and t.text in ("use", "struct", "enum", "impl", "trait", "static",
                                                   "const", "type", "mod", "pub", "extern", "unsafe",
                                                   "macro_rules"):
@@ -235,6 +290,69 @@ class _Parser:
             else:
                 raise ParseError(t.loc, "expected an item, found %s" % self.describe(t))
         return items
+
+    # ------------------------------------------------------------ FR-257
+    def attribute(self):
+        """Exactly `#[derive(Clone)]`."""
+        t = self.expect("#")
+        want = ["[", "derive", "(", "Clone", ")", "]"]
+        got = [x.text for x in self.toks[self.i:self.i + len(want)]]
+        if got != want:
+            self.unsupported(t, "attribute other than `#[derive(Clone)]` on a struct")
+        self.i += len(want)
+        return t
+
+    def struct_(self):
+        start = self.expect("struct")
+        name = self.ident()
+        if self.at("<"):
+            self.unsupported(self.tok, "generic struct")
+        if self.at("(") or self.at(";"):
+            self.unsupported(self.tok, "tuple or unit struct")
+        self.expect("{")
+        fields = []
+        while not self.at("}"):
+            ft = self.tok
+            if not self.at("pub"):
+                self.unsupported(ft, "private field (the subset's data members are public: `pub %s`)" % ft.text)
+            self.next()
+            if self.at("("):
+                self.unsupported(ft, "restricted visibility `pub(..)`")
+            fname = self.ident()
+            self.expect(":")
+            fty = self.type_()
+            fields.append(K.FieldDef(fname.text, fty, fname.loc))
+            if not self.at("}"):
+                self.expect(",")
+        self.expect("}")
+        return K.StructDef(name.text, tuple(fields), (), start.loc, self.ns, False)
+
+    def impl_(self):
+        start = self.expect("impl")
+        if self.at("<"):
+            self.unsupported(self.tok, "generic impl")
+        nt = self.tok
+        name = self.path_segments()
+        if self.at("for"):
+            self.unsupported(self.tok, "trait implementation (`impl Trait for S`)")
+        if "::" in name:
+            self.unsupported(nt, "`impl` of a struct of another module")
+        self.expect("{")
+        methods = []
+        while not self.at("}"):
+            mt = self.tok
+            if self.tok.kind == "eof":
+                raise ParseError(mt.loc, "expected `}`, found end of file")
+            if not self.at("pub"):
+                self.unsupported(mt, "private member function (the subset spells it `pub fn`)")
+            self.next()
+            if self.at("("):
+                self.unsupported(mt, "restricted visibility `pub(..)`")
+            if not self.at("fn"):
+                self.unsupported(self.tok, "`impl` item other than `pub fn`")
+            methods.append(self.func(owner=name))
+        self.expect("}")
+        self.impls.append((name, self.ns, methods, start.loc, nt.loc))
 
     def bx_module(self):
         start = self.tok
@@ -254,13 +372,28 @@ class _Parser:
         self.expect("}")
         return start
 
-    def func(self):
+    def func(self, owner=None):
         start = self.expect("fn")
         name = self.ident()
         if self.at("<"):
             self.unsupported(self.tok, "generic function")
         self.expect("(")
         params = []
+        recv = "" if owner is None else "static"
+        if owner is not None and (self.at("&") and self.peek().text in ("self", "mut")):
+            st = self.next()
+            if self.at("mut"):
+                self.next()
+                recv = "mut"
+            else:
+                recv = "ref"
+            if not self.at("self"):
+                self.unsupported(st, "reference parameter in the receiver position")
+            self.next()
+            if not self.at(")"):
+                self.expect(",")
+        elif owner is not None and (self.at("self") or (self.at("mut") and self.peek().text == "self")):
+            self.unsupported(self.tok, "member function taking `self` by value (C++ has no by-value `this`)")
         while not self.at(")"):
             pt = self.tok
             mutable = False
@@ -279,6 +412,8 @@ class _Parser:
             self.next()
             ret = self.type_()
         body = self.block()
+        if owner is not None:
+            return K.Func(name.text, tuple(params), ret, body, start.loc, self.ns, False, owner, recv)
         return K.Func(name.text, tuple(params), ret, body, start.loc)
 
     # -------------------------------------------------------------- stmts
@@ -302,7 +437,7 @@ class _Parser:
                 return self.if_()
             if kw == "while":
                 self.next()
-                cond = self.expr()
+                cond = self.cond_expr()
                 return K.While(cond, self.block(), t.loc)
             if kw == "for":
                 return self.for_()
@@ -360,12 +495,12 @@ class _Parser:
                 if op_tok.text == "=":
                     return K.Assign(e.name, v, t.loc)
                 return K.CompoundAssign(COMPOUND[op_tok.text], e.name, v, t.loc, "plain")
-            if isinstance(e, K.Index):
+            if isinstance(e, (K.Index, K.Field)):
                 if op_tok.text == "=":
                     return K.Store(e, v, t.loc)
                 return K.CompoundStore(COMPOUND[op_tok.text], e, v, t.loc, "plain")
             self.unsupported(t, "assignment to something other than a variable or an element")
-        if not isinstance(e, K.Call):
+        if not isinstance(e, (K.Call, K.MethodCall)):
             if self.at("}"):
                 self.unsupported(t, "tail expression (the subset spells it `return e;`)")
             self.unsupported(t, "expression statement that is not a call")
@@ -413,7 +548,7 @@ class _Parser:
         t = self.expect("if")
         if self.at("let"):
             self.unsupported(self.tok, "`if let`")
-        cond = self.expr()
+        cond = self.cond_expr()
         then = self.block()
         els = None
         if self.at("else"):
@@ -435,7 +570,7 @@ class _Parser:
             self.unsupported(self.tok, "pattern in `for`")
         var = self.ident()
         self.expect("in")
-        lo = self.expr()
+        lo = self.cond_expr()
         if isinstance(lo, _Iter):
             body = self.block()
             if lo.mode in ("copied", "cloned"):
@@ -450,7 +585,7 @@ class _Parser:
         if not self.at(".."):
             self.unsupported(self.tok, "`for` over something other than a half-open range `a..b`")
         self.next()
-        hi = self.expr()
+        hi = self.cond_expr()
         body = self.block()
         return K.For(var.text, lo, hi, body, t.loc)
 
@@ -538,6 +673,23 @@ class _Parser:
     def expr(self):
         return self.binary(0)
 
+    def cond_expr(self):
+        """An expression followed by a block: like rustc, no struct literal
+        at its top level (`if x == S { .. }` would be ambiguous)."""
+        saved, self.no_struct = self.no_struct, True
+        try:
+            return self.expr()
+        finally:
+            self.no_struct = saved
+
+    def free_expr(self):
+        """Inside parentheses / brackets / arguments: struct literals again."""
+        saved, self.no_struct = self.no_struct, False
+        try:
+            return self.expr()
+        finally:
+            self.no_struct = saved
+
     def binary(self, level):
         if level == len(BIN_LEVELS):
             return self.cast()
@@ -621,6 +773,11 @@ class _Parser:
                 if m.kind != "ident":
                     self.unsupported(m, "field access")
                 self.next()
+                if not self.at("(") and m.text not in WRAPPING_METHODS and m.text != "wrapping_neg":
+                    if isinstance(e, (_MStmt, _Iter)):
+                        self.unsupported(m, "field access `.%s`" % m.text)
+                    e = K.Field(e, m.text, getattr(e, "loc", None) or m.loc)  # located at its start, like C++
+                    continue
                 if m.text in WRAPPING_METHODS:
                     self.expect("(")
                     arg = self.expr()
@@ -636,7 +793,7 @@ class _Parser:
                 continue
             if t.kind == "punct" and t.text == "[":
                 self.next()
-                idx = self.expr()
+                idx = self.free_expr()
                 self.expect("]")
                 e = K.Index(e, idx, getattr(e, "loc", None) or t.loc)  # located at its start, like C++
                 continue
@@ -691,20 +848,22 @@ class _Parser:
             self.expect("(")
             args = []
             while not self.at(")"):
-                args.append(self.expr())
+                args.append(self.free_expr())
                 if not self.at(")"):
                     self.expect(",")
             self.expect(")")
             if len(args) != STMT_METHODS[name]:
                 self.unsupported(m, "`.%s()` with %d arguments" % (name, len(args)))
             return _MStmt(name, recv, tuple(args), m.loc)
-        self.unsupported(m, "method call `.%s()`" % name)
+        # FR-257: any other name is a user member function, resolved by the
+        # receiver's struct type (the checker reports `.capacity()` on a Vec)
+        return K.MethodCall(recv, name, tuple(self.call_args()), m.loc)
 
     def call_args(self):
         self.expect("(")
         args = []
         while not self.at(")"):
-            args.append(self.expr())
+            args.append(self.free_expr())
             if not self.at(")"):
                 self.expect(",")
         self.expect(")")
@@ -748,15 +907,35 @@ class _Parser:
             return K.Substr(args[0], args[1], args[2] if len(args) == 3 else None, t.loc)
         self.unsupported(t, "path expression `%s`" % path)
 
+    def struct_lit(self, raw, t):
+        """`S { f: e, g }` (FR-257); the path and the field order are
+        checked once every struct is known."""
+        self.expect("{")
+        names, values = [], []
+        while not self.at("}"):
+            if self.at(".."):
+                self.unsupported(self.tok, "struct update syntax `..base`")
+            n = self.ident()
+            if self.at(":"):
+                self.next()
+                values.append(self.free_expr())
+            else:
+                values.append(K.Var(n.text, n.loc))  # field-init shorthand
+            names.append(n.text)
+            if not self.at("}"):
+                self.expect(",")
+        self.expect("}")
+        return K.StructLit(_RawPath(raw, self.ns, t.loc), tuple(values), t.loc, tuple(names))
+
     def vec_macro(self, t):
         self.next()  # !
         self.expect("[")
         if self.at("]"):
             self.unsupported(t, "`vec![]` (the subset spells the empty vector `Vec::new()`)")
-        first = self.expr()
+        first = self.free_expr()
         if self.at(";"):
             self.next()
-            n = self.expr()
+            n = self.free_expr()
             self.expect("]")
             return K.VecFill(first, n, t.loc)
         elems = [first]
@@ -764,7 +943,7 @@ class _Parser:
             self.next()
             if self.at("]"):
                 break
-            elems.append(self.expr())
+            elems.append(self.free_expr())
         self.expect("]")
         return K.VecLit(None, tuple(elems), t.loc)
 
@@ -804,6 +983,8 @@ class _Parser:
                 while self.at("::"):
                     self.next()
                     segs.append(self.ident().text)
+                if self.at("{") and not self.no_struct:
+                    return self.struct_lit("::".join(segs), t)
                 if not self.at("("):
                     self.unsupported(t, "path expression `%s`" % "::".join(segs))
                 return K.Call("::".join(segs), tuple(self.call_args()), t.loc)
@@ -815,17 +996,19 @@ class _Parser:
                 self.next()
                 args = []
                 while not self.at(")"):
-                    args.append(self.expr())
+                    args.append(self.free_expr())
                     if not self.at(")"):
                         self.expect(",")
                 self.expect(")")
                 return K.Call(t.text, tuple(args), t.loc)
+            if self.at("{") and not self.no_struct and t.text != "self":
+                return self.struct_lit(t.text, t)
             return K.Var(t.text, t.loc)
         if t.kind == "punct" and t.text == "(":
             self.next()
             if self.at(")"):
                 self.unsupported(t, "unit value `()`")
-            e = self.expr()
+            e = self.free_expr()
             if self.at(","):
                 self.unsupported(self.tok, "tuple")
             self.expect(")")
@@ -847,9 +1030,10 @@ def _tc():
 PATH_KEYWORDS = ("crate", "self", "super")
 
 
-def _resolve(raw, ns, funcs, loc):
+def _resolve(raw, ns, funcs, loc, what="function"):
     """Rust's resolution of a call path written in module ``ns``, as an
-    absolute Kernel path.  ``funcs``: every absolute function path."""
+    absolute Kernel path.  ``funcs``: every absolute function path (FR-257:
+    or struct path, with ``what='struct'``)."""
     segs = raw.split("::")
     lead = 0
     while lead < len(segs) and segs[lead] == "super":
@@ -871,7 +1055,7 @@ def _resolve(raw, ns, funcs, loc):
     else:
         absolute = list(ns) + segs
     if not absolute:
-        raise ParseError(loc, "unsupported: path `%s` names no function" % raw)
+        raise ParseError(loc, "unsupported: path `%s` names no %s" % (raw, what))
     path = "::".join(absolute)
     if len(segs) == 1 and path not in funcs and ns:
         # C++ would search the enclosing namespaces; Rust does not.
@@ -884,24 +1068,49 @@ def _resolve(raw, ns, funcs, loc):
     return path
 
 
-def _resolve_calls(node, ns, funcs):
-    """Rebuild ``node`` with every Call's raw path resolved."""
+def _resolve_struct(rp, structs):
+    """A _RawPath -> the absolute struct path (Rust's rules, like calls)."""
+    path = _resolve(rp.raw, rp.ns, structs, rp.loc, "struct")
+    if path not in structs:
+        raise ParseError(rp.loc, "unsupported: type `%s`" % rp.raw)
+    return path
+
+
+def _resolve_ty(t, structs):
+    if isinstance(t, K.StructT) and isinstance(t.path, _RawPath):
+        return K.StructT(_resolve_struct(t.path, structs))
+    if isinstance(t, K.VecT):
+        e = _resolve_ty(t.elem, structs)
+        return t if e is t.elem else K.VecT(e)
+    if isinstance(t, K.RefT):
+        e = _resolve_ty(t.inner, structs)
+        return t if e is t.inner else K.RefT(e, t.mutable)
+    return t
+
+
+def _resolve_calls(node, ns, funcs, structs=frozenset()):
+    """Rebuild ``node`` with every Call's raw path resolved (FR-257: and
+    every struct type / struct literal path)."""
     from dataclasses import fields as dfields, is_dataclass, replace
     if isinstance(node, tuple):
-        out = tuple(_resolve_calls(x, ns, funcs) for x in node)
+        out = tuple(_resolve_calls(x, ns, funcs, structs) for x in node)
         return node if all(a is b for a, b in zip(out, node)) else out
-    if not is_dataclass(node) or isinstance(node, (K.Loc,) + K.TYPE_CLASSES):
+    if isinstance(node, K.TYPE_CLASSES):
+        return _resolve_ty(node, structs)
+    if not is_dataclass(node) or isinstance(node, K.Loc):
         return node
     changes = {}
     for f in dfields(node):
-        if f.name in ("loc", "spelling"):
+        if f.name in ("loc", "spelling", "names"):
             continue
         v = getattr(node, f.name)
-        nv = _resolve_calls(v, ns, funcs)
+        nv = _resolve_calls(v, ns, funcs, structs)
         if nv is not v:
             changes[f.name] = nv
     if isinstance(node, K.Call):
         changes["name"] = _resolve(node.name, ns, funcs, node.loc)
+    if isinstance(node, K.StructLit) and isinstance(node.path, _RawPath):
+        changes["path"] = _resolve_struct(node.path, structs)
     return replace(node, **changes) if changes else node
 
 
@@ -911,16 +1120,70 @@ def rs_parse_surface(src):
         toks = lex(src)
     except LexError as ex:
         raise ParseError(ex.loc, ex.msg)
-    prog = _Parser(toks).program()
-    funcs = {f.path for f in prog.funcs()}
-    prog = K.Program(tuple(K.Func(f.name, f.params, f.ret, _resolve_calls(f.body, f.ns, funcs), f.loc, f.ns,
-                                  f.internal) for f in prog.items))
+    parser = _Parser(toks)
+    prog = parser.program()
+    prog = _attach_impls(prog, parser.impls)
+    funcs = {f.path for f in prog.all_funcs()}
+    structs = {sd.path for sd in prog.structs()}
+    items = []
+    for it in prog.items:
+        if isinstance(it, K.StructDef):
+            items.append(K.StructDef(it.name, _resolve_calls(it.fields, it.ns, funcs, structs),
+                                     tuple(_resolve_func(m, funcs, structs) for m in it.methods), it.loc, it.ns,
+                                     it.internal))
+        else:
+            items.append(_resolve_func(it, funcs, structs))
+    prog = K.Program(tuple(items))
+    _check_literal_fields(prog)
     for n in K.walk(prog):
         if isinstance(n, _MStmt):
             raise ParseError(n.loc, "unsupported: `.%s()` used as a value" % n.kind)
         if isinstance(n, _Iter):
             raise ParseError(n.loc, "unsupported: iterator outside a `for` loop")
     return prog
+
+
+def _resolve_func(f, funcs, structs):
+    return K.Func(f.name, _resolve_calls(f.params, f.ns, funcs, structs), _resolve_ty(f.ret, structs),
+                  _resolve_calls(f.body, f.ns, funcs, structs), f.loc, f.ns, f.internal, f.owner, f.recv)
+
+
+def _attach_impls(prog, impls):
+    """Each `impl S { .. }` joins the struct S of its module (one impl per
+    struct; a constructor is `pub fn new(..) -> S { return S { .. }; }`)."""
+    by = {(sd.ns, sd.name): sd for sd in prog.structs()}
+    methods = {}
+    for name, ns, ms, loc, nloc in impls:
+        if (ns, name) not in by:
+            raise ParseError(nloc, "unsupported: `impl %s` without a struct `%s` in the same module" % (name, name))
+        if (ns, name) in methods:
+            raise ParseError(loc, "unsupported: second `impl %s` block (the subset spells one per struct, "
+                                  "like the one C++ class definition)" % name)
+        out = []
+        for m in ms:
+            recv = m.recv
+            if m.name == "new" and recv == "static":
+                recv = "ctor"
+            out.append(K.Func(m.name, m.params, m.ret, m.body, m.loc, ns, False, name, recv))
+        methods[(ns, name)] = tuple(out)
+    items = []
+    for it in prog.items:
+        if isinstance(it, K.StructDef):
+            it = K.StructDef(it.name, it.fields, methods.get((it.ns, it.name), ()), it.loc, it.ns, it.internal)
+        items.append(it)
+    return K.Program(tuple(items))
+
+
+def _check_literal_fields(prog):
+    """Rust evaluates a struct literal's fields in WRITTEN order, C++ an
+    aggregate's initializers in DECLARATION order: the subset requires
+    every field, in declaration order (FR-257)."""
+    decl = {sd.path: tuple(f.name for f in sd.fields) for sd in prog.structs()}
+    for n in K.walk(prog):
+        if isinstance(n, K.StructLit) and n.path in decl and n.names != decl[n.path]:
+            raise ParseError(n.loc, "unsupported: the literal of struct '%s' does not list every field in "
+                                    "declaration order (Rust evaluates field initializers in written order, "
+                                    "C++ in declaration order)" % n.path)
 
 
 def rs_parse(src):

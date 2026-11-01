@@ -220,6 +220,48 @@ RULES = [
     (r"^namespace alias of a namespace outside this file$", "namespace: foreign alias", None),
     (r"^'.*' is internal to namespace '.*'", "namespace: internal member referenced outside", None),
     (r"^function '.*' has the name of a namespace", "namespace: function named like a namespace", None),
+    # FR-257 struct/class rejections. "union" and the unnamed-record "class/struct
+    # definition" reject the record WHOLE (OPAQUE); every other class-level reason
+    # is reported while bx still inspects the member bodies.
+    (r"^union$", "struct: union", None),
+    (r"^class with a base class", "struct: inheritance", None),
+    (r"^struct with members outside the subset$", "struct: has members outside the subset", None),
+    (r"^(private or protected member|bit-field|default member initializer|mutable data member"
+     r"|unnamed data member|const data member|static data member|operator overload"
+     r"|virtual member function|defaulted or deleted member function|volatile member function"
+     r"|user-declared copy or move constructor|overloaded constructor|user-declared destructor"
+     r"|friend declaration|member function template|nested class|enum inside a class"
+     r"|member typedef|static_assert inside a class|using-declaration inside a class"
+     r"|anonymous union or struct member|conversion operator|member function declared but not defined"
+     r"|use of a rejected data member|use of a rejected member function|member function used as a value"
+     r"|member access on a temporary|member function call on a temporary"
+     r"|static member function called through an object"
+     r"|aggregate initialization that omits data members"
+     r"|aggregate initialization of a struct with rejected data members"
+     r"|struct variable without an initializer"
+     r"|delegating or base-class constructor initializer)\b", "struct: member", "generic"),
+    (r"^data member of type '(.*)'$", "struct: data member of non-kernel type", "type"),
+    (r"^.* inside a class$", "struct: member", "generic"),
+    (r"^value-initialized or default-initialized struct", "struct: default/value initialization", None),
+    (r"^(constructor whose body|constructor of '.*' whose body) is not a member-initializer",
+     "struct: constructor body", None),
+    (r"^aggregate initialization of '.*', which has a constructor", "struct: aggregate init of a struct with a constructor", None),
+    (r"^move out of a data member", "struct: move out of a data member", None),
+    (r"^member function call on something other than", "struct: call receiver form", None),
+    (r"^(an argument of '.*' modifies '.*', the object"
+     r"|'.*' is passed by reference to '.*', a non-const member function"
+     r"|non-const member function '.*' is called on an element of"
+     r"|non-const member function '.*' is called on '.*', which is also used elsewhere)",
+     "struct: receiver aliasing", None),
+    (r"^constructor call evaluated only for its effect$", "struct: constructor call for effect", None),
+    (r"^call of non-const member function '.*' of immutable", "struct: mutating call on immutable", None),
+    (r"^(member function '.*' called without an object|static member function '.*' called on an object"
+     r"|constructor '.*' called on an object)", "struct: call form", None),
+    (r"^(struct name: |struct '.*' has the name of|variable '.*' has the name of a struct"
+     r"|data member '.*' has the name of a struct|member function '.*' has the name of a struct)",
+     "struct: name clash", None),
+    (r"^identifier '.*' is reserved by the canonical Rust spelling", "identifier: reserved by canonical spelling", None),
+    (r"^struct '.*' contains itself by value", "struct: contains itself", None),
     # clang kinds with no FRIENDLY name (friendly() falls back to the kind)
     (r"^([A-Z][A-Za-z]*(Expr|Stmt|Decl|Operator|Literal))$", None, None),
     # ---- typecheck.py ------------------------------------------------------
@@ -274,7 +316,11 @@ OPAQUE = {
     "ClassTemplatePartialSpecializationDecl", "ClassTemplateSpecializationDecl",
     "local class/struct definition", "label", "statement expression", "GCCAsmStmt",
     "namespace: inline", "namespace: named inside anonymous", "namespace: name not representable",
+    "struct: union",
 }
+
+# a member-function definition bx rejects as ONE item without inspecting its body
+WHOLE_MEMBER = {"member function", "CXXConstructorDecl", "CXXDestructorDecl", "CXXConversionDecl"}
 
 
 def mark(key):
@@ -615,7 +661,10 @@ def build(records, corpus_sources, args):
             # either an enclosing class/namespace/template, or this function is itself a
             # top-level non-FunctionDecl item (out-of-line method/ctor/dtor), which bx's
             # run() rejects as one ResidualItem without descending.
-            hidden = bool(f["container_diags"]) or (f["kind"] != "FunctionDecl" and bool(f["diags"]))
+            # Since FR-257 bx inspects members of a named struct and out-of-line member
+            # bodies, so only an OPAQUE container tag or a whole-item member tag hides.
+            hidden = any(ds[i]["tag"] in OPAQUE for i in f["container_diags"]) or (
+                f["kind"] != "FunctionDecl" and any(ds[i]["tag"] in WHOLE_MEMBER for i in f["diags"]))
             func_short[F] = (P, f["short"], f["callees"], hidden, bool(f["diags"]))
     # transitive cleanliness over an APPROXIMATE, name-based, same-file call graph
     clean = {F for F, s in func_tags.items() if not s}

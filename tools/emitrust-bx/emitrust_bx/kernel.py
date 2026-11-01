@@ -99,8 +99,24 @@ class RefT:
         return "&%s%s" % ("mut " if self.mutable else "", self.inner)
 
 
-Ty = Union[Prim, VecT, StrT, RefT]  # the closed sum
-TYPE_CLASSES = (Prim, VecT, StrT, RefT)
+@dataclass(frozen=True)
+class StructT:
+    """FR-257: a user aggregate, named by its ABSOLUTE path ('a::P').
+
+    C++ `struct P` (public data members of Kernel types) <=> Rust
+    `#[derive(Clone)] struct P` with `pub` fields.  Like Vec and String it
+    is NOT Copy: a C++ copy is an explicit ``Clone`` (`.clone()`), a bare
+    variable in a consuming position is a move (`std::move(x)`).
+    """
+
+    path: str
+
+    def __str__(self):
+        return self.path
+
+
+Ty = Union[Prim, VecT, StrT, RefT, StructT]  # the closed sum
+TYPE_CLASSES = (Prim, VecT, StrT, RefT, StructT)
 STRING = StrT()
 
 I8 = Prim("i8")
@@ -146,8 +162,8 @@ def is_copy(t):
 
 
 def is_owned_nc(t):
-    """An owned non-Copy value type (Vec or String)."""
-    return isinstance(t, (VecT, StrT))
+    """An owned non-Copy value type (Vec, String or a struct)."""
+    return isinstance(t, (VecT, StrT, StructT))
 
 
 def deref(t):
@@ -163,6 +179,19 @@ def elem_ok(t):
         return True
     if isinstance(t, VecT):
         return elem_ok(t.elem)
+    if isinstance(t, StructT):
+        return True
+    return False
+
+
+def has_struct(t):
+    """Does ``t`` contain a struct anywhere (no `==` in either language)?"""
+    if isinstance(t, StructT):
+        return True
+    if isinstance(t, (VecT,)):
+        return has_struct(t.elem)
+    if isinstance(t, RefT):
+        return has_struct(t.inner)
     return False
 
 
@@ -406,9 +435,52 @@ class Borrow:
     loc: Optional[Loc] = _loc()
 
 
+# ---------------------------------------------------------------- FR-257 exprs
+
+@dataclass(frozen=True)
+class Field:
+    """`p.f` <=> `p.f` (C++ `this->f` / implicit `f` <=> Rust `self.f`).
+
+    ``base`` is a PLACE of struct type (a variable -- `self` included --
+    an element, or another field); the Kernel has no member access on a
+    temporary."""
+
+    base: "Expr"
+    name: str
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class StructLit:
+    """Aggregate initialization `S{a, b}` / `S s = {a, b};` <=> `S { f1: a,
+    f2: b }`: EVERY field, in DECLARATION order (both languages then
+    evaluate the initializers left to right).  ``names`` is the Rust
+    surface's field list (compare=False), checked against the declaration."""
+
+    path: str
+    values: Tuple["Expr", ...]
+    loc: Optional[Loc] = _loc()
+    names: Tuple[str, ...] = field(default=(), compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class MethodCall:
+    """`r.m(args)` <=> `r.m(args)` on a non-static member function; the
+    method is resolved from the receiver's struct type.  ``recv`` is a
+    place (`self` for C++ `this->m(..)` / implicit `m(..)`)."""
+
+    recv: "Expr"
+    name: str
+    args: Tuple["Expr", ...]
+    loc: Optional[Loc] = _loc()
+    # the receiver's struct path, filled in by normalize (which has the
+    # scope) so scope-free analyses resolve the method exactly
+    owner: str = field(default="", compare=False, repr=False)
+
+
 Expr = Union[IntLit, FloatLit, BoolLit, StrLit, Var, Unary, Binary, Cast, Call,
              ResidualExpr, Clone, Index, ByteAt, Len, IsEmpty, VecLit, VecFill,
-             StrNew, StrFrom, Substr, ToStr]
+             StrNew, StrFrom, Substr, ToStr, Field, StructLit, MethodCall]
 
 
 # ---------------------------------------------------------------- printf
@@ -473,9 +545,10 @@ class CompoundAssign:
 
 @dataclass(frozen=True)
 class ExprStmt:
-    """A call evaluated for effect (its value, if any, discarded)."""
+    """A call (or FR-257 method call) evaluated for effect (its value, if
+    any, discarded)."""
 
-    expr: Call
+    expr: Expr
     loc: Optional[Loc] = _loc()
 
 
@@ -543,19 +616,19 @@ class ResidualStmt:
 
 @dataclass(frozen=True)
 class Store:
-    """`v[i] = e;` (target an Index place)."""
+    """`v[i] = e;` / `p.f = e;` (target an Index or Field place)."""
 
-    target: Index
+    target: Expr
     value: Expr
     loc: Optional[Loc] = _loc()
 
 
 @dataclass(frozen=True)
 class CompoundStore:
-    """`v[i] op= e;` (`++v[i];` for += 1)."""
+    """`v[i] op= e;` / `p.f op= e;` (`++v[i];` for += 1)."""
 
     op: str
-    target: Index
+    target: Expr
     value: Expr
     loc: Optional[Loc] = _loc()
     spelling: str = field(default="", compare=False, repr=False)
@@ -664,10 +737,67 @@ class Func:
     # FR-260: a member of an anonymous namespace (C++) <=> a private `fn`
     # inside a `mod` (Rust).  Always False at the root (normal form N14).
     internal: bool = False
+    # FR-257: a member function of struct ``owner`` (its leaf name; the
+    # struct lives in ``ns``).  ``recv``: '' (a free function), 'static'
+    # (C++ `static` member <=> Rust associated fn `S::f`), 'ref' (C++ const
+    # member function <=> `&self`), 'mut' (non-const <=> `&mut self`),
+    # 'ctor' (a constructor whose body is a member-initializer list <=>
+    # `pub fn new(..) -> S { return S { .. }; }`; its name is 'new' and its
+    # body is exactly `return StructLit;`).
+    owner: str = ""
+    recv: str = ""
+
+    @property
+    def path(self):
+        if self.owner:
+            return path_of(tuple(self.ns) + (self.owner,), self.name)
+        return path_of(self.ns, self.name)
+
+
+RECV_KINDS = ("static", "ref", "mut", "ctor")
+
+
+@dataclass(frozen=True)
+class FieldDef:
+    name: str
+    ty: "Ty"
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
+class StructDef:
+    """FR-257: `struct S { fields; methods; };` <=> `#[derive(Clone)]
+    struct S { pub fields } impl S { pub fns }`.  ``methods`` keep their
+    C++ in-class declaration order (= the Rust `impl` order)."""
+
+    name: str
+    fields: Tuple[FieldDef, ...]
+    methods: Tuple[Func, ...]
+    loc: Optional[Loc] = _loc()
+    ns: Tuple[str, ...] = ()
+    internal: bool = False
 
     @property
     def path(self):
         return path_of(self.ns, self.name)
+
+    def field_ty(self, name):
+        for f in self.fields:
+            if f.name == name:
+                return f.ty
+        return None
+
+    def method(self, name):
+        for m in self.methods:
+            if m.name == name:
+                return m
+        return None
+
+    def ctor(self):
+        for m in self.methods:
+            if m.recv == "ctor":
+                return m
+        return None
 
 
 def path_of(ns, name):
@@ -694,10 +824,24 @@ class ResidualItem:
 
 @dataclass(frozen=True)
 class Program:
-    items: Tuple[Union[Func, ResidualItem], ...]
+    items: Tuple[Union[Func, StructDef, ResidualItem], ...]
 
     def funcs(self):
+        """The FREE functions (FR-257 member functions live in StructDefs)."""
         return [f for f in self.items if isinstance(f, Func)]
+
+    def structs(self):
+        return [s for s in self.items if isinstance(s, StructDef)]
+
+    def all_funcs(self):
+        """Free functions and member functions, in item order."""
+        out = []
+        for it in self.items:
+            if isinstance(it, Func):
+                out.append(it)
+            elif isinstance(it, StructDef):
+                out.extend(it.methods)
+        return out
 
 
 RESIDUALS = (ResidualExpr, ResidualStmt, ResidualItem)
@@ -751,8 +895,13 @@ def dump(node, indent=0):
         return "".join(dump(i, indent) for i in node.items)
     if isinstance(node, Func):
         ps = ", ".join("%s%s: %s" % ("mut " if p.mutable else "", p.name, p.ty) for p in node.params)
-        s = "%sfunc %s%s(%s) -> %s\n" % (pad, "internal " if node.internal else "", node.path, ps, node.ret)
+        s = "%sfunc %s%s%s(%s) -> %s\n" % (pad, "internal " if node.internal else "",
+                                          ("%s " % node.recv) if node.recv else "", node.path, ps, node.ret)
         return s + dump(node.body, indent + 1)
+    if isinstance(node, StructDef):
+        s = "%sstruct %s%s\n" % (pad, "internal " if node.internal else "", node.path)
+        s += "".join("%s  field %s: %s\n" % (pad, f.name, f.ty) for f in node.fields)
+        return s + "".join(dump(m, indent + 1) for m in node.methods)
     if isinstance(node, Block):
         return pad + "block\n" + "".join(dump(s, indent + 1) for s in node.stmts)
     if isinstance(node, Let):
@@ -855,6 +1004,12 @@ def dump_expr(e):
         return "(to_string %s)" % dump_expr(e.operand)
     if isinstance(e, Borrow):
         return "(borrow%s %s)" % (" mut" if e.mutable else "", dump_expr(e.operand))
+    if isinstance(e, Field):
+        return "(field %s %s)" % (dump_expr(e.base), e.name)
+    if isinstance(e, StructLit):
+        return "(struct %s [%s])" % (e.path, ", ".join(dump_expr(x) for x in e.values))
+    if isinstance(e, MethodCall):
+        return "(method %s %s%s)" % (dump_expr(e.recv), e.name, "".join(" " + dump_expr(a) for a in e.args))
     if isinstance(e, ResidualExpr):
         return "(residual %r)" % e.reason
     raise TypeError("dump_expr: %r" % (e,))

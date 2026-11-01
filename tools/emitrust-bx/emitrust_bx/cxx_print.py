@@ -46,6 +46,23 @@ FR-251 rows:
   `std::to_string(x)`, `v.push_back(e);`, `v.pop_back();`, `x.clear();`,
   `v.resize(n, x);`, `s += t;`, `s.push_back(c);`, `++v[i];` for += 1,
   `x.c_str()` as a printf %s argument.
+
+FR-257 rows (structs):
+
+* layout: forward declarations `struct S;` (only for a struct named before
+  its definition through a vector, a reference or a member-function
+  signature), then every struct definition in normal-form-N15 order inside
+  its namespace blocks -- data members, then member-function DECLARATIONS
+  (`int get() const;`, `void add(int k);`, `static S mk(int z);`,
+  `S(int a, int b);`) -- then prototypes, then every definition in item
+  order, member functions OUT OF LINE (`int S::get() const {`,
+  `S::S(int a, int b) : x(a), y(b) {}`) so a body may call anything.
+* a struct type is bare in its own namespace, else `::a::S`; inside a
+  member function every FREE function call is `::`-qualified (a member of
+  the same name would hide it); `S::f(..)` / `S(..)` for static members and
+  constructors.
+* `self` is `*this`; a member through it is `this->f` / `this->m(..)`.
+* aggregate init: `S s = {a, b};` as a declaration, `S{a, b}` elsewhere.
 """
 
 from . import fmt
@@ -70,14 +87,23 @@ class PrintError(Exception):
     pass
 
 
-def cxx_ty(t):
+def cxx_ty(t, ns=()):
     if isinstance(t, K.VecT):
-        return "std::vector<%s>" % cxx_ty(t.elem)
+        return "std::vector<%s>" % cxx_ty(t.elem, ns)
     if isinstance(t, K.StrT):
         return "std::string"
     if isinstance(t, K.RefT):
-        return "%s%s&" % ("" if t.mutable else "const ", cxx_ty(t.inner))
+        return "%s%s&" % ("" if t.mutable else "const ", cxx_ty(t.inner, ns))
+    if isinstance(t, K.StructT):
+        return cxx_path(t.path, ns)
     return CXX_TYPE[t.name]
+
+
+def cxx_path(path, ns):
+    """FR-257: a struct of the SAME namespace is bare, any other is
+    `::a::S` (never an enclosing-scope search, like FR-260's calls)."""
+    sns, leaf = K.split_path(path)
+    return leaf if sns == tuple(ns) else "::" + path
 
 
 def cxx_int_lit(e):
@@ -110,14 +136,22 @@ class _Printer:
         self.lines = []
         self.includes = set()
         self.ns = ()  # the namespace of the function being printed
+        self.method = None  # FR-257: the member function being printed
 
     def callee(self, path):
         """FR-260: bare in the same namespace (unqualified lookup finds the
         innermost declaration first, and a prototype always precedes the
         use), otherwise global-qualified `::a::b::f` -- which never searches
         enclosing scopes and suppresses argument-dependent lookup."""
+        if TC.recv_of(self.sigs).get(path):
+            # FR-257: `S::f(..)` (a constructor call is `S(..)`)
+            sp, leaf = path.rsplit("::", 1)
+            head = cxx_path(sp, self.ns)
+            return head if TC.recv_of(self.sigs)[path] == "ctor" else head + "::" + leaf
         ns, leaf = K.split_path(path)
-        if ns == self.ns:
+        if ns == self.ns and self.method is None:
+            # (inside a member function a member of the same name would
+            # hide it, so there every free function is `::`-qualified)
             return leaf
         return "::" + path
 
@@ -135,13 +169,15 @@ class _Printer:
 
     def tyname(self, t):
         self.note_ty(t)
-        return cxx_ty(t)
+        return cxx_ty(t, self.ns)
 
     @staticmethod
     def atomic(e):
+        if isinstance(e, K.Var) and e.name == "self":
+            return False
         return isinstance(e, (K.IntLit, K.FloatLit, K.BoolLit, K.Var, K.Call, K.Cast, K.StrLit, K.Index,
                               K.ByteAt, K.Len, K.IsEmpty, K.VecLit, K.VecFill, K.StrNew, K.StrFrom,
-                              K.Substr, K.ToStr, K.Clone))
+                              K.Substr, K.ToStr, K.Clone, K.Field, K.StructLit, K.MethodCall))
 
     def recv(self, e, scope):
         s = self.expr(e, scope)
@@ -156,9 +192,23 @@ class _Printer:
                 return "std::move(%s)" % e.name
         return self.expr(e, scope)
 
+    def member(self, base, scope):
+        """`this->` for `self`, otherwise `base.`."""
+        if isinstance(base, K.Var) and base.name == "self":
+            return "this->"
+        return self.recv(base, scope) + "."
+
     def nc_expr(self, e, scope):
         if isinstance(e, K.Clone):
             return self.expr(e.operand, scope)
+        if isinstance(e, K.Field):
+            return self.member(e.base, scope) + e.name
+        if isinstance(e, K.StructLit):
+            return "%s{%s}" % (cxx_path(e.path, self.ns), self.struct_values(e, scope))
+        if isinstance(e, K.MethodCall):
+            rt = self.ty(e.recv, scope)
+            sig = self.sigs[TC.method_path(rt.path, e.name)]
+            return "%s%s(%s)" % (self.member(e.recv, scope), e.name, self.args(sig[0], e.args, scope))
         if isinstance(e, (K.Index, K.ByteAt)):
             return "%s[%s]" % (self.recv(e.base, scope), self.expr(e.index, scope))
         if isinstance(e, K.Len):
@@ -199,14 +249,12 @@ class _Printer:
         if isinstance(e, K.StrLit):
             return '"' + fmt.c_escape(e.value, False) + '"'
         if isinstance(e, K.Var):
-            return e.name
+            return "*this" if e.name == "self" else e.name
         if isinstance(e, K.Call):
             ptys = self.sigs[e.name][0]
-            return "%s(%s)" % (self.callee(e.name), ", ".join(
-                self.expr(a, scope) if isinstance(pt, K.RefT) else self.consume(a, scope)
-                for pt, a in zip(ptys, e.args)))
+            return "%s(%s)" % (self.callee(e.name), self.args(ptys, e.args, scope))
         if isinstance(e, (K.Clone, K.Index, K.ByteAt, K.Len, K.IsEmpty, K.VecLit, K.VecFill, K.StrNew,
-                          K.StrFrom, K.Substr, K.ToStr)):
+                          K.StrFrom, K.Substr, K.ToStr, K.Field, K.StructLit, K.MethodCall)):
             return self.nc_expr(e, scope)
         if isinstance(e, K.Cast):
             return "static_cast<%s>(%s)" % (CXX_TYPE[e.ty.name], self.expr(e.operand, scope))
@@ -223,6 +271,13 @@ class _Printer:
             return "%s %s %s" % (self.operand(e, e.lhs, scope, True, consume), CXX_BINOP[e.op],
                                  self.operand(e, e.rhs, scope, False))
         raise PrintError("cannot print %r" % (e,))
+
+    def args(self, ptys, args, scope):
+        return ", ".join(self.expr(a, scope) if isinstance(pt, K.RefT) else self.consume(a, scope)
+                         for pt, a in zip(ptys, args))
+
+    def struct_values(self, e, scope):
+        return ", ".join(self.consume(v, scope) for v in e.values)
 
     def operand(self, parent, child, scope, is_lhs, consume=False):
         s = self.consume(child, scope) if consume else self.expr(child, scope)
@@ -255,11 +310,13 @@ class _Printer:
                 self.emit(d, "%s(%s, %s);" % (head, self.expr(i.count, scope), self.expr(i.value, scope)))
             elif isinstance(i, K.StrFrom):
                 self.emit(d, '%s = "%s";' % (head, fmt.c_escape(i.value, False)))
+            elif isinstance(i, K.StructLit):
+                self.emit(d, "%s = {%s};" % (head, self.struct_values(i, scope)))
             else:
                 self.emit(d, "%s = %s;" % (head, self.consume(i, scope)))
             scope.declare(s.name, s.ty, s.mutable)
         elif isinstance(s, K.Assign):
-            self.emit(d, "%s = %s;" % (s.name, self.consume(s.value, scope)))
+            self.emit(d, "%s = %s;" % ("*this" if s.name == "self" else s.name, self.consume(s.value, scope)))
         elif isinstance(s, K.CompoundAssign):
             t = K.deref(scope.lookup(s.name)[0])
             v = s.value
@@ -365,8 +422,10 @@ class _Printer:
         self.block_body(e, scope, d + 1)
         self.emit(d, "}")
 
-    def signature(self, f):
+    def params(self, f):
         scope = TC.Scope()
+        if f.recv in ("ref", "mut"):
+            scope.declare("self", K.RefT(K.StructT(K.path_of(f.ns, f.owner)), f.recv == "mut"), False)
         ps = []
         for p in f.params:
             if isinstance(p.ty, K.RefT):
@@ -374,28 +433,105 @@ class _Printer:
             else:
                 ps.append("%s%s %s" % ("" if p.mutable else "const ", self.tyname(p.ty), p.name))
             scope.declare(p.name, p.ty, p.mutable)
+        return ", ".join(ps), scope
+
+    def signature(self, f, in_class=False):
+        """The declarator of ``f``.  FR-257: a member function is declared
+        in its class (`int get() const;`, `static S mk(int z);`, `S(int a);`)
+        and defined out of line (`int S::get() const {`, `S::S(int a) : ..`)."""
+        ps, scope = self.params(f)
         if f.path == "main":
             return "int main()", scope
-        return "%s %s(%s)" % (self.tyname(f.ret), f.name, ", ".join(ps)), scope
+        if f.recv == "ctor":
+            return ("%s(%s)" % (f.owner, ps) if in_class else "%s::%s(%s)" % (f.owner, f.owner, ps)), scope
+        name = f.name if not f.owner or in_class else "%s::%s" % (f.owner, f.name)
+        head = "%s %s(%s)" % (self.tyname(f.ret), name, ps)
+        if f.recv == "static" and in_class:
+            head = "static " + head
+        if f.recv == "ref":
+            head += " const"
+        return head, scope
 
     def func(self, f):
         sig, scope = self.signature(f)
-        self.emit(0, sig + " {")
-        self.block_body(f.body, scope, 1, same=True)
-        if f.path == "main":
-            self.emit(1, "return 0;")
-        self.emit(0, "}")
+        self.method = f if f.owner else None
+        try:
+            if f.recv == "ctor":
+                lit = f.body.stmts[0].value
+                sd = TC.structs_of(self.sigs)[lit.path]
+                inits = ", ".join("%s(%s)" % (fd.name, self.consume(v, scope)) for fd, v in zip(sd.fields, lit.values))
+                self.emit(0, "%s%s {}" % (sig, " : " + inits if inits else ""))
+                return
+            self.emit(0, sig + " {")
+            self.block_body(f.body, scope, 1, same=True)
+            if f.path == "main":
+                self.emit(1, "return 0;")
+            self.emit(0, "}")
+        finally:
+            self.method = None
+
+    def struct(self, sd):
+        """`struct S {` data members, then member-function declarations `};`"""
+        self.emit(0, "struct %s {" % sd.name)
+        for fd in sd.fields:
+            self.emit(1, "%s %s;" % (self.tyname(fd.ty), fd.name))
+        for m in sd.methods:
+            self.emit(1, self.signature(m, in_class=True)[0] + ";")
+        self.emit(0, "};")
+
+
+def definitions(program):
+    """FR-257: the C++ definition sequence -- free functions, and in a
+    StructDef's place its member functions (defined out of line)."""
+    return program.all_funcs()
 
 
 def needs_prototype(program):
-    funcs = program.funcs()
-    index = {f.path: i for i, f in enumerate(funcs)}
+    """Free functions called (by any definition, member functions too)
+    before their own definition.  A member function never needs one: its
+    class declares it."""
+    defs = definitions(program)
+    index = {f.path: i for i, f in enumerate(defs) if not f.owner}
     need = set()
-    for i, f in enumerate(funcs):
+    for i, f in enumerate(defs):
         for n in K.walk(f.body):
             if isinstance(n, K.Call) and n.name in index and index[n.name] > i:
                 need.add(n.name)
-    return [f for f in funcs if f.path in need]
+    return [f for f in program.funcs() if f.path in need]
+
+
+def struct_mentions(sd):
+    """Struct paths a definition of ``sd`` names: data member and member-
+    function signature types (by value, in a vector, or by reference)."""
+    out = []
+
+    def add(t):
+        while isinstance(t, (K.VecT, K.RefT)):
+            t = t.elem if isinstance(t, K.VecT) else t.inner
+        if isinstance(t, K.StructT) and t.path != sd.path and t.path not in out:
+            out.append(t.path)
+
+    for fd in sd.fields:
+        add(fd.ty)
+    for m in sd.methods:
+        for p in m.params:
+            add(p.ty)
+        add(m.ret)
+    return out
+
+
+def forward_decls(structs):
+    """The structs that need a forward declaration `struct S;`: those named
+    by a struct printed before them (only through a vector, a reference or
+    a member-function signature -- a by-value data member forces the
+    contained struct earlier, normal form N15)."""
+    pos = {sd.path: i for i, sd in enumerate(structs)}
+    need = set()
+    for i, sd in enumerate(structs):
+        for p in struct_mentions(sd):
+            if pos.get(p, -1) > i:
+                need.add(p)
+    return [sd for sd in structs if sd.path in need]
 
 
 def _block_path(f):
@@ -449,12 +585,21 @@ def cxx_print(program):
         loc, msg = errs[0]
         raise PrintError("ill-formed kernel at %s: %s" % (loc, msg))
     p = _Printer(program)
+    structs = TC.struct_order(program.structs())  # N15: C++ defines before use
+    fwd = forward_decls(structs)
+    if fwd:
+        p.lines.append("")
+        emit_nested(p, fwd, lambda sd: p.emit(0, "struct %s;" % sd.name), spaced=False)
+    if structs:
+        p.lines.append("")
+        emit_nested(p, structs, p.struct, spaced=True)
     protos = needs_prototype(program)
     if protos:
         p.lines.append("")
         emit_nested(p, protos, lambda f: p.emit(0, p.signature(f)[0] + ";"), spaced=False)
-    if program.funcs():
+    defs = definitions(program)
+    if defs:
         p.lines.append("")
-    emit_nested(p, program.funcs(), p.func, spaced=True)
+    emit_nested(p, defs, p.func, spaced=True)
     head = ["#include <cstdio>"] + ["#include <%s>" % h for h in sorted(p.includes)]
     return "\n".join(head + p.lines) + "\n"

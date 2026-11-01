@@ -58,6 +58,14 @@ style lint, not a typing rule):
   non-Copy element; `for mut x` when the C++ copy is non-const),
   `for x in v.iter()`, `for x in v.iter_mut()`.
 
+FR-257 rows (structs): `#[derive(Clone)] struct S { pub f: T, .. }`
+(`pub struct` in a module unless internal), then `impl S { pub fn .. }`
+with `&self` / `&mut self` / no receiver; `pub fn new(..) -> S { return
+S { .. }; }` for a constructor; a struct of the same module is bare, any
+other `crate::a::S`; `S { f: e, g }` (field-init shorthand exactly when the
+value is a non-reference variable of the field's name); `S::f(..)`,
+`r.m(..)`, `p.f`, `self.f`.
+
 FR-260 rows (namespaces): a C++ named namespace is a `mod`, one block per
 namespace (N13), contents indented one level; a nested one is `pub mod`
 (a private nested module is unreachable from the root, E0603).  A function
@@ -87,14 +95,23 @@ class PrintError(Exception):
     pass
 
 
-def rs_ty(t):
+def rs_ty(t, ns=()):
     if isinstance(t, K.VecT):
-        return "Vec<%s>" % rs_ty(t.elem)
+        return "Vec<%s>" % rs_ty(t.elem, ns)
     if isinstance(t, K.StrT):
         return "String"
     if isinstance(t, K.RefT):
-        return "&%s%s" % ("mut " if t.mutable else "", rs_ty(t.inner))
+        return "&%s%s" % ("mut " if t.mutable else "", rs_ty(t.inner, ns))
+    if isinstance(t, K.StructT):
+        return rs_path(t.path, ns)
     return t.name
+
+
+def rs_path(path, ns):
+    """FR-257 (FR-260's rule for items): a struct of the SAME module is
+    bare, any other is `crate::`-absolute."""
+    sns, leaf = K.split_path(path)
+    return leaf if sns == tuple(ns) else "crate::" + path
 
 
 def int_lit(e, in_cast=False):
@@ -120,11 +137,19 @@ class _Printer:
         return "crate::bx::" if self.ns else "bx::"
 
     def callee(self, path):
-        """FR-260: bare in the same module, otherwise `crate::`-absolute."""
+        """FR-260: bare in the same module, otherwise `crate::`-absolute.
+        FR-257: an associated function (static member / `new`) is `S::f`
+        when S is in the same module."""
+        if TC.recv_of(self.sigs).get(path):
+            sp, leaf = path.rsplit("::", 1)
+            return rs_path(sp, self.ns) + "::" + leaf
         ns, leaf = K.split_path(path)
         if ns == self.ns:
             return leaf
         return "crate::" + path
+
+    def rty(self, t):
+        return rs_ty(t, self.ns)
 
     def ty(self, e, scope):
         return TC.type_of(e, scope, self.sigs)
@@ -139,7 +164,8 @@ class _Printer:
         if isinstance(e, K.Var):
             return not self.is_ref(e, scope)
         if isinstance(e, (K.IntLit, K.FloatLit, K.BoolLit, K.Call, K.StrLit, K.Clone, K.Index, K.Len,
-                          K.IsEmpty, K.VecLit, K.VecFill, K.StrNew, K.StrFrom, K.Substr, K.ToStr)):
+                          K.IsEmpty, K.VecLit, K.VecFill, K.StrNew, K.StrFrom, K.Substr, K.ToStr, K.Field,
+                          K.MethodCall, K.StructLit)):
             return True
         if isinstance(e, K.Binary) and self.is_wrapping(e, scope):
             return True
@@ -173,7 +199,7 @@ class _Printer:
             finally:
                 self.in_cast = saved
         if isinstance(e, (K.Clone, K.Index, K.ByteAt, K.Len, K.IsEmpty, K.VecLit, K.VecFill, K.StrNew,
-                          K.StrFrom, K.Substr, K.ToStr)):
+                          K.StrFrom, K.Substr, K.ToStr, K.Field, K.StructLit, K.MethodCall)):
             saved, self.in_cast = self.in_cast, 0
             try:
                 return self.nc_expr(e, scope)
@@ -250,6 +276,23 @@ class _Printer:
     def nc_expr(self, e, scope):
         if isinstance(e, K.Clone):
             return self.recv(e.operand, scope) + ".clone()"
+        if isinstance(e, K.Field):
+            return "%s.%s" % (self.recv(e.base, scope), e.name)
+        if isinstance(e, K.StructLit):
+            sd = TC.structs_of(self.sigs)[e.path]
+            parts = []
+            for fd, v in zip(sd.fields, e.values):
+                if isinstance(v, K.Var) and v.name == fd.name and not self.is_ref(v, scope):
+                    parts.append(fd.name)  # field-init shorthand
+                else:
+                    parts.append("%s: %s" % (fd.name, self.typed(v, scope)))
+            head = rs_path(e.path, self.ns)
+            return "%s { %s }" % (head, ", ".join(parts)) if parts else head + " {}"
+        if isinstance(e, K.MethodCall):
+            rt = self.ty(e.recv, scope)
+            sig = self.sigs[TC.method_path(rt.path, e.name)]
+            return "%s.%s(%s)" % (self.recv(e.recv, scope), e.name,
+                                  ", ".join(self.arg(pt, a, scope) for pt, a in zip(sig[0], e.args)))
         if isinstance(e, K.Index):
             return "%s[%s]" % (self.recv(e.base, scope), self.expr(e.index, scope))
         if isinstance(e, K.ByteAt):
@@ -260,7 +303,7 @@ class _Printer:
             return self.recv(e.base, scope) + ".is_empty()"
         if isinstance(e, K.VecLit):
             if not e.elems:
-                return "Vec::<%s>::new()" % rs_ty(e.elem)
+                return "Vec::<%s>::new()" % self.rty(e.elem)
             return "vec![%s]" % ", ".join(self.copied(x, scope) for x in e.elems)
         if isinstance(e, K.VecFill):
             return "vec![%s; %s]" % (self.copied(e.value, scope), self.expr(e.count, scope))
@@ -304,7 +347,7 @@ class _Printer:
             self.block_body(s, scope, d + 1)
             self.emit(d, "}")
         elif isinstance(s, K.Let):
-            self.emit(d, "let %s%s: %s = %s;" % ("mut " if s.mutable else "", s.name, rs_ty(s.ty),
+            self.emit(d, "let %s%s: %s = %s;" % ("mut " if s.mutable else "", s.name, self.rty(s.ty),
                                                  self.typed(s.init, scope)))
             scope.declare(s.name, s.ty, s.mutable)
         elif isinstance(s, K.Assign):
@@ -433,14 +476,41 @@ class _Printer:
     def func(self, f):
         scope = TC.Scope()
         ps = []
+        if f.recv in ("ref", "mut"):
+            ps.append("&mut self" if f.recv == "mut" else "&self")
+            scope.declare("self", K.RefT(K.StructT(K.path_of(f.ns, f.owner)), f.recv == "mut"), False)
         for p in f.params:
-            ps.append("%s%s: %s" % ("mut " if p.mutable else "", p.name, rs_ty(p.ty)))
+            ps.append("%s%s: %s" % ("mut " if p.mutable else "", p.name, self.rty(p.ty)))
             scope.declare(p.name, p.ty, p.mutable)
-        ret = "" if f.ret == K.UNIT else " -> " + rs_ty(f.ret)
-        vis = "pub " if f.ns and not f.internal else ""
+        ret = "" if f.ret == K.UNIT else " -> " + self.rty(f.ret)
+        vis = "pub " if (f.ns and not f.internal) or f.owner else ""
         self.emit(0, "%sfn %s(%s)%s {" % (vis, f.name, ", ".join(ps), ret))
         self.block_body(f.body, scope, 1, same=True)
         self.emit(0, "}")
+
+    def struct(self, sd):
+        """FR-257: `#[derive(Clone)] struct S { pub f: T, .. }` (`pub struct`
+        inside a module), then `impl S { pub fn .. }` when it has member
+        functions."""
+        self.emit(0, "#[derive(Clone)]")
+        head = "%sstruct %s" % ("pub " if sd.ns and not sd.internal else "", sd.name)
+        if not sd.fields:
+            self.emit(0, head + " {}")
+        else:
+            self.emit(0, head + " {")
+            for fd in sd.fields:
+                self.emit(1, "pub %s: %s," % (fd.name, self.rty(fd.ty)))
+            self.emit(0, "}")
+        if sd.methods:
+            self.lines.append("")
+            self.emit(0, "impl %s {" % sd.name)
+            self.base += 1
+            for i, m in enumerate(sd.methods):
+                if i:
+                    self.lines.append("")
+                self.func(m)
+            self.base -= 1
+            self.emit(0, "}")
 
 
 def rs_print(program):
@@ -459,7 +529,7 @@ def rs_print(program):
         if p.lines and not p.lines[-1].endswith("{"):
             p.lines.append("")
 
-    for f in program.funcs():
+    for f in program.items:
         # N13 makes each module's items contiguous, so one walk opens and
         # closes every `mod` block exactly once.
         common = 0
@@ -478,7 +548,10 @@ def rs_print(program):
         p.base = len(open_ns)
         p.ns = f.ns
         gap()
-        p.func(f)
+        if isinstance(f, K.StructDef):
+            p.struct(f)
+        else:
+            p.func(f)
     while open_ns:
         open_ns = open_ns[:-1]
         p.base = len(open_ns)
