@@ -95,6 +95,28 @@ FR-261 (pointers), measured on the same clang:
   pointer local; `&v[i]` is `&` over an operator[] call (N17: the suffix).
 * a `T*` passed for `const T*` is a NoOp ImplicitCastExpr (seen through);
   `nullptr` / `0` for a pointer is NullToPointer, `if (p)` PointerToBoolean.
+
+FR-259, measured on the same clang:
+
+* a REFERENCE's pointee (`const std::vector<uint8_t> &`) and a function
+  type's return (`uint32_t (int)`) carry no desugared spelling either, so
+  the <cstdint>/<cstddef> names are resolved in every written spelling
+  (normal form N20) -- unless the TU declares one of those names as a
+  typedef of a DIFFERENT type (anywhere: a header's namespace too) or as a
+  class / enum, which turns the resolution off (the spellings keep their
+  residual).  A TypedefType's nested `decl` reference has no `type` and is
+  not a declaration.
+* a free function's `inline` / `static` is the FunctionDecl's `inline` /
+  `storageClass` (normal form N21).
+* an `auto` VarDecl's `type` is the DEDUCED type (`size_t`, `const
+  value_type` desugaring to `const unsigned char`, `int16_t &` for `auto&`),
+  read like a written one (N22); a lambda's is `(lambda at FILE:L:C)`.
+* `c ? a : b` is a ConditionalOperator [cond, then, else] whose arms carry
+  the usual arithmetic conversions as ImplicitCastExprs (so the Kernel arms
+  have one type) and whose condition is converted to bool; it is an LVALUE
+  when both arms are lvalues of one type, read through LValueToRValue.
+* `x++` / `++x` is a UnaryOperator `++` with `isPostfix`; used as a value it
+  is not a statement of its own.
 """
 
 import bisect
@@ -137,19 +159,29 @@ _STRING_SPELLINGS = (
 )
 
 
-def parse_cxx_type(q, struct=None):
+def resolve_typedefs(q):
+    """N20: the <cstdint>/<cstddef> names in a written spelling -> their
+    LP64 builtin type (also inside template arguments)."""
+    return _INT_TYPEDEF_RE.sub(lambda m: INT_TYPEDEFS.get(m.group(0), m.group(0)), q)
+
+
+def parse_cxx_type(q, struct=None, typedefs=True):
     """A clang type spelling -> (Kernel type or None, top-level const).
 
     References become RefT; `const` under a reference makes it shared.
     FR-257: ``struct(name)`` resolves a record name to a StructT (or None).
+    FR-259: with ``typedefs`` the <cstdint>/<cstddef> names are resolved
+    (normal form N20).
     """
     if q is None:
         return None, False
     q = q.strip()
+    if typedefs:
+        q = resolve_typedefs(q)
     if q.endswith("&&"):
         return None, False
     if q.endswith("&"):
-        inner, const = parse_cxx_type(q[:-1], struct)
+        inner, const = parse_cxx_type(q[:-1], struct, typedefs)
         if inner is None or isinstance(inner, (K.RefT, K.PtrT)):
             return None, False
         return K.RefT(inner, not const), False
@@ -167,8 +199,7 @@ def parse_cxx_type(q, struct=None):
         bare = body[len("const "):].strip() if bconst else body
         if bare.endswith(" const"):
             bconst, bare = True, bare[:-len(" const")].strip()
-        bare = _POINTEE_TYPEDEF_RE.sub(lambda m: POINTEE_TYPEDEFS.get(m.group(0), m.group(0)), bare)
-        inner, iconst = parse_cxx_type(bare, struct)
+        inner, iconst = parse_cxx_type(bare, struct, typedefs)
         if inner is None or inner == K.UNIT or isinstance(inner, (K.RefT, K.PtrT)) or "volatile" in body:
             return None, top
         return K.PtrT(inner, not (bconst or iconst)), top
@@ -176,6 +207,11 @@ def parse_cxx_type(q, struct=None):
     if q.startswith("const "):
         const = True
         q = q[len("const "):].strip()
+    elif q.endswith(" const"):
+        # FR-259: clang spells a DEDUCED (`auto`) const type east-const
+        # (`unsigned char const &`, `P const &`)
+        const = True
+        q = q[:-len(" const")].strip()
     if "volatile" in q:
         return None, const
     if q in TYPE_MAP:
@@ -189,7 +225,7 @@ def parse_cxx_type(q, struct=None):
             return None, const
         if len(args) not in (1, 2):
             return None, const
-        el, econst = parse_cxx_type(args[0], struct)
+        el, econst = parse_cxx_type(args[0], struct, typedefs)
         if el is None or econst or isinstance(el, K.RefT):
             return None, const
         return K.VecT(el), const
@@ -211,14 +247,19 @@ def is_ptr_spelling(q):
 # (`const uint8_t *`), so the <cstdint>/<cstddef> names a pointee is
 # commonly written with are resolved here, to the type their scalar
 # desugaring maps to on LP64 (uint64_t is `unsigned long`, like size_t).
-POINTEE_TYPEDEFS = {
-    "uint8_t": "unsigned char", "std::uint8_t": "unsigned char",
-    "int32_t": "int", "std::int32_t": "int", "uint32_t": "unsigned int", "std::uint32_t": "unsigned int",
-    "int64_t": "long", "std::int64_t": "long", "uint64_t": "unsigned long", "std::uint64_t": "unsigned long",
-    "size_t": "unsigned long", "std::size_t": "unsigned long",
+# FR-259 (N20): neither has a reference's pointee nor a function's return
+# type, so every written spelling is resolved; int8_t / int16_t / uint16_t /
+# ptrdiff_t joined.
+INT_TYPEDEFS = {
+    "int8_t": "signed char", "uint8_t": "unsigned char", "int16_t": "short", "uint16_t": "unsigned short",
+    "int32_t": "int", "uint32_t": "unsigned int", "int64_t": "long", "uint64_t": "unsigned long",
+    "size_t": "unsigned long", "ptrdiff_t": "long",
 }
-# (also inside a pointee's template arguments: `std::vector<uint8_t> *`)
-_POINTEE_TYPEDEF_RE = re.compile(r"(?<![\w:])(?:std::)?(?:u?int(?:8|32|64)_t|size_t)\b")
+INT_TYPEDEFS.update({"std::" + k: v for k, v in list(INT_TYPEDEFS.items())})
+POINTEE_TYPEDEFS = INT_TYPEDEFS  # (FR-261's name)
+# (also inside template arguments: `std::vector<uint8_t> *`)
+_INT_TYPEDEF_RE = re.compile(r"(?<![\w:])(?:std::)?(?:u?int(?:8|16|32|64)_t|size_t|ptrdiff_t)\b")
+_POINTEE_TYPEDEF_RE = _INT_TYPEDEF_RE
 
 
 def run_clang(path, clang="clang++"):
@@ -237,6 +278,8 @@ TYPE_MAP = {
     "unsigned long": K.USIZE, "unsigned long long": K.U64, "size_t": K.USIZE,
     "std::size_t": K.USIZE, "double": K.F64, "bool": K.BOOL, "char": K.I8,
     "unsigned char": K.U8, "void": K.UNIT,
+    # FR-259: `signed char` is int8_t's type (N20: canonical `char`)
+    "signed char": K.I8, "short": K.I16, "unsigned short": K.U16,
 }
 
 OPCODES = {
@@ -381,6 +424,7 @@ class CxxImporter:
         self.record_cpath = {}
         self.ctor_types = {}  # struct path -> its user constructor's type string
         self.nonneg_ids = set()  # FR-261: decl ids of counting-loop variables with a literal lower bound
+        self.td_ok = True  # FR-259 (N20): may the <cstdint> names be resolved in written spellings?
 
     # -------------------------------------------------------------- utils
     def is_main(self, f):
@@ -429,9 +473,9 @@ class CxxImporter:
             # FR-261: the pointee's constness is not top-level const
             kt, top = (None, False)
             if d0 and is_ptr_spelling(d0):
-                kt, top = parse_cxx_type(d0, self.struct_canonical)
+                kt, top = parse_cxx_type(d0, self.struct_canonical, self.td_ok)
             if kt is None:
-                kt, top = parse_cxx_type(q, self.struct_written)
+                kt, top = parse_cxx_type(q, self.struct_written, self.td_ok)
             return kt, top, q
         const = False
         s = q
@@ -453,9 +497,9 @@ class CxxImporter:
         # no desugared form (a reference's pointee, a function type).
         kt, c2 = (None, False)
         if d:
-            kt, c2 = parse_cxx_type(d, self.struct_canonical)
+            kt, c2 = parse_cxx_type(d, self.struct_canonical, self.td_ok)
         if kt is None:
-            kt, c3 = parse_cxx_type(q, self.struct_written)
+            kt, c3 = parse_cxx_type(q, self.struct_written, self.td_ok)
             c2 = c2 or c3
         if kt is not None:
             return kt, const or c2, q
@@ -512,6 +556,8 @@ class CxxImporter:
                     self.decl_info[x["id"]] = x
                     if not in_main and x.get("kind") == "FunctionDecl" and x.get("name") == "printf":
                         self.libc_printf.add(x["id"])
+                    if x.get("name") in INT_TYPEDEFS:
+                        self.typedef_seen(x)
 
             visit(n, trk.cur)
             trk.node(rest, visit)
@@ -564,6 +610,22 @@ class CxxImporter:
         # keep source order
         items.sort(key=lambda it: (it.loc.line, it.loc.col) if it.loc else (0, 0))
         return K.Program(tuple(items))
+
+    def typedef_seen(self, x):
+        """FR-259 (N20): a declaration named like a <cstdint>/<cstddef> type.
+        The real ones (global, std) are typedefs of the expected builtin; a
+        typedef of any other type, or a class/enum of that name, may be what
+        a written spelling means, so the resolution is turned off."""
+        k = x.get("kind")
+        if k in ("TypedefDecl", "TypeAliasDecl"):
+            if "type" not in x:
+                return  # a reference to a declaration (a TypedefType's `decl`), not one
+            t = x.get("type") or {}
+            d = t.get("desugaredQualType") or t.get("qualType")
+            if d != INT_TYPEDEFS[x["name"]]:
+                self.td_ok = False
+        elif k in ("CXXRecordDecl", "RecordDecl", "EnumDecl", "ClassTemplateDecl", "TypeAliasTemplateDecl"):
+            self.td_ok = False
 
     # -------------------------------------------------------------- FR-260
     def index_ns(self, n, path, internal):
@@ -800,7 +862,7 @@ class CxxImporter:
             rs = self.ret_type_str(m)
             if rs.endswith("const"):
                 rs = rs[:-len("const")].strip()
-            ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written)[0]
+            ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0]
         self.sigs[mpath] = (tuple(ptys), ret)
         self.sigs.recv[mpath] = recv
 
@@ -871,7 +933,7 @@ class CxxImporter:
             if p.get("kind") == "ParmVarDecl":
                 ptys.append(self.map_type(p.get("type"))[0])
         rs = self.ret_type_str(n)
-        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written)[0]
+        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0]
         return tuple(ptys), ret
 
     # -------------------------------------------------------------- funcs
@@ -885,10 +947,14 @@ class CxxImporter:
             name = "new" if recv == "ctor" else name
             if n.get("inline"):
                 pre.append(K.ResidualStmt("inline function", floc))
-        elif n.get("storageClass") in ("static", "extern"):
-            pre.append(K.ResidualStmt("%s function" % n["storageClass"], floc))
-        if n.get("inline"):
-            pre.append(K.ResidualStmt("inline function", floc))
+                pre.append(K.ResidualStmt("inline function", floc))
+        elif n.get("storageClass") == "extern":
+            pre.append(K.ResidualStmt("extern function", floc))
+        elif n.get("storageClass") == "static" and ns:
+            # FR-259 (N21): internal linkage inside a named namespace is the
+            # anonymous-namespace member it means (Rust: a private `fn`);
+            # at the root it is dropped like `inline` (N14)
+            internal = True
         if n.get("constexpr"):
             pre.append(K.ResidualStmt("constexpr function", floc))
         if n.get("variadic"):
@@ -921,7 +987,7 @@ class CxxImporter:
         rs = self.ret_type_str(n)
         if rs.endswith(" const") and recv == "ref":
             rs = rs[:-len(" const")]
-        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written)[0]
+        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0]
         if recv == "ctor":
             ret = K.StructT(owner["path"])
             body = self.ctor_body(n, owner, floc)
@@ -1124,7 +1190,10 @@ class CxxImporter:
         if head.startswith("const "):
             head = head[len("const "):].lstrip()
         if head.startswith("auto") and (len(head) == 4 or not (head[4].isalnum() or head[4] == "_")):
-            return K.ResidualStmt("auto-typed declaration", L)
+            # FR-259 (N22): `type` is clang's DEDUCED type, read like a written
+            # one (a reference, an iterator or a lambda keeps a residual)
+            if "(lambda at " in (spelled or ""):
+                return K.ResidualStmt("auto-typed declaration of a lambda", L)
         if head.startswith("decltype"):
             return K.ResidualStmt("decltype-typed declaration", L)
         if d.get("storageClass") in ("static", "extern"):
@@ -1241,7 +1310,7 @@ class CxxImporter:
                     return K.CompoundStore(op, tgt, K.IntLit(1, T, L), L)
                 if T == K.F64:
                     return K.CompoundStore(op, tgt, K.FloatLit("1.0", L), L)
-                if T in (K.I8, K.U8):
+                if T in K.SMALL_INT:
                     return K.Store(tgt, K.Cast(T, K.Binary(op, K.Cast(K.I32, tgt, L), K.IntLit(1, K.I32, L), L), L), L)
             return self.rstmt(n, "increment of something other than a local variable")
         v = self.scope.lookup(name)
@@ -1255,7 +1324,7 @@ class CxxImporter:
             return K.CompoundAssign(op, name, K.IntLit(1, T, L), L)
         if T == K.F64:
             return K.CompoundAssign(op, name, K.FloatLit("1.0", L), L)
-        if T in (K.I8, K.U8):
+        if T in K.SMALL_INT:
             return K.Assign(name, K.Cast(T, K.Binary(op, K.Cast(K.I32, K.Var(name, L), L),
                                                      K.IntLit(1, K.I32, L), L), L), L)
         return self.rstmt(n, "increment of a bool")
@@ -1405,7 +1474,7 @@ class CxxImporter:
         L = getattr(e, "loc", None)
         if t == K.BOOL or t is None:
             return e
-        if t in (K.I8, K.U8):
+        if t in K.SMALL_INT:
             return K.Binary("ne", K.Cast(K.I32, e, L), K.IntLit(0, K.I32, L), L)
         if t in K.ARITH_INT:
             return K.Binary("ne", e, K.IntLit(0, t, L), L)
@@ -1503,7 +1572,7 @@ class CxxImporter:
         if k == "UnaryOperator":
             op = n.get("opcode")
             if op in ("++", "--"):
-                return self.rexpr(n, "increment/decrement used as a value")
+                return self.incdec_value(n)
             if op == "&":
                 return self.addr_of(n)
             if op == "*":
@@ -1586,7 +1655,34 @@ class CxxImporter:
             return self.subscript(n)
         if k == "CXXThisExpr" and self.cur is not None and self.cur[1] in ("ref", "mut"):
             return K.AddrOf(K.Var("self", L), L)  # FR-261: `this` is `&*this`
+        if k == "ConditionalOperator":
+            return self.conditional(n)
         return self.rexpr(n, friendly(k))
+
+    # ================================================== FR-259
+    def conditional(self, n):
+        """`c ? a : b` of a scalar type <=> Cond (both arms already converted
+        to clang's result type; only the chosen one is evaluated)."""
+        T, _, spelled = self.map_type(n.get("type"))
+        if T not in K.ALL_PRIMS:
+            return self.rexpr(n, "conditional operator `?:` of type '%s' (the subset's `?:` yields a scalar)"
+                              % spelled)
+        c, a, b = n["inner"][:3]
+        return K.Cond(self.truthy(self.expr(c)), self.expr(a), self.expr(b), self.loc(n))
+
+    def incdec_value(self, n):
+        """`++x` / `x++` / `--x` / `x--` used as a value, on an integer
+        variable of an arithmetic type (the sequencing rule -- no other
+        mention of x in the statement -- is the checker's)."""
+        L = self.loc(n)
+        name = self.local_ref(n["inner"][0])
+        if name is not None:
+            v = self.scope.lookup(name)
+            T = K.deref(v[0]) if v else None
+            if T in K.ARITH_INT:
+                return K.IncDec(K.Var(name, self.loc(self.strip(n["inner"][0]))),
+                                "add" if n.get("opcode") == "++" else "sub", bool(n.get("isPostfix")), L)
+        return self.rexpr(n, "increment/decrement used as a value")
 
     # ================================================== FR-261: pointers
     def is_ptr_node(self, n):
@@ -1610,7 +1706,7 @@ class CxxImporter:
         u = self.strip(n)
         if u.get("kind") == "DeclRefExpr" and u.get("referencedDecl", {}).get("id") in self.nonneg_ids:
             return True
-        bits = {"i8": 8, "u8": 8, "i32": 32, "u32": 32, "i64": 64, "u64": 64, "usize": 64}
+        bits = {"i8": 8, "u8": 8, "i16": 16, "u16": 16, "i32": 32, "u32": 32, "i64": 64, "u64": 64, "usize": 64}
         if isinstance(e, K.Cast) and e.ty in K.SIGNED:
             t = self.ty_of(e.operand)
             return t in K.UNSIGNED and bits[t.name] < bits[e.ty.name]
@@ -1713,6 +1809,9 @@ class CxxImporter:
                     continue
                 if self.is_this_deref(self.strip_tmp(a)):
                     args.append(K.Var("self", self.loc(a)))
+                    continue
+                if not pt.mutable and self.strip_tmp(a).get("kind") == "ConditionalOperator":
+                    args.append(self.expr(a))  # FR-259: a `const T&` reads the chosen arm's value
                     continue
                 tgt = self.elem_target(a)
                 if isinstance(tgt, (K.Index, K.Field)):
@@ -2035,6 +2134,13 @@ class CxxImporter:
             me = self.strip(u["inner"][0])
             if me.get("kind") == "MemberExpr" and me.get("name") in ("front", "back"):
                 return self.member_expr(u)
+        if k == "ConditionalOperator":
+            # FR-259: a `?:` is a value; as a place (`&(c ? x : y)`, a copy of
+            # `c ? s : t`) it would be one of two objects
+            e = self.conditional(u)
+            if isinstance(e, K.ResidualExpr):
+                return e
+            return self.rexpr(u, "conditional operator `?:` used as an lvalue")
         return self.rexpr(u, "copy of something other than a variable or element")
 
     def op_name(self, n):
@@ -2244,6 +2350,8 @@ class CxxImporter:
         `p.f` / `this->f`), a ResidualStmt, or None."""
         u = self.strip_tmp(n)
         k = u.get("kind")
+        if k == "ConditionalOperator":
+            return self.rstmt(u, "conditional operator `?:` used as an lvalue")  # FR-259
         if k == "MemberExpr":
             e = self.member_access(u)
             if isinstance(e, K.ResidualExpr):
@@ -2342,8 +2450,8 @@ class CxxImporter:
         head = self.text_at(vd).lstrip()
         if head.startswith("const "):
             head = head[len("const "):].lstrip()
-        if head.startswith("auto") and (len(head) == 4 or not (head[4].isalnum() or head[4] == "_")):
-            return K.ResidualStmt("auto-typed declaration", self.loc(vd))
+        # FR-259 (N22): an `auto` / `const auto&` / `auto&` loop variable has
+        # clang's deduced type, checked against the element type below
         it = self.borrowed(rng["inner"][0])
         if isinstance(it, K.ResidualExpr):
             return K.ResidualStmt(it.reason, it.loc)

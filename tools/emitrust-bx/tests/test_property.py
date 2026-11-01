@@ -89,9 +89,11 @@ def test_generator_size_and_coverage(programs):
         assert seen["op:" + op] >= 10, op
     for sk in ("d", "d-", "d0", "f", "c", "s"):
         assert seen["spec:" + sk] >= 10, sk
-    for t in K.INT_TYPES:
+    # (FR-259's i16 / u16 are pinned in test_fr259's own population; these
+    # are exactly the FR-250 types, same thresholds)
+    for t in [x for x in gen.FR250_PRIMS if K.is_int(x)]:
         assert seen["lit:" + t.name] >= 10, t
-    for t in K.ALL_PRIMS:
+    for t in gen.FR250_PRIMS:
         if t != K.BOOL:
             assert seen["cast:" + t.name] >= 10, t
 

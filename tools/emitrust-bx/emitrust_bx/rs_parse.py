@@ -31,6 +31,15 @@ an Offset), `std::slice::from_ref(&x)` / `std::slice::from_mut(&mut x)`
 (an AddrOf); `p = &p[k..];` is normalized to `p += k` (N18).  A bare
 `x[k..]` and a range with an end are located errors.
 
+FR-259: `i16` / `u16`; an `if c { a } else { b }` EXPRESSION (each arm one
+expression, `else if` chains) is a Cond; a block expression is accepted
+only as the canonical increment `{ x += 1; x }` / `{ x += 1; x - 1 }` /
+`{ x -= 1; x }` / `{ x -= 1; x + 1 }` (unsigned `{ x =
+x.wrapping_add(1u32); x }` ..; `*x` for a reference), an IncDec.  Neither
+may be followed, unparenthesized, by a method call, an index, `as` or a
+binary operator (rustc's statement-position rules make those fragile; the
+printer parenthesizes them).
+
 FR-257: `#[derive(Clone)] [pub] struct S { pub f: T, .. }` (exactly that
 attribute; every field `pub`; a private struct in a module is internal),
 one `impl S { pub fn .. }` per struct in its module (`&self`, `&mut self`,
@@ -50,7 +59,7 @@ from . import kernel as K
 from .kernel import Loc
 from .rs_lex import LexError, lex
 
-RUST_TYPES = {"i8": K.I8, "u8": K.U8, "i32": K.I32, "i64": K.I64, "u32": K.U32,
+RUST_TYPES = {"i8": K.I8, "u8": K.U8, "i16": K.I16, "u16": K.U16, "i32": K.I32, "i64": K.I64, "u32": K.U32,
               "u64": K.U64, "usize": K.USIZE, "f64": K.F64, "bool": K.BOOL}
 
 BIN_LEVELS = [
@@ -769,6 +778,8 @@ class _Parser:
                 stack.extend([n.lhs, n.rhs])
             elif isinstance(n, K.Cast):
                 stack.append(n.operand)
+            elif isinstance(n, K.Cond):
+                stack.extend([n.then, n.els])  # (the arms take the cast's expectation too)
 
     def unary(self):
         t = self.tok
@@ -802,7 +813,14 @@ class _Parser:
         return self.postfix()
 
     def postfix(self):
+        start = self.tok
         e = self.primary()
+        if isinstance(e, (K.Cond, K.IncDec)) and not (start.kind == "punct" and start.text == "("):
+            t = self.tok
+            if t.kind == "punct" and (t.text in (".", "[", "?") or any(t.text in lv for lv in BIN_LEVELS)) \
+                    or (t.kind == "ident" and t.text == "as"):
+                self.unsupported(t, "`%s` after an unparenthesized %s (the subset parenthesizes it)" % (
+                    t.text, "`if` expression" if isinstance(e, K.Cond) else "block expression"))
         while True:
             t = self.tok
             if t.kind == "punct" and t.text == ".":
@@ -992,6 +1010,56 @@ class _Parser:
         self.expect("}")
         return K.StructLit(_RawPath(raw, self.ns, t.loc), tuple(values), t.loc, tuple(names))
 
+    # ---------------------------------------------------- FR-259
+    def if_expr(self):
+        """`if c { a } else { b }` (`else if ..` chains) as an expression."""
+        t = self.expect("if")
+        if self.at("let"):
+            self.unsupported(self.tok, "`if let`")
+        cond = self.cond_expr()
+        then = self.if_arm()
+        if not self.at("else"):
+            self.unsupported(t, "`if` expression without `else`")
+        self.next()
+        els = self.if_expr() if self.at("if") else self.if_arm()
+        return K.Cond(cond, then, els, t.loc)
+
+    def if_arm(self):
+        self.expect("{")
+        e = self.free_expr()
+        if not self.at("}"):
+            self.unsupported(self.tok, "`if` expression arm other than one expression")
+        self.next()
+        return e
+
+    def incdec_block(self):
+        """A block expression: only the canonical increment of FR-259."""
+        t = self.expect("{")
+        bad = ("block expression other than the canonical increment `{ x += 1; x }` / `{ x += 1; x - 1 }` "
+               "(`{ x = x.wrapping_add(1u32); x }` when unsigned)")
+        saved, self.no_struct = self.no_struct, False
+        try:
+            lhs = self.unary()
+            op = self.tok
+            if not (op.kind == "punct" and op.text in ("=", "+=", "-=")):
+                self.unsupported(t, bad)
+            self.next()
+            val = self.expr()
+            if not self.at(";"):
+                self.unsupported(t, bad)
+            self.next()
+            tail = self.expr()
+            if not self.at("}"):
+                self.unsupported(t, bad)
+            self.next()
+        finally:
+            self.no_struct = saved
+        shape = _incdec_shape(lhs, op.text, val, tail)
+        if shape is None:
+            self.unsupported(t, bad)
+        var, kop, post, wrapping, lit_ty = shape
+        return K.IncDec(K.Var(var.name, var.loc, var.spelling), kop, post, t.loc, (wrapping, lit_ty))
+
     def vec_macro(self, t):
         self.next()  # !
         self.expect("[")
@@ -1037,7 +1105,9 @@ class _Parser:
             if t.text in ("true", "false"):
                 self.next()
                 return K.BoolLit(t.text == "true", t.loc)
-            if t.text in ("if", "match", "loop", "while", "for", "unsafe", "move", "return",
+            if t.text == "if":
+                return self.if_expr()
+            if t.text in ("match", "loop", "while", "for", "unsafe", "move", "return",
                           "break", "continue", "let"):
                 self.unsupported(t, "`%s` expression" % t.text)
             self.next()
@@ -1080,11 +1150,47 @@ class _Parser:
                 self.unsupported(self.tok, "tuple")
             self.expect(")")
             return e
+        if t.kind == "punct" and t.text == "{":
+            return self.incdec_block()
         if t.kind == "punct" and t.text == "|":
             self.unsupported(t, "closure")
         if t.kind == "punct" and t.text == "[":
             self.unsupported(t, "array expression")
         raise ParseError(t.loc, "expected an expression, found %s" % self.describe(t))
+
+
+def _incdec_shape(stmt_lhs, stmt_op, stmt_val, tail):
+    """(var, op, post, wrapping, literal type) of a canonical increment block,
+    or None.  ``stmt_*``: the block's one statement `lhs op= val;` / `lhs = val;`."""
+    def one(x):
+        return isinstance(x, K.IntLit) and x.value == 1
+
+    def same(v):
+        return isinstance(v, K.Var) and v.name == stmt_lhs.name and v.spelling == stmt_lhs.spelling
+
+    if not isinstance(stmt_lhs, K.Var):
+        return None
+    if stmt_op in ("+=", "-="):
+        if not one(stmt_val):
+            return None
+        op, wrapping, lit = ("add" if stmt_op == "+=" else "sub"), False, stmt_val
+    elif stmt_op == "=":
+        v = stmt_val
+        if not (isinstance(v, K.Binary) and v.spelling == "wrapping" and v.op in K.INCDEC_OPS and same(v.lhs)
+                and one(v.rhs)):
+            return None
+        op, wrapping, lit = v.op, True, v.rhs
+    else:
+        return None
+    inv = "sub" if op == "add" else "add"
+    if same(tail):
+        post = False
+    elif (isinstance(tail, K.Binary) and tail.op == inv and same(tail.lhs) and one(tail.rhs)
+          and tail.rhs.ty == lit.ty and (tail.spelling == "wrapping") == wrapping):
+        post = True
+    else:
+        return None
+    return stmt_lhs, op, post, wrapping, lit.ty
 
 
 def _tc():

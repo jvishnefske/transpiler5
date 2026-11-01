@@ -1762,11 +1762,11 @@ anchor = "FR-258 (opened 2026-11-01, from FR-256): **THE WEEKLY INDICATOR"
 [[items]]
 id = "FR-259"
 kind = "feature"
-status = "open"
+status = "landed"
 rank = 61
 size = "M"
 title = "BX cheap syntactic breadth: static/inline, ?:, main argv, early exit, ++ as value, deferred init"
-summary = "Broadest observed-function tags that hide nothing; census upper bound ~50 functions / ~25 programs, halve it."
+summary = "Int typedefs, static/inline, auto, ?:, incdec-as-value; frontier EMIT 6 -> 18/392. Expected TRACTOR +0."
 blocked_by = ["FR-251"]
 anchor = "FR-259 (opened 2026-11-01, from FR-256): **BX CHEAP SYNTACTIC"
 
