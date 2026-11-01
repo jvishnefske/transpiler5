@@ -1802,3 +1802,14 @@ title = "BX multi-TU projects: cross-TU calls resolved, one crate"
 summary = "Spike: header visibility +3..+6 strict EMIT, cross-TU linking +0; one-TU normalizer, not a bijection row. Kill line unreachable."
 blocked_by = ["FR-260"]
 anchor = "FR-262 (opened 2026-11-01, from FR-258): **BX MULTI-TU"
+
+[[items]]
+id = "FR-263"
+kind = "feature"
+status = "landed"
+rank = 60
+size = "S"
+title = "BX print order: unsequenced printing calls refused"
+summary = "Two calls that may print, unsequenced in one statement, have two legal C++ outputs (g++ vs clang); refused, located, both directions. Expected TRACTOR +0."
+blocked_by = ["FR-252"]
+anchor = "FR-263 (opened 2026-11-01, from FR-252's verification): **BX PRINT ORDER"

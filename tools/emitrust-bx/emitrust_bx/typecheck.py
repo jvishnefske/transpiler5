@@ -290,7 +290,12 @@ def closure_info(body, sigs):
 
 
 def unsequenced_uses(exprs, name):
-    """FR-252: a second use of closure ``name`` (a call, or the closure passed
+    return unsequenced_hits(exprs, lambda e: isinstance(e, (K.ClosureCall, K.Var)) and e.name == name)
+
+
+def unsequenced_hits(exprs, hit, nested_ok=False):
+    """FR-252 (``unsequenced_uses``), generalized by FR-263 to any node
+    predicate ``hit``: a second use of closure ``name`` (a call, or the closure passed
     as an argument) that C++ does not sequence against another one in the
     statement whose expressions are ``exprs`` -- or None.  `&&`, `||` and
     `?:` sequence their operands (and only one `?:` arm runs); every other
@@ -307,7 +312,7 @@ def unsequenced_uses(exprs, name):
         if isinstance(e, K.Cond):
             parts = [uses(x) for x in (e.cond, e.then, e.els)]
             return sum((p[0] for p in parts), []), next((p[1] for p in parts if p[1] is not None), None)
-        own = [e] if isinstance(e, (K.ClosureCall, K.Var)) and e.name == name else []
+        own = [e] if hit(e) else []
         groups = [own]
         bad = None
         for f in fields(e) if is_dataclass(e) else ():
@@ -322,7 +327,9 @@ def unsequenced_uses(exprs, name):
                     groups.append(u)
                     bad = bad or b
         flat = [x for g in groups for x in g]
-        if bad is None and sum(1 for g in groups if g) > 1:
+        # nested_ok (FR-263): a call's arguments are sequenced before its
+        # body, so a hit is unsequenced only with a SIBLING's hits
+        if bad is None and sum(1 for g in (groups[1:] if nested_ok else groups) if g) > 1:
             bad = flat[1]
         return flat, bad
 
@@ -968,6 +975,61 @@ def method_sigs(n, sigs):
             if recv_of(sigs).get(pth) in ("ref", "mut") and pth.rsplit("::", 1)[1] == n.name]
 
 
+def printing_funcs(program):
+    """FR-263: (paths of the functions, free and member, whose call may
+    print; paths of the functions whose CALLABLE parameter may print) -- a
+    fixpoint over the program.  A body prints when it contains a printf,
+    calls a printing function or method, or calls a callable parameter that
+    some call site binds to a printing closure (or forwards a callable
+    parameter to: conservative).  A local closure prints when its body
+    does.  Output order is the one effect two unsequenced calls can make
+    observable: `T&` arguments are already distinct and unmentioned
+    elsewhere in the statement, and the subset has no globals."""
+    funcs = program.all_funcs()
+    sigs = sigs_of(program)
+    out, via = set(), set()
+
+    def body_prints(body, f):
+        return any(isinstance(n, K.Print) or (isinstance(n, K.ClosureCall) and n.name in callables(f)
+                                              and f.path in via)
+                   or (isinstance(n, (K.Call, K.MethodCall)) and calls_printing(n, out)) for n in K.walk(body))
+
+    changed = True
+    while changed:
+        changed = False
+        for f in funcs:
+            clo = {n.name: body_prints(n.body, f) for n in K.walk(f.body) if isinstance(n, K.Closure)}
+            for n in K.walk(f.body):
+                if not isinstance(n, K.Call) or n.name in via or n.name not in sigs:
+                    continue
+                for pt, a in zip(sigs[n.name][0], n.args):
+                    a = a.operand if isinstance(a, K.Borrow) else a
+                    if isinstance(pt, K.RefT) and isinstance(pt.inner, K.FnT) and (
+                            not isinstance(a, K.Var) or clo.get(a.name, True)):
+                        via.add(n.name)
+                        changed = True
+                        break
+            if f.path not in out and body_prints(f.body, f):
+                out.add(f.path)
+                changed = True
+    return out, via
+
+
+def callables(f):
+    """FR-263: the callable parameters of ``f``."""
+    return {p.name for p in f.params if isinstance(p.ty, K.RefT) and isinstance(p.ty.inner, K.FnT)}
+
+
+def calls_printing(n, printing):
+    """FR-263: Call / MethodCall ``n`` resolves into ``printing`` (a method
+    whose receiver normalize has not resolved: any struct's, by name)."""
+    if isinstance(n, K.Call):
+        return n.name in printing
+    if n.owner:
+        return method_path(n.owner, n.name) in printing
+    return any(p.rsplit("::", 1)[-1] == n.name for p in printing)
+
+
 def closure_effects(sigs):
     """FR-252: closure name -> the ENCLOSING variables a call of it may
     modify (its by-reference captures it mutates), for the function being
@@ -1140,6 +1202,7 @@ class _Checker:
         self.program = program
         self.surface = surface
         self.sigs = sigs_of(program)
+        self.printing, self.param_prints = printing_funcs(program)  # FR-263
         self.errors = []
         self.ns = ()  # FR-260: the namespace of the function being checked
         self.internal = {}
@@ -1895,6 +1958,13 @@ class _Checker:
         self.sigs.closure_muts = {}
         cm, self.fnmut, self.mut_closures = closure_info(f.body, self.sigs)
         self.sigs.closure_muts = cm
+        # FR-263: local closure -> its body may print (by name, conservative
+        # over same-named closures)
+        self.closure_prints = {}
+        for c in (n for n in K.walk(f.body) if isinstance(n, K.Closure)):
+            self.closure_prints[c.name] = self.closure_prints.get(c.name, False) or any(
+                isinstance(n, K.Print) or (isinstance(n, (K.Call, K.MethodCall)) and calls_printing(n, self.printing))
+                for n in K.walk(c.body))
 
     def capture_vars(self, s):
         """One synthetic Var per capture of closure ``s`` (stable ids: the
@@ -2219,6 +2289,18 @@ class _Checker:
         self.stmt_alias(s)
         self.stmt_inner(s, scope, loop)
 
+    def prints(self, e):
+        """FR-263: a call that may print (``printing_funcs``): a local
+        closure whose body may, a callable parameter some call site binds
+        to one, a printing function."""
+        if isinstance(e, K.ClosureCall):
+            if e.name in self.closure_prints:
+                return self.closure_prints[e.name]
+            return self.cur is None or self.cur.path in self.param_prints
+        if isinstance(e, (K.Call, K.MethodCall)):
+            return calls_printing(e, self.printing)
+        return False
+
     def stmt_alias(self, s):
         """A variable a call may modify (passed by `T&`) is not mentioned
         anywhere else in the statement: C++ leaves the order of `bump(k) + k`
@@ -2244,6 +2326,15 @@ class _Checker:
                                            "in one statement without a sequence point between the calls (C++ "
                                            "leaves the order unspecified)" % nm)
                 return
+        # FR-263: two calls that may print, unsequenced against each other:
+        # `printf("%d %d", g(3), g(4))` prints g's lines in either order in
+        # C++ (g++ right to left, clang left to right), Rust left to right
+        hit = unsequenced_hits(exprs, self.prints, nested_ok=True)
+        if hit is not None:
+            self.err(hit.loc or s.loc, "unsupported: two calls that may print in one statement without a "
+                                       "sequence point between them (C++ leaves their order unspecified; "
+                                       "normalizer: evaluate each into a local first)")
+            return
         for n in (n for e in exprs for n in K.walk(e) if isinstance(n, K.IncDec)):
             # FR-259: `i++ + i` is unsequenced (undefined) in C++, `f(i++, i)`
             # unspecified, `x = x++` defined only since C++17 -- Rust fixes
