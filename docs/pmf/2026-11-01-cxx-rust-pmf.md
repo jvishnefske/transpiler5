@@ -256,3 +256,15 @@ URL: https://github.com/DARPA-TRACTOR-Program/Reports/blob/main/First_TRACTOR_Ev
   validation, behind an opt-in `--normalize`. The purpose is to make the search seam real
   and measurable on the frontier (`bx-frontier --bx-arg=--normalize`), not to chase
   criterion 1. If the measured gain is ≤ the halved estimate, stop adding rules and record it.
+
+### 2026-11-02 ~00:30 CST -- normalizer R1-R3: EMIT 18 -> 30 of 392 functions
+
+Three sound rewrites (for->while, do-while, post-incdec) moved woff2/brunsli EMIT from 18 to
+30 functions (4.6% -> 7.7%), 0 lost, each verified by byte-diff of the ORIGINAL against the
+normalized C++ and the Rust. Per rule: +8, then +4. That is real movement, but kill
+criterion 1 (30%) is still ~4x away, and the movers were the functions with a single blocker;
+what remains carries multi-tag sets (member functions, library calls, constructors, private
+members). The hybrid spike (an LLM rewrites blocked functions into the subset, certified by
+differential execution of the extracted original under sanitizers) is the measurement that
+decides whether the wedge closes that gap; it is blocked on a tool-permission decision, not
+on design.
