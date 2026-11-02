@@ -319,6 +319,12 @@ RULES = [
     # FR-254 normalizer guards (only under --normalize)
     (r"^(`for` loop|do-while loop) with a `continue` bound to it", "normalize: continue blocks loop rewrite", None),
     (r"^`for` loop with a condition variable", "normalize: for with condition variable", None),
+    (r"^increment/decrement used as a value on something other than a local variable or `\*p`",
+     "normalize: incdec operand", None),
+    (r"^increment/decrement used as a value inside `&&`", "normalize: incdec conditional", None),
+    (r"^increment/decrement of '.*' used as a value in a statement that calls a closure",
+     "normalize: incdec with indirect call", None),
+    (r"^increment/decrement used as a value in a `return` of type '(.*)'", "normalize: incdec return type", "type"),
     # FR-263
     (r"^two calls that may print in one statement", "sequencing: two printing calls (normalizer)", None),
     (r"^identifier '.*' is reserved by the canonical Rust spelling", "identifier: reserved by canonical spelling", None),

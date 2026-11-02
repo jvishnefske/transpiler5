@@ -1157,6 +1157,10 @@ class CxxImporter:
             return [self.as_block(n)]
         if k == "NullStmt":
             return []
+        if self.normalize:
+            r = self.post_incdec(n)
+            if r is not None:
+                return r
         if k == "DeclStmt":
             return [self.decl(d) for d in n.get("inner", []) if not self.spelling_only(d)]
         if k == "ReturnStmt":
@@ -1254,6 +1258,88 @@ class CxxImporter:
         for s in rule.apply(n):
             out.extend(self.stmt(s))
         return out
+
+    def post_incdec(self, n):
+        """FR-254 R3: the rewrite of statement ``n`` around its one postfix
+        increment the subset refuses (or the guard's refusal, located at
+        it), or None when R3 does not match -- the statement then keeps
+        the importer's own handling and wording."""
+        k = n.get("kind")
+        if k == "ReturnStmt":
+            e = (n.get("inner") or [None])[0]
+            if e is None or self.in_main or getattr(self, "ret_ref", False):
+                return None
+        elif k == "DeclStmt":
+            vds = n.get("inner", [])
+            if (len(vds) != 1 or vds[0].get("kind") != "VarDecl" or not vds[0].get("inner")
+                    or vds[0].get("storageClass") or vds[0].get("tls") or vds[0].get("constexpr")):
+                return None  # (a `static` initializer runs ONCE: the trailing `++x;` would not)
+            e = vds[0]
+        elif k.endswith("Stmt") or NZ.is_incdec(NZ.strip_value(n)):
+            return None  # a statement-level `x++;` is the importer's
+        else:
+            e = n
+        sites = NZ.incdec_sites(e)
+        if not sites or all(self.incdec_native(u) for u, _ in sites):
+            return None
+        if len(sites) != 1 or not sites[0][0].get("isPostfix"):
+            return None  # a prefix one, or two or more: the importer's refusal
+        u, cond = sites[0]
+        root = NZ.incdec_root(u)
+        if root is not None and root["referencedDecl"].get("id") in self.poisoned:
+            return None  # its declaration was refused already: the importer's (cascade) handling
+        why = NZ.POST_INCDEC.guard(n, u, cond)
+        if why is None and root["referencedDecl"].get("id") not in self.locals:
+            why = NZ.INC_OPERAND  # a global or a static: a call may reach it unnamed
+        fresh = vid = None
+        if why is None and k == "ReturnStmt":
+            T, _, spelled = self.map_type(e.get("type"))
+            if T not in K.ALL_PRIMS or e.get("valueCategory") != "prvalue":
+                why = NZ.INC_RETURN % spelled
+            else:
+                fresh, vid = self.fresh_local("bx_ret")
+        if why is not None:
+            if k == "DeclStmt" and "id" in e:
+                self.poisoned.add(e["id"])
+            if k == "ReturnStmt":  # still a return: no cascading "may reach its end" refusal
+                return [K.Return(self.rexpr(u, why), self.loc(n))]
+            return [self.rstmt(u, why)]
+        self.notes.append((self.loc(u), "normalized: " + NZ.POST_INCDEC.name))
+        out = []
+        for s in NZ.POST_INCDEC.apply(n, u, fresh, vid):
+            out.extend(self.stmt(s))
+        return out
+
+    def fresh_local(self, base):
+        """(a name nothing in the translation unit declares -- headers
+        included -- and no earlier fresh name took, a synthetic decl id)."""
+        used = getattr(self, "_fresh", None)
+        if used is None:
+            used = self._fresh = set()
+            stack = [self.ast]
+            while stack:
+                x = stack.pop()
+                if isinstance(x, dict):
+                    if isinstance(x.get("name"), str):
+                        used.add(x["name"])
+                    stack.extend(v for v in x.values() if isinstance(v, (dict, list)))
+                elif isinstance(x, list):
+                    stack.extend(x)
+        i = 0
+        while True:
+            name = base if i == 0 else "%s%d" % (base, i)
+            if name not in used:
+                used.add(name)
+                return name, "bx-fr254-%s" % name
+            i += 1
+
+    def incdec_native(self, u):
+        """Is ``u`` a Kernel IncDec: `x++` on a local integer variable?"""
+        name = self.local_ref(u["inner"][0])
+        if name is None:
+            return False
+        v = self.scope.lookup(name)
+        return (K.deref(v[0]) if v else None) in K.ARITH_INT
 
     def decl(self, d):
         r = self.decl_inner(d)
@@ -1762,13 +1848,10 @@ class CxxImporter:
         variable of an arithmetic type (the sequencing rule -- no other
         mention of x in the statement -- is the checker's)."""
         L = self.loc(n)
-        name = self.local_ref(n["inner"][0])
-        if name is not None:
-            v = self.scope.lookup(name)
-            T = K.deref(v[0]) if v else None
-            if T in K.ARITH_INT:
-                return K.IncDec(K.Var(name, self.loc(self.strip(n["inner"][0]))),
-                                "add" if n.get("opcode") == "++" else "sub", bool(n.get("isPostfix")), L)
+        if self.incdec_native(n):
+            name = self.local_ref(n["inner"][0])
+            return K.IncDec(K.Var(name, self.loc(self.strip(n["inner"][0]))),
+                            "add" if n.get("opcode") == "++" else "sub", bool(n.get("isPostfix")), L)
         return self.rexpr(n, "increment/decrement used as a value")
 
     # ================================================== FR-261: pointers
