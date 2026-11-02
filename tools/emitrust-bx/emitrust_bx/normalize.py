@@ -34,10 +34,37 @@ R2 do-while    ``do B while (C);`` -> ``while (true) { B if (!(C)) { break; } }`
    Guard: no ``continue`` bound to this loop (C++ jumps to the test
    ``C``; the while form would skip it).  ``C`` mentioning a name ``B``
    declares at its top level keeps ``{ B }`` nested, as in R1.
+R3 post-incdec  an expression statement, a single-variable declaration or a
+   ``return`` whose expression contains exactly ONE increment/decrement used
+   as a value, and that one POSTFIX on a local ``x`` or on ``*p`` (``p`` a
+   local pointer) that the subset refuses (a local integer ``i++`` is
+   already a Kernel IncDec): the expression reads the OLD value in place and
+   a separate prefix ``++x;`` / ``--x;`` follows it.  ``return E;`` becomes
+   ``const T t = E; ++x; return t;`` with a fresh ``t``.  Sound because the
+   only difference is WHEN the side effect lands -- at the end of the
+   statement instead of somewhere inside it -- and the guards make that
+   unobservable:
+   * nothing else in the statement names ``x`` / ``p`` (by NAME,
+     conservative: FR-259's own rule and wording, the importer's
+     ``TC.INCDEC_ALSO_USES``).  This is the only path to the object inside
+     the subset: no globals, and two Rust borrows of one object (an alias
+     through another pointer) are refused by rustc, never run;
+   * the statement calls no closure or function through a variable (a
+     by-reference capture reaches ``x`` without naming it, and C++ leaves
+     such a call indeterminately sequenced with the side effect);
+   * the site is not under ``&&``, ``||``, ``?:`` or ``,`` (it might not
+     be evaluated at all; conservative even on the always-evaluated side).
+   A prefix ``++x`` used as a value and a statement with two or more
+   increments keep the importer's own refusal.  NOT a hazard (the FR-254
+   lead suspected one): in ``a[(*p)++] = f()`` C++17 sequences ``f()``
+   before the whole left side, so ``a[*p] = f(); ++*p;`` reads ``*p`` at
+   the same point (and Rust evaluates an assignment's value first, too).
 """
 
 from dataclasses import dataclass
 from typing import Callable, List, Optional
+
+from . import typecheck as TC
 
 LOOPS = ("ForStmt", "WhileStmt", "DoStmt", "CXXForRangeStmt")
 # a `continue` inside these cannot be bound to an enclosing loop
@@ -48,6 +75,20 @@ FOR_CONTINUE = ("`for` loop with a `continue` bound to it (normalize for->while:
 FOR_CVAR = "`for` loop with a condition variable (normalize for->while: no rule)"
 DO_CONTINUE = ("do-while loop with a `continue` bound to it (normalize do-while: the `while (true)` form's "
                "`continue` would skip the condition)")
+
+
+# R3: located at the increment
+INC_OPERAND = ("increment/decrement used as a value on something other than a local variable or `*p` "
+               "(normalize post-incdec: no rule)")
+INC_COND = ("increment/decrement used as a value inside `&&`, `||`, `?:` or `,` (normalize post-incdec: it "
+            "might not be evaluated)")
+INC_CLOSURE = ("increment/decrement of '%s' used as a value in a statement that calls a closure or a function "
+               "through a variable (normalize post-incdec: the call may read or modify '%s')")
+INC_RETURN = ("increment/decrement used as a value in a `return` of type '%s' (normalize post-incdec: the "
+              "temporary must be a scalar)")
+# `x && y`, `x || y`, `x, y`: an operand not evaluated, or a sequence point
+COND_OPS = ("&&", "||", ",")
+COND_KINDS = ("ConditionalOperator", "BinaryConditionalOperator")
 
 
 @dataclass(frozen=True)
@@ -206,6 +247,161 @@ def do_apply(n):
     return [_while(rng, _true(rng), _compound(body.get("range"), _spliced(body, cond, [test])))]
 
 
+# ------------------------------------------------------------------ R3
+
+def is_incdec(n):
+    return isinstance(n, dict) and n.get("kind") == "UnaryOperator" and n.get("opcode") in ("++", "--")
+
+
+def strip_value(n):
+    """``n`` without parentheses and value/no-op conversions."""
+    while isinstance(n, dict) and (n.get("kind") in ("ParenExpr", "ExprWithCleanups", "ConstantExpr")
+                                   or (n.get("kind") == "ImplicitCastExpr"
+                                       and n.get("castKind") in ("LValueToRValue", "NoOp"))):
+        n = n["inner"][0]
+    return n
+
+
+def incdec_sites(e):
+    """[(increment node, conditional)] in ``e`` (not inside a lambda body or
+    a local class); ``conditional``: under ``&&`` / ``||`` / ``?:`` / ``,``."""
+    out = []
+    stack = [(e, False)]
+    while stack:
+        x, c = stack.pop()
+        if not isinstance(x, dict):
+            continue
+        k = x.get("kind")
+        if k in OPAQUE:
+            continue
+        if is_incdec(x):
+            out.append((x, c))
+        cc = c or k in COND_KINDS or (k == "BinaryOperator" and x.get("opcode") in COND_OPS)
+        stack.extend((y, cc) for y in _kids(x))
+    return out
+
+
+def incdec_root(u):
+    """The DeclRefExpr of ``x`` in ``x++`` or of ``p`` in ``(*p)++``, or None."""
+    o = strip_value(u["inner"][0])
+    if isinstance(o, dict) and o.get("kind") == "UnaryOperator" and o.get("opcode") == "*":
+        o = strip_value(o["inner"][0])
+    if isinstance(o, dict) and o.get("kind") == "DeclRefExpr":
+        return o
+    return None
+
+
+def other_mentions(n, name, skip):
+    """Does ``n`` name ``name`` outside the subtree ``skip`` (a declaration
+    of ``name`` counts)?"""
+    stack = [n]
+    while stack:
+        x = stack.pop()
+        if not isinstance(x, dict) or x is skip:
+            continue
+        if x.get("kind") == "DeclRefExpr" and x.get("referencedDecl", {}).get("name") == name:
+            return True
+        if x.get("kind") == "VarDecl" and x.get("name") == name:
+            return True
+        stack.extend(_kids(x))
+    return False
+
+
+def indirect_call(n):
+    """The first call in ``n`` that is not a direct call of a named function
+    (a closure, a lambda, a function pointer or a callable parameter), or
+    None.  Looks inside lambda bodies too: a lambda in the statement is
+    refused here whether or not it is called."""
+    stack = [n]
+    while stack:
+        x = stack.pop()
+        if not isinstance(x, dict):
+            continue
+        k = x.get("kind")
+        if k == "LambdaExpr":
+            return x
+        if k == "CXXOperatorCallExpr" and x.get("inner"):
+            callee = x["inner"][0]
+            while isinstance(callee, dict) and callee.get("kind") in ("ImplicitCastExpr", "ParenExpr"):
+                callee = callee["inner"][0]
+            if not isinstance(callee, dict) or callee.get("referencedDecl", {}).get("name") == "operator()":
+                return x
+        if k == "CallExpr" and x.get("inner"):
+            callee = x["inner"][0]
+            while isinstance(callee, dict) and callee.get("kind") in ("ImplicitCastExpr", "ParenExpr"):
+                if callee.get("kind") == "ImplicitCastExpr" and callee.get("castKind") != "FunctionToPointerDecay":
+                    return x  # a pointer variable read (LValueToRValue) or a conversion
+                callee = callee["inner"][0]
+            if not (isinstance(callee, dict) and callee.get("kind") == "DeclRefExpr"
+                    and callee.get("referencedDecl", {}).get("kind") in ("FunctionDecl", "CXXMethodDecl")):
+                return x
+        stack.extend(_kids(x))
+    return None
+
+
+def incdec_guard(n, u, conditional):
+    """None when R3 may rewrite statement ``n`` around its one increment
+    ``u``, else the refusal (to be located at ``u``).  The root's
+    locality and the return type are the importer's checks."""
+    root = incdec_root(u)
+    if root is None:
+        return INC_OPERAND
+    if conditional:
+        return INC_COND
+    name = root["referencedDecl"].get("name")
+    if indirect_call(n) is not None:
+        return INC_CLOSURE % (name, name)
+    if other_mentions(n, name, u):
+        return TC.INCDEC_ALSO_USES % (name, name)  # FR-259's rule, and its wording
+    return None
+
+
+def _replace(n, old, new):
+    if n is old:
+        return new
+    if isinstance(n, dict):
+        return {k: (_replace(v, old, new) if k not in ("type", "referencedDecl", "range", "loc") else v)
+                for k, v in n.items()}
+    if isinstance(n, list):
+        return [_replace(v, old, new) for v in n]
+    return n
+
+
+def _const(t):
+    t = dict(t)
+    for k in ("qualType", "desugaredQualType"):
+        if k in t:
+            t[k] = "const " + t[k]
+    return t
+
+
+def incdec_apply(n, u, fresh=None, vid=None):
+    """``n`` with ``u`` (``x++``) read as ``x``, then ``++x;`` -- a
+    ``return E`` through ``const T fresh = E;`` (decl id ``vid``)."""
+    op = u["inner"][0]
+    rng = u.get("range")
+    read = {"kind": "ImplicitCastExpr", "range": rng, "type": op.get("type"), "valueCategory": "prvalue",
+            "castKind": "LValueToRValue", "inner": [op]}
+    step = {"kind": "UnaryOperator", "range": rng, "type": op.get("type"), "valueCategory": "lvalue",
+            "isPostfix": False, "opcode": u["opcode"], "inner": [op]}
+    new = _replace(n, u, read)
+    if n.get("kind") != "ReturnStmt":
+        return [new, step]
+    e = new["inner"][0]
+    nrng = n.get("range")
+    T = _const(e["type"])
+    vd = {"kind": "VarDecl", "id": vid, "range": nrng, "name": fresh, "type": T, "init": "c", "inner": [e]}
+    ref = {"kind": "DeclRefExpr", "range": nrng, "type": T, "valueCategory": "lvalue",
+           "referencedDecl": {"id": vid, "kind": "VarDecl", "name": fresh, "type": T}}
+    ret = {"kind": "ReturnStmt", "range": nrng,
+           "inner": [{"kind": "ImplicitCastExpr", "range": nrng, "type": e["type"], "valueCategory": "prvalue",
+                      "castKind": "LValueToRValue", "inner": [ref]}]}
+    return [{"kind": "DeclStmt", "range": nrng, "inner": [vd]}, step, ret]
+
+
 FOR_TO_WHILE = Rule("for->while", "ForStmt", for_guard, for_apply)
 DO_WHILE = Rule("do-while", "DoStmt", do_guard, do_apply)
-RULES = (FOR_TO_WHILE, DO_WHILE)
+# R3 matches a STATEMENT around one increment: guard(n, u, conditional),
+# apply(n, u, fresh, vid) (the importer finds ``u`` and owns the fresh name)
+POST_INCDEC = Rule("post-incdec", "Stmt", incdec_guard, incdec_apply)
+RULES = (FOR_TO_WHILE, DO_WHILE, POST_INCDEC)

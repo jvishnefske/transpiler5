@@ -288,6 +288,10 @@ RESERVED = {
 }
 
 
+# FR-259's sequencing refusal, shared with the FR-254 normalizer's R3 guard
+INCDEC_ALSO_USES = ("increment/decrement of '%s' used as a value in a statement that also uses '%s' (C++ leaves "
+                    "the order unsequenced or unspecified)")
+
 # FR-252 wordings shared by the checker and cxx_import
 CLOSURE_VALUE = ("unsupported: closure '%s' used other than by calling it or passing it to a callable "
                  "parameter (copying a closure copies its state in C++ and moves it in Rust)")
@@ -2731,8 +2735,7 @@ class _Checker:
             b = n.var.name
             total = sum(1 for e in exprs for m in K.walk(e) if isinstance(m, K.Var) and m.name == b)
             if total > 1:
-                self.err(n.loc, "unsupported: increment/decrement of '%s' used as a value in a statement that "
-                                "also uses '%s' (C++ leaves the order unsequenced or unspecified)" % (b, b))
+                self.err(n.loc, "unsupported: " + INCDEC_ALSO_USES % (b, b))
                 return
         calls = [n for e in exprs for n in K.walk(e) if isinstance(n, (K.Call, K.MethodCall))]
         for c in calls:
