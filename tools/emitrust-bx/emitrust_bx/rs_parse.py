@@ -151,6 +151,14 @@ class _RawPath:
         return self.raw
 
 
+@dataclass(frozen=True)
+class _RawConst:
+    """FR-264: a value path `crate::a::k` as written (never in a Kernel)."""
+
+    raw: str
+    loc: Optional[Loc] = field(default=None, compare=False)
+
+
 class ParseError(Exception):
     def __init__(self, loc, msg):
         Exception.__init__(self, msg)
@@ -310,6 +318,10 @@ class _Parser:
 
     # -------------------------------------------------------------- items
     def program(self):
+        # FR-264: the one inner attribute the subset prints (with constants)
+        want = ["#", "!", "[", "allow", "(", "non_upper_case_globals", ")", "]"]
+        if [x.text for x in self.toks[self.i:self.i + len(want)]] == want:
+            self.i += len(want)
         prog = K.Program(tuple(self.items(top=True)))
         for name, t in self.bx_uses:
             if name not in self.bx_defined:
@@ -351,6 +363,16 @@ class _Parser:
             elif self.at("fn"):
                 f = self.func()
                 items.append(K.Func(f.name, f.params, f.ret, f.body, f.loc, self.ns, bool(self.ns) and not pub))
+            elif self.at("const"):
+                # FR-264: `[pub] const k: T = e;`
+                self.next()
+                name = self.ident()
+                self.expect(":")
+                ty = self.type_()
+                self.expect("=")
+                e = self.free_expr()
+                self.expect(";")
+                items.append(K.ConstItem(name.text, ty, e, name.loc, self.ns, bool(self.ns) and not pub))
             elif self.at("mod") and top and not pub and self.peek().text == "bx":
                 self.bx_module()
             elif self.at("mod"):
@@ -378,7 +400,7 @@ class _Parser:
                     self.ns = saved
                 self.expect("}")
             elif pub:
-                self.unsupported(self.tok, "`pub` item other than `pub fn` / `pub mod`")
+                self.unsupported(self.tok, "`pub` item other than `pub fn` / `pub mod` / `pub const`")
             elif t.kind == "ident" and t.text in ("use", "struct", "enum", "impl", "trait", "static",
                                                   "const", "type", "mod", "pub", "extern", "unsafe",
                                                   "macro_rules"):
@@ -1358,7 +1380,7 @@ class _Parser:
                 if self.at("{") and not self.no_struct:
                     return self.struct_lit("::".join(segs), t)
                 if not self.at("("):
-                    self.unsupported(t, "path expression `%s`" % "::".join(segs))
+                    return _RawConst("::".join(segs), t.loc)  # FR-264: resolved after the crate is read
                 return K.Call("::".join(segs), tuple(self.call_args()), t.loc)
             if self.at("!"):
                 if t.text == "vec" and self.peek().text == "[":
@@ -1501,12 +1523,21 @@ def _resolve_ty(t, structs):
     return t
 
 
-def _resolve_calls(node, ns, funcs, structs=frozenset()):
+def _resolve_calls(node, ns, funcs, structs=frozenset(), consts=frozenset()):
     """Rebuild ``node`` with every Call's raw path resolved (FR-257: and
-    every struct type / struct literal path)."""
+    every struct type / struct literal path; FR-264: every constant path,
+    and every bare name of a constant of the module -- Rust can never
+    bind a local of that name, so the name always means the constant)."""
     from dataclasses import fields as dfields, is_dataclass, replace
+    if isinstance(node, _RawConst):
+        path = _resolve(node.raw, ns, consts, node.loc, "constant")
+        if path not in consts:
+            raise ParseError(node.loc, "unsupported: path expression `%s`" % node.raw)
+        return K.ConstRef(path, node.loc)
+    if isinstance(node, K.Var) and K.path_of(ns, node.name) in consts:
+        return K.ConstRef(K.path_of(ns, node.name), node.loc)
     if isinstance(node, tuple):
-        out = tuple(_resolve_calls(x, ns, funcs, structs) for x in node)
+        out = tuple(_resolve_calls(x, ns, funcs, structs, consts) for x in node)
         return node if all(a is b for a, b in zip(out, node)) else out
     if isinstance(node, K.TYPE_CLASSES):
         return _resolve_ty(node, structs)
@@ -1517,7 +1548,7 @@ def _resolve_calls(node, ns, funcs, structs=frozenset()):
         if f.name in ("loc", "spelling", "names"):
             continue
         v = getattr(node, f.name)
-        nv = _resolve_calls(v, ns, funcs, structs)
+        nv = _resolve_calls(v, ns, funcs, structs, consts)
         if nv is not v:
             changes[f.name] = nv
     if isinstance(node, K.Call):
@@ -1538,14 +1569,18 @@ def rs_parse_surface(src):
     prog = _attach_impls(prog, parser.impls)
     funcs = {f.path for f in prog.all_funcs()}
     structs = {sd.path for sd in prog.structs()}
+    consts = {c.path for c in prog.consts()}
     items = []
     for it in prog.items:
         if isinstance(it, K.StructDef):
             items.append(K.StructDef(it.name, _resolve_calls(it.fields, it.ns, funcs, structs),
-                                     tuple(_resolve_func(m, funcs, structs) for m in it.methods), it.loc, it.ns,
-                                     it.internal))
+                                     tuple(_resolve_func(m, funcs, structs, consts) for m in it.methods), it.loc,
+                                     it.ns, it.internal))
+        elif isinstance(it, K.ConstItem):
+            items.append(K.ConstItem(it.name, it.ty, _resolve_calls(it.value, it.ns, funcs, structs, consts),
+                                     it.loc, it.ns, it.internal))
         else:
-            items.append(_resolve_func(it, funcs, structs))
+            items.append(_resolve_func(it, funcs, structs, consts))
     prog = K.Program(tuple(items))
     _check_literal_fields(prog)
     for n in K.walk(prog):
@@ -1564,9 +1599,9 @@ def rs_parse_surface(src):
     return prog
 
 
-def _resolve_func(f, funcs, structs):
+def _resolve_func(f, funcs, structs, consts=frozenset()):
     return K.Func(f.name, _resolve_calls(f.params, f.ns, funcs, structs), _resolve_ty(f.ret, structs),
-                  _resolve_calls(f.body, f.ns, funcs, structs), f.loc, f.ns, f.internal, f.owner, f.recv)
+                  _resolve_calls(f.body, f.ns, funcs, structs, consts), f.loc, f.ns, f.internal, f.owner, f.recv)
 
 
 def _attach_impls(prog, impls):

@@ -210,8 +210,8 @@ class _Printer:
     def atomic(self, e, scope):
         if isinstance(e, K.Var):
             return not self.is_ref(e, scope)
-        if isinstance(e, (K.IntLit, K.FloatLit, K.BoolLit, K.Call, K.ClosureCall, K.StrLit, K.Clone, K.Index, K.Len,
-                          K.IsEmpty, K.VecLit, K.VecFill, K.StrNew, K.StrFrom, K.Substr, K.ToStr, K.Field,
+        if isinstance(e, (K.IntLit, K.FloatLit, K.BoolLit, K.ConstRef, K.Call, K.ClosureCall, K.StrLit, K.Clone,
+                          K.Index, K.Len, K.IsEmpty, K.VecLit, K.VecFill, K.StrNew, K.StrFrom, K.Substr, K.ToStr, K.Field,
                           K.MethodCall, K.StructLit, K.MinMax)):
             return True
         if isinstance(e, K.Alg):
@@ -239,6 +239,8 @@ class _Printer:
             return '"' + fmt.rust_escape(e.value, False) + '"'
         if isinstance(e, K.Var):
             return "*" + e.name if self.is_ref(e, scope) else e.name
+        if isinstance(e, K.ConstRef):
+            return rs_path(e.path, self.ns)  # FR-264: bare in its module, else `crate::`
         if isinstance(e, K.ClosureCall):
             saved, self.in_cast = self.in_cast, 0
             try:
@@ -738,6 +740,9 @@ def rs_print(program):
         gap()
         if isinstance(f, K.StructDef):
             p.struct(f)
+        elif isinstance(f, K.ConstItem):
+            p.emit(0, "%sconst %s: %s = %s;" % ("pub " if f.ns and not f.internal else "", f.name, f.ty.name,
+                                               p.expr(f.value, TC.Scope())))
         else:
             p.func(f)
     while open_ns:
@@ -745,6 +750,8 @@ def rs_print(program):
         p.base = len(open_ns)
         p.emit(0, "}")
     out = "\n".join(p.lines) + "\n"
+    if program.consts():
+        out = "#![allow(non_upper_case_globals)]\n\n" + out
     mod = fmt.bx_module(p.used)
     if mod:
         out += "\n" + mod

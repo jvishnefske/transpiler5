@@ -268,3 +268,12 @@ members). The hybrid spike (an LLM rewrites blocked functions into the subset, c
 differential execution of the extracted original under sanitizers) is the measurement that
 decides whether the wedge closes that gap; it is blocked on a tool-permission decision, not
 on design.
+
+### 2026-11-03 -- namespace constants (FR-264): EMIT 32 -> 35 of 392 functions
+
+`global variable` was step 1 of the set cover. Making scalar namespace constants a Kernel row
+moved exactly the three predicted brunsli functions (8.2% -> 8.9%), 0 lost, and dropped the tag
+from 87 functions to 1. The other 84 functions it touched are still blocked by parameter /
+local of non-kernel type and member access, which are now the gate on further movement; the
+criterion-1 gap (30%) is unchanged in kind. The hybrid LLM-rewrite spike is still blocked on the
+tool-permission decision.

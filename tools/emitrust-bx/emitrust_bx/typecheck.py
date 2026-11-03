@@ -600,6 +600,7 @@ class Sigs(dict):
         dict.__init__(self, *a)
         self.structs = {}
         self.recv = {}
+        self.consts = {}  # FR-264: const path -> Prim
 
 
 def structs_of(sigs):
@@ -620,6 +621,8 @@ def sigs_of(program):
             sigs.recv.setdefault(f.path, f.recv)
     for sd in program.structs():
         sigs.structs.setdefault(sd.path, sd)
+    for c in program.consts():
+        sigs.consts.setdefault(c.path, c.ty)
     return sigs
 
 
@@ -807,6 +810,11 @@ def type_of(e, scope, sigs):
         if v is None:
             raise KernelTypeError(e.loc, "use of undeclared variable '%s'" % e.name)
         return K.deref(v[0])
+    if isinstance(e, K.ConstRef):
+        t = (getattr(sigs, "consts", None) or {}).get(e.path)
+        if t is None:
+            raise KernelTypeError(e.loc, "use of undeclared constant '%s'" % e.path)
+        return t
     if isinstance(e, K.Unary):
         t = type_of(e.operand, scope, sigs)
         if e.op == "neg":
@@ -1448,6 +1456,10 @@ class _Checker:
             # only a SAME-namespace function is spelled bare (FR-260), so
             # only it can be hidden by a local of the same name
             self.err(loc, "variable '%s' has the name of a function" % name)
+        elif K.path_of(self.ns, name) in self.sigs.consts:
+            # FR-264: a Rust binding can never shadow a constant in scope
+            # (the name is a PATTERN: E0005 / E0530)
+            self.err(loc, "variable '%s' has the name of a constant" % name)
 
     def expr(self, e, scope, want=None, pos="value"):
         try:
@@ -1904,6 +1916,9 @@ class _Checker:
                 ns_names.add(f.ns[:i + 1])
             if f.internal and isinstance(f, K.Func):
                 self.internal[f.path] = f.ns
+        for c in self.program.consts():
+            if c.internal:
+                self.internal[c.path] = c.ns
         bad_ns = set()
         for f in funcs + structs:
             for i, c in enumerate(f.ns):
@@ -1930,7 +1945,54 @@ class _Checker:
             self.func(f)
         self.check_structs(structs, ns_names, {f.path for f in funcs})
         self.check_instantiated(funcs)
+        self.check_consts(ns_names, {f.path for f in funcs})
         return self.errors
+
+    CONST_NODES = (K.IntLit, K.FloatLit, K.BoolLit, K.ConstRef, K.Unary, K.Binary, K.Cast, K.Cond)
+
+    def check_consts(self, ns_names, free_paths):
+        """FR-264: every constant is a scalar defined ONCE, before every
+        use in another constant's initializer (C++ declares before use;
+        Rust would accept the forward reference), its initializer a
+        constant expression of its type."""
+        pos = {}
+        for i, it in enumerate(self.program.items):
+            if isinstance(it, K.ConstItem):
+                if it.path in pos:
+                    self.err(it.loc, "constant '%s' defined twice" % it.path)
+                pos.setdefault(it.path, i)
+        for i, c in enumerate(self.program.items):
+            if not isinstance(c, K.ConstItem):
+                continue
+            self.ns = c.ns
+            p = ident_problem(c.name)
+            if p:
+                self.err(c.loc, p)
+            if c.path in free_paths:
+                self.err(c.loc, "constant '%s' has the name of a function" % c.path)
+            if c.ns + (c.name,) in ns_names:
+                self.err(c.loc, "constant '%s' has the name of a namespace declared in the same scope" % c.path)
+            if c.name in self.struct_leaves:
+                self.err(c.loc, "constant '%s' has the name of a struct" % c.path)
+            if c.internal and not c.ns:
+                self.err(c.loc, "internal constant at the root (normal form N14)")
+            if not isinstance(c.ty, K.Prim) or c.ty == K.UNIT:
+                self.err(c.loc, "constant of non-kernel type '%s'" % c.ty)
+                continue
+            for n in K.walk(c.value):
+                if isinstance(n, K.ResidualExpr):
+                    break  # already reported by the importer
+                if not isinstance(n, self.CONST_NODES):
+                    self.err(getattr(n, "loc", None) or c.loc,
+                             "constant initializer is not a constant expression")
+                    break
+                if isinstance(n, K.ConstRef):
+                    self.check_visibility(n)
+                if isinstance(n, K.ConstRef) and n.path in pos and pos[n.path] >= i:
+                    self.err(n.loc or c.loc, "constant '%s' used before its definition (C++ defines a "
+                                             "constant before its use)" % n.path)
+            else:
+                self.expr(c.value, Scope(), want=c.ty)
 
     def check_instantiated(self, funcs):
         """FR-252: C++ types a callable parameter only through its
@@ -2093,11 +2155,12 @@ class _Checker:
         `fn` in a `mod`) may only be referenced from inside its namespace:
         Rust's privacy rule (E0603).  C++ would also accept `::a::h` from
         outside, which has no 1:1 Rust spelling, so it is a residual."""
-        owner = self.internal.get(call.name)
+        name = call.path if isinstance(call, K.ConstRef) else call.name
+        owner = self.internal.get(name)
         if owner is not None and self.ns[:len(owner)] != owner:
             self.err(call.loc, "unsupported: '%s' is internal to namespace '%s' (a C++ anonymous-namespace "
-                               "member, a private Rust `fn`) and is referenced from outside it"
-                     % (call.name, "::".join(owner)))
+                               "member, a private Rust `%s`) and is referenced from outside it"
+                     % (name, "::".join(owner), "const" if isinstance(call, K.ConstRef) else "fn"))
 
     def func(self, f):
         self.moves = []
@@ -2106,7 +2169,7 @@ class _Checker:
         self.cur = f
         self.closure_table(f)
         for n in K.walk(f.body):
-            if isinstance(n, K.Call):
+            if isinstance(n, (K.Call, K.ConstRef)):
                 self.check_visibility(n)
         self.func_struct_visibility(f)
         if not (f.ret in K.ALL_PRIMS or f.ret == K.UNIT or K.is_owned_nc(f.ret)):
@@ -2945,7 +3008,7 @@ class _Checker:
                 self.err(s.loc, "counting loop bounds refer to a variable of the loop variable's name '%s'" % s.var)
             len_bound = (isinstance(s.hi, K.Len) and is_place(s.hi.base)
                          and not any(isinstance(n, K.Call) for n in K.walk(s.hi.base)))
-            if not isinstance(s.hi, (K.IntLit, K.Var)) and not len_bound:
+            if not isinstance(s.hi, (K.IntLit, K.Var, K.ConstRef)) and not len_bound:
                 self.err(getattr(s.hi, "loc", None) or s.loc,
                          "counting loop bound must be a literal or a variable")
             self.expr(s.hi, scope, t)
@@ -3470,8 +3533,13 @@ def normalize(program, keep_surface=False):
     n = _Normalizer(program, keep_surface)
     items = tuple(n.func(i) if isinstance(i, K.Func) else n.struct(i) if isinstance(i, K.StructDef) else i
                   for i in program.items)
+    items = tuple(K.ConstItem(i.name, i.ty, n.expr(i.value, Scope(), i.ty), i.loc, i.ns, i.internal)
+                  if isinstance(i, K.ConstItem) else i for i in items)
     if not keep_surface:
         structs = struct_order([i for i in items if isinstance(i, K.StructDef)])
-        rest = [i for i in items if not isinstance(i, K.StructDef)]
-        items = tree_order(tuple(structs) + tuple(rest))  # N15, then N13
+        consts = [i for i in items if isinstance(i, K.ConstItem)]
+        rest = [i for i in items if not isinstance(i, (K.StructDef, K.ConstItem))]
+        # N15, FR-264 (constants after structs, before functions, in their
+        # relative order), then N13
+        items = tree_order(tuple(structs) + tuple(consts) + tuple(rest))
     return K.Program(items)

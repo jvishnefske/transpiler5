@@ -470,8 +470,12 @@ class CxxImporter:
         self.project_root = None  # realpath of --project-root
         self.decl_file = {}  # FunctionDecl id -> clang's file spelling
         self.hdr_bad = {}  # decl id -> name of a reachable header function refused whole
-        self.hdr_spans = {}  # imported header function path -> (file, first line, last line)
+        self.hdr_spans = {}  # imported header function / constant path -> (file, first line, last line)
         self.file_lines = {}  # header file -> (_Loc, bytes)
+        # FR-264: namespace-scope scalar constants
+        self.consts = []  # (node, ns, internal) main-file const VarDecls
+        self.const_ids = {}  # VarDecl id -> absolute path
+        self.const_tys = {}  # absolute path -> Prim
 
     # -------------------------------------------------------------- utils
     def is_main(self, f):
@@ -601,7 +605,7 @@ class CxxImporter:
                 if x.get("kind", "").endswith("Decl"):
                     self.decl_main[x["id"]] = in_main
                     self.decl_info[x["id"]] = x
-                    if x.get("kind") == "FunctionDecl":
+                    if x.get("kind") in ("FunctionDecl", "VarDecl"):
                         self.decl_file[x["id"]] = f
                     if not in_main and x.get("kind") == "FunctionDecl" and x.get("name") == "printf":
                         self.libc_printf.add(x["id"])
@@ -638,8 +642,17 @@ class CxxImporter:
         hfuncs, hkeys = [], {}
         if self.normalize and self.project_root is not None:
             hfuncs = self.header_imports(top, mains, funcs, items, hkeys)
+        # FR-264: project-header constants reachable from this file
+        hconsts = []
+        if self.normalize and self.project_root is not None:
+            hconsts = self.header_consts(top, mains, hfuncs, items, hkeys)
+        for n, ns, internal in self.consts:
+            self.const_ids[n["id"]] = K.path_of(ns, n["name"])
         # signatures (for typing calls)
         self.sigs = TC.Sigs()
+        self.sigs.consts = self.const_tys
+        for n, ns, internal in self.consts + [(h[0], h[1], h[2]) for h in hconsts]:
+            self.const_tys[K.path_of(ns, n["name"])] = self.map_type(n.get("type"))[0]
         defined = set()
         for n, ns, internal in funcs + [(h[0], h[1], h[2]) for h in hfuncs]:
             if self.has_body(n):
@@ -663,6 +676,13 @@ class CxxImporter:
                 fn = self.func(n, ns, internal)
             hkeys[id(fn)] = key
             items.append(fn)
+        for n, ns, internal in self.consts:
+            items.append(self.const_item(n, ns, internal))
+        for n, ns, internal, f, key in hconsts:
+            with self.in_file(f):
+                ci = self.const_item(n, ns, internal)
+            hkeys[id(ci)] = key
+            items.append(ci)
         for sd in structs:
             items.append(self.struct_def(sd, items))
         # keep source order; an imported header function sits right before
@@ -853,6 +873,127 @@ class CxxImporter:
             out.append((n, ns, internal, f, key))
         return out
 
+    # -------------------------------------------------------------- FR-264
+    def const_problem(self, n):
+        """None when namespace-scope VarDecl ``n`` is a Kernel constant
+        `const T k = e;` (also spelled `static const` / `constexpr` /
+        `inline constexpr`: at namespace scope a const object already has
+        internal linkage, so the specifier carries nothing), else the
+        located refusal's text."""
+        T, const, spelled = self.map_type(n.get("type"))
+        if not const or n.get("storageClass") == "extern" or "volatile" in (spelled or ""):
+            return "global variable"
+        if not isinstance(T, K.Prim) or T == K.UNIT:
+            return "constant of non-kernel type '%s'" % spelled
+        if not n.get("init") or not n.get("inner"):
+            return "global variable"
+        if n.get("tls"):
+            return "global variable"
+        return None
+
+    def const_item(self, n, ns, internal):
+        T, _, _ = self.map_type(n.get("type"))
+        self.ctx_ns = ns
+        self.cur = None
+        self.locals = {}
+        self.scope = TC.Scope()
+        init = [c for c in n.get("inner", []) if isinstance(c, dict) and not c.get("kind", "").endswith("Attr")]
+        e = self.expr(init[-1])
+        t = self.ty_of(e)
+        if t is not None and t != T:
+            e = K.Cast(T, e, self.loc(init[-1]))
+        return K.ConstItem(n["name"], T, e, self.lines.at(_off(n.get("loc"))), ns, internal)
+
+    @staticmethod
+    def var_refs(n):
+        """Decl ids of the VarDecls ``n`` names (DeclRefExpr), in print order."""
+        out = []
+        stack = [n]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, list):
+                stack.extend(reversed(x))
+                continue
+            if not isinstance(x, dict):
+                continue
+            if x.get("kind") == "DeclRefExpr":
+                rd = x.get("referencedDecl") or {}
+                if rd.get("kind") == "VarDecl" and rd.get("id"):
+                    out.append(rd["id"])
+            kids = [v for k, v in x.items()
+                    if k not in ("loc", "range", "type", "referencedDecl", "foundReferencedDecl")
+                    and isinstance(v, (list, dict))]
+            stack.extend(reversed(kids))
+        return out
+
+    def header_consts(self, top, mains, hfuncs, items, hkeys):
+        """FR-264 + R4: the project-header namespace-scope constants named
+        by this file's declarations or by an imported header function,
+        transitively through their initializers, dependencies first.
+        Returns [(node, ns, internal, file, sort key)]."""
+        defs = {}
+
+        def index(n, ns, internal):
+            k = n.get("kind")
+            if k == "NamespaceDecl":
+                name = n.get("name") or ""
+                ns2, int2 = (ns + (name,), internal) if name else (ns, True)
+                if n.get("isInline") or (name and internal):
+                    return
+                for c in n.get("inner", []):
+                    index(c, ns2, int2)
+            elif k == "VarDecl":
+                f = self.decl_file.get(n["id"])
+                if self.in_project_header(f) and self.const_problem(n) is None:
+                    defs[n["id"]] = (n, ns, internal, f)
+
+        for n in top:
+            index(n, (), False)
+        if not defs:
+            return []
+        order, seen = [], set()
+        anchor = {}
+
+        def visit(c, anc):
+            seen.add(c)
+            for r in self.var_refs(defs[c][0].get("inner", [])):
+                if r in defs and r not in seen:
+                    visit(r, anc)
+            order.append(c)
+            anchor[c] = anc
+
+        roots = [(n, self.lines.at(_off(n.get("loc")))) for n in mains]
+        roots += [(h[0], h[4]) for h in hfuncs]
+        for n, anc in roots:
+            for r in self.var_refs(n):
+                if r in defs and r not in seen:
+                    visit(r, anc)
+        main_paths = {K.path_of(ns, n["name"]) for n, ns, internal in self.consts}
+        out = []
+        for k, c in enumerate(order):
+            n, ns, internal, f = defs[c]
+            path = K.path_of(ns, n["name"])
+            a = anchor[c]
+            key = a if isinstance(a, tuple) else ((a.line, a.col, -2, k) if a else (0, 0, -2, k))
+            with self.in_file(f):
+                hl = self.lines.at(_off(n.get("loc")))
+            if path in main_paths:
+                ri = K.ResidualItem("normalize: header constant '%s' collides with a main-file name" % n["name"], hl)
+                hkeys[id(ri)] = key
+                items.append(ri)
+                continue
+            self.const_ids[c] = path
+            with self.in_file(f):
+                rg = n.get("range") or {}
+                l0 = self.lines.at(_off(rg.get("begin"))) or hl
+                l1 = self.lines.at(_off(rg.get("end"))) or hl
+            # a use of a header constant whose definition has an error is a
+            # located refusal at the use (cli.header_cascade)
+            self.hdr_spans[path] = (f, l0.line, l1.line)
+            self.notes.append((hl, "normalized: header constant '%s' from %s" % (n["name"], f)))
+            out.append((n, ns, internal, f, key))
+        return out
+
     def typedef_seen(self, x):
         """FR-259 (N20): a declaration named like a <cstdint>/<cstddef> type.
         The real ones (global, std) are typedefs of the expected builtin; a
@@ -949,6 +1090,12 @@ class CxxImporter:
                 items.append(K.ResidualItem(r, self.loc(n)))
                 # its calls are cascades of this one report
                 self.bad_funcs |= {c.get("id") for c in n.get("inner", []) if c.get("kind") == "FunctionDecl"}
+        elif k == "VarDecl":
+            r = self.const_problem(n)
+            if r is not None:
+                items.append(K.ResidualItem(r, self.loc(n)))
+                return
+            self.consts.append((n, ns, internal))
         elif k == "NamespaceAliasDecl":
             al = n.get("aliasedNamespace", {}).get("id")
             if al in self.ns_index and self.decl_main.get(al):
@@ -1942,6 +2089,8 @@ class CxxImporter:
             if rd.get("id") in self.poisoned:
                 return K.ResidualExpr("use of a rejected declaration", L, cascade=True)
             rk = rd.get("kind")
+            if rk == "VarDecl" and rd.get("id") in self.const_ids:
+                return K.ConstRef(self.const_ids[rd["id"]], L)
             if rk == "VarDecl":
                 return self.rexpr(n, "global variable")
             if rk == "EnumConstantDecl":

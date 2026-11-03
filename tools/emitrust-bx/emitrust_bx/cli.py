@@ -46,7 +46,9 @@ def header_cascade(prog, spans, errs):
     """FR-254 R4: the calls of imported header functions that have an error
     (their own, or a call of another such function), as located refusals at
     each call site -- in the main file this is what makes the CALLER
-    non-clean (a per-function census attributes only main-file lines)."""
+    non-clean (a per-function census attributes only main-file lines).
+    FR-264: likewise every use of an imported header constant with an error
+    (its own initializer, or a use of another such constant)."""
     if not spans:
         return []
     real = {}
@@ -63,21 +65,30 @@ def header_cascade(prog, spans, errs):
         for path, (f, l0, l1) in spans.items():
             if rp(f) == rp(loc.file) and l0 <= loc.line <= l1:
                 bad.add(path)
-    calls = []  # (callee, caller path if a header function else None, loc)
+    hconsts = {c.path for c in prog.consts() if c.loc is not None and c.loc.file is not None and c.path in spans}
+    uses = []  # (callee or constant, caller path if a header function / constant else None, loc, is_const)
     for fn in prog.all_funcs():
         caller = fn.path if (fn.loc is not None and fn.loc.file is not None and fn.path in spans) else None
         for n in K.walk(fn.body):
-            if isinstance(n, K.Call) and n.name in spans:
-                calls.append((n.name, caller, n.loc))
+            if isinstance(n, K.Call) and n.name in spans and n.name not in hconsts:
+                uses.append((n.name, caller, n.loc, False))
+            elif isinstance(n, K.ConstRef) and n.path in hconsts:
+                uses.append((n.path, caller, n.loc, True))
+    for c in prog.consts():
+        caller = c.path if c.path in hconsts else None
+        for n in K.walk(c.value):
+            if isinstance(n, K.ConstRef) and n.path in hconsts:
+                uses.append((n.path, caller, n.loc or c.loc, True))
     changed = True
     while changed:
         changed = False
-        for callee, caller, _ in calls:
+        for callee, caller, _, _ in uses:
             if callee in bad and caller is not None and caller not in bad:
                 bad.add(caller)
                 changed = True
-    return [(loc, "unsupported: call of a rejected header function '%s'" % callee.rsplit("::", 1)[-1])
-            for callee, _, loc in calls if callee in bad]
+    return [(loc, ("unsupported: use of a rejected header constant '%s'" if is_const else
+                   "unsupported: call of a rejected header function '%s'") % callee.rsplit("::", 1)[-1])
+            for callee, _, loc, is_const in uses if callee in bad]
 
 
 def load_cpp(path, clang, normalize=False, notes=None, project_root=None):

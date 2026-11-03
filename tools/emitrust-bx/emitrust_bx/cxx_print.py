@@ -229,8 +229,8 @@ class _Printer:
             return e.op not in ("contains", "max_element", "min_element")  # `.. != v.end()`, `*std::..`
         if self.alg_not(e):
             return e.operand.op == "any_of"  # `std::none_of(..)`
-        return isinstance(e, (K.IntLit, K.FloatLit, K.BoolLit, K.Var, K.Call, K.ClosureCall, K.Cast, K.StrLit, K.Index,
-                              K.ByteAt, K.Len, K.IsEmpty, K.VecLit, K.VecFill, K.StrNew, K.StrFrom,
+        return isinstance(e, (K.IntLit, K.FloatLit, K.BoolLit, K.Var, K.ConstRef, K.Call, K.ClosureCall, K.Cast,
+                              K.StrLit, K.Index, K.ByteAt, K.Len, K.IsEmpty, K.VecLit, K.VecFill, K.StrNew, K.StrFrom,
                               K.Substr, K.ToStr, K.Clone, K.Field, K.StructLit, K.MethodCall, K.MinMax))
 
     @staticmethod
@@ -358,6 +358,12 @@ class _Printer:
             return '"' + fmt.c_escape(e.value, False) + '"'
         if isinstance(e, K.Var):
             return "*this" if e.name == "self" else e.name
+        if isinstance(e, K.ConstRef):
+            # FR-264: like a callee -- bare in its own namespace (the checker
+            # refuses a local of its name there), else `::`-qualified; inside
+            # a member function a data member could hide it
+            ns, leaf = K.split_path(e.path)
+            return leaf if ns == self.ns and self.method is None else "::" + e.path
         if isinstance(e, K.Call):
             ptys = self.sigs[e.name][0]
             return "%s(%s)" % (self.callee(e.name), self.args(ptys, e.args, scope))
@@ -761,6 +767,13 @@ def cxx_print(program):
     if structs:
         p.lines.append("")
         emit_nested(p, structs, p.struct, spaced=True)
+    consts = program.consts()  # FR-264: after the structs, before every function
+    if consts:
+        p.lines.append("")
+
+        def const_(c):
+            p.emit(0, "const %s %s = %s;" % (CXX_TYPE[c.ty.name], c.name, p.expr(c.value, TC.Scope())))
+        emit_nested(p, consts, const_, spaced=False)
     protos = needs_prototype(program)
     if protos:
         p.lines.append("")

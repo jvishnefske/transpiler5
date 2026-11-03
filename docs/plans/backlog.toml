@@ -1813,3 +1813,14 @@ title = "BX print order: unsequenced printing calls refused"
 summary = "Two calls that may print, unsequenced in one statement, have two legal C++ outputs (g++ vs clang); refused, located, both directions. Expected TRACTOR +0."
 blocked_by = ["FR-252"]
 anchor = "FR-263 (opened 2026-11-01, from FR-252's verification): **BX PRINT ORDER"
+
+[[items]]
+id = "FR-264"
+kind = "feature"
+status = "landed"
+rank = 60
+size = "M"
+title = "BX namespace constants: const T k = e; <=> const k: T = e;"
+summary = "Namespace-scope scalar constants (const/static const/constexpr) as Kernel ConstItem + ConstRef, header constants via R4 reachability, located refusals for arrays, non-constant initializers, shadowing and forward references. bx-frontier EMIT 32 -> 35 of 392. Expected TRACTOR +0."
+blocked_by = ["FR-254"]
+anchor = "FR-264 (opened 2026-11-03, from the FR-254 R4 frontier): **BX NAMESPACE CONSTANTS"

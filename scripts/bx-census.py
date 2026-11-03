@@ -333,6 +333,10 @@ RULES = [
     (r"^header function '.*' is overloaded \(normalize header-inline", "normalize: header-inline overload", None),
     (r"^header function '.*' has the same name as a function of the main file",
      "normalize: header-inline name collision", None),
+    # FR-264 header constants (same R4 path): the USE of a header constant whose
+    # definition has an error, and a header constant colliding with a main-file one
+    (r"^use of a rejected header constant '(.*)'$", "normalize: header constant rejected", None),
+    (r"^normalize: header constant '.*' collides", "normalize: header constant collision", None),
     # FR-263
     (r"^two calls that may print in one statement", "sequencing: two printing calls (normalizer)", None),
     (r"^identifier '.*' is reserved by the canonical Rust spelling", "identifier: reserved by canonical spelling", None),
@@ -380,6 +384,17 @@ RULES = [
     (r"^function '.*' may reach its end without returning", "typing: may fall off end of non-void function", None),
     (r"^redeclaration of '.*' in the same scope$", "typing: shadowing redeclaration in same scope", None),
     (r"^variable '.*' has the name of a function$", "typing: variable named like a function", None),
+    # FR-264 namespace-scope constants ("global variable" stays the mutable /
+    # extern / volatile / thread_local tag; internal-constant visibility reuses
+    # the FR-260 "is internal to namespace" needle)
+    (r"^variable '.*' has the name of a constant$", "typing: variable named like a constant", None),
+    (r"^constant of non-kernel type '(.*)'$", "constant of non-kernel type", "type"),
+    (r"^constant initializer is not a constant expression$", "constant: non-constant initializer", None),
+    (r"^constant '.*' used before its definition", "constant: used before definition", None),
+    (r"^constant '.*' (defined twice|has the name of a (function|namespace|struct))", "constant: name collision",
+     None),
+    (r"^internal constant at the root", "constant: internal at the root (N14)", None),
+    (r"^use of undeclared constant", "typing: use of undeclared constant (cascade)", None),
     (r"^initializer of '.*' refers to a variable of the same name$", "typing: self-referential initializer name", None),
     (r"^use of undeclared variable", "typing: use of undeclared variable (cascade)", None),
     (r"^call to undeclared function", "typing: call to undeclared function (cascade)", None),
