@@ -13,6 +13,13 @@ rewrite rules (normalize.RULES) instead of refusing their patterns; each
 applied rule is a located `SRC:line:col: note: normalized: <rule>` line on
 stderr.  The output is canonical subset C++/Rust: ``--emit=cpp`` prints
 the rewritten program, which re-imports WITHOUT --normalize.
+
+FR-254 R4: with ``--project-root DIR`` as well, an ``inline`` /
+``constexpr`` / ``static`` free function DEFINED in a header under DIR and
+reachable from the main file is imported into one unity translation unit
+(`note: normalized: header-inline 'NAME' from HEADER`).  Its residuals are
+located in the header, and every call of a header function with a residual
+is itself refused at the call site, so the caller is never counted clean.
 """
 
 import argparse
@@ -32,13 +39,53 @@ from .cxx_import import ClangError, cxx_import
 
 def _key(item):
     loc = item[0]
-    return (loc is None, loc.line if loc else 0, loc.col if loc else 0, item[1])
+    return (loc is None, (loc.file or "") if loc else "", loc.line if loc else 0, loc.col if loc else 0, item[1])
 
 
-def load_cpp(path, clang, normalize=False, notes=None):
+def header_cascade(prog, spans, errs):
+    """FR-254 R4: the calls of imported header functions that have an error
+    (their own, or a call of another such function), as located refusals at
+    each call site -- in the main file this is what makes the CALLER
+    non-clean (a per-function census attributes only main-file lines)."""
+    if not spans:
+        return []
+    real = {}
+
+    def rp(f):
+        if f not in real:
+            real[f] = os.path.realpath(f)
+        return real[f]
+
+    bad = set()
+    for loc, _ in errs:
+        if loc is None or loc.file is None:
+            continue
+        for path, (f, l0, l1) in spans.items():
+            if rp(f) == rp(loc.file) and l0 <= loc.line <= l1:
+                bad.add(path)
+    calls = []  # (callee, caller path if a header function else None, loc)
+    for fn in prog.all_funcs():
+        caller = fn.path if (fn.loc is not None and fn.loc.file is not None and fn.path in spans) else None
+        for n in K.walk(fn.body):
+            if isinstance(n, K.Call) and n.name in spans:
+                calls.append((n.name, caller, n.loc))
+    changed = True
+    while changed:
+        changed = False
+        for callee, caller, _ in calls:
+            if callee in bad and caller is not None and caller not in bad:
+                bad.add(caller)
+                changed = True
+    return [(loc, "unsupported: call of a rejected header function '%s'" % callee.rsplit("::", 1)[-1])
+            for callee, _, loc in calls if callee in bad]
+
+
+def load_cpp(path, clang, normalize=False, notes=None, project_root=None):
     """(normalized program or None, [(loc, msg)]).  FR-254: ``normalize``
-    applies the rewrite rules, appending each application to ``notes``."""
-    surf = cxx_import(path, clang, normalize, notes)
+    applies the rewrite rules, appending each application to ``notes``;
+    R4: ``project_root`` imports reachable project-header functions."""
+    spans = {}
+    surf = cxx_import(path, clang, normalize, notes, project_root, spans)
     errs = [(r.loc, "unsupported: " + r.reason) for r in K.residuals(surf)]
     prog = TC.normalize(surf)
     for loc, msg in TC.check(prog):
@@ -46,6 +93,7 @@ def load_cpp(path, clang, normalize=False, notes=None):
             continue
         errs.append((loc, msg if msg.startswith("unsupported:") else "unsupported: " + msg))
     if errs:
+        errs += header_cascade(prog, spans, errs)
         return None, sorted(set(errs), key=_key)
     return prog, []
 
@@ -58,15 +106,15 @@ def load_rust(path):
 
 
 def report_notes(path, notes):
-    for loc, msg in sorted(set(notes), key=lambda x: (x[0] is None, x[0].line if x[0] else 0,
-                                                 x[0].col if x[0] else 0)):
-        where = "%s:%d:%d" % (path, loc.line, loc.col) if loc else "%s:1:1" % path
+    for loc, msg in sorted(set(notes), key=lambda x: (x[0] is None, (x[0].file or "") if x[0] else "",
+                                                 x[0].line if x[0] else 0, x[0].col if x[0] else 0)):
+        where = "%s:%d:%d" % (loc.file or path, loc.line, loc.col) if loc else "%s:1:1" % path
         sys.stderr.write("%s: note: %s\n" % (where, msg))
 
 
 def report(path, errs):
     for loc, msg in errs:
-        where = "%s:%d:%d" % (path, loc.line, loc.col) if loc else "%s:1:1" % path
+        where = "%s:%d:%d" % (loc.file or path, loc.line, loc.col) if loc else "%s:1:1" % path
         sys.stderr.write("%s: error: %s\n" % (where, msg))
 
 
@@ -116,6 +164,7 @@ def main(argv=None):
     ap.add_argument("--build", action="store_true")
     ap.add_argument("--check-roundtrip", action="store_true")
     ap.add_argument("--normalize", action="store_true")
+    ap.add_argument("--project-root", dest="project_root")
     ap.add_argument("--clang", default="clang++")
     ap.add_argument("src")
     a = ap.parse_args(argv)
@@ -130,6 +179,9 @@ def main(argv=None):
     if a.normalize and lang != "cpp":
         sys.stderr.write("error: --normalize applies to C++ input only\n")
         return 1
+    if a.project_root is not None and not a.normalize:
+        sys.stderr.write("error: --project-root needs --normalize\n")
+        return 1
     if emit == "crate" and not a.out:
         sys.stderr.write("error: --emit=crate needs -o DIR\n")
         return 1
@@ -137,7 +189,7 @@ def main(argv=None):
     notes = []
     try:
         if lang == "cpp":
-            prog, errs = load_cpp(a.src, a.clang, a.normalize, notes)
+            prog, errs = load_cpp(a.src, a.clang, a.normalize, notes, a.project_root)
         else:
             prog, errs = load_rust(a.src)
     except ClangError as ex:

@@ -344,15 +344,24 @@ R4_CMP = ("pointer comparison (Rust compares slices by contents, and suffixes of
 R4_DIFF = "pointer difference (a Rust slice has no address to subtract)"
 R6_NULL = "null pointer (the subset's pointers always point into an object)"
 
+# FR-254 R4 (normalize header-inline) refusals
+HDR_CALL = "call of a rejected header function '%s'"
+HDR_OVERLOAD = ("header function '%s' is overloaded (normalize header-inline: the subset has one function per "
+                "name)")
+HDR_COLLIDE = ("header function '%s' has the same name as a function of the main file (normalize header-inline: "
+               "the subset has one function per name)")
+
 
 def friendly(kind):
     return FRIENDLY.get(kind, kind)
 
 
 class _Loc:
-    """Byte-offset -> (line, col) for the main file."""
+    """Byte-offset -> (line, col) for the main file (``file`` None) or, for
+    FR-254 R4, one project header (``file`` its clang spelling)."""
 
-    def __init__(self, data):
+    def __init__(self, data, file=None):
+        self.file = file
         self.starts = [0]
         for i, b in enumerate(data):
             if b == 0x0A:
@@ -362,6 +371,8 @@ class _Loc:
         if off is None:
             return None
         i = bisect.bisect_right(self.starts, off) - 1
+        if self.file is not None:
+            return K.Loc(i + 1, off - self.starts[i] + 1, self.file)
         return K.Loc(i + 1, off - self.starts[i] + 1)
 
 
@@ -455,6 +466,12 @@ class CxxImporter:
         self._std = None  # FR-253: ids of the functions declared directly in namespace std
         self.normalize = False  # FR-254: apply normalize.RULES instead of refusing their patterns
         self.notes = []  # FR-254: (loc, "normalized: <rule>") per applied rule
+        # FR-254 R4 (header-inline): on when normalize and project_root are set
+        self.project_root = None  # realpath of --project-root
+        self.decl_file = {}  # FunctionDecl id -> clang's file spelling
+        self.hdr_bad = {}  # decl id -> name of a reachable header function refused whole
+        self.hdr_spans = {}  # imported header function path -> (file, first line, last line)
+        self.file_lines = {}  # header file -> (_Loc, bytes)
 
     # -------------------------------------------------------------- utils
     def is_main(self, f):
@@ -584,6 +601,8 @@ class CxxImporter:
                 if x.get("kind", "").endswith("Decl"):
                     self.decl_main[x["id"]] = in_main
                     self.decl_info[x["id"]] = x
+                    if x.get("kind") == "FunctionDecl":
+                        self.decl_file[x["id"]] = f
                     if not in_main and x.get("kind") == "FunctionDecl" and x.get("name") == "printf":
                         self.libc_printf.add(x["id"])
                     if x.get("name") in INT_TYPEDEFS:
@@ -615,10 +634,14 @@ class CxxImporter:
             prev = n.get("previousDecl")
             if prev and prev not in self.user_funcs:
                 self.user_funcs[prev] = K.path_of(ns, n.get("name"))
+        # FR-254 R4: project-header definitions reachable from this file
+        hfuncs, hkeys = [], {}
+        if self.normalize and self.project_root is not None:
+            hfuncs = self.header_imports(top, mains, funcs, items, hkeys)
         # signatures (for typing calls)
         self.sigs = TC.Sigs()
         defined = set()
-        for n, ns, internal in funcs:
+        for n, ns, internal in funcs + [(h[0], h[1], h[2]) for h in hfuncs]:
             if self.has_body(n):
                 self.ctx_ns = ns
                 ptys, ret = self.signature_types(n)
@@ -635,11 +658,200 @@ class CxxImporter:
                     items.append(K.ResidualItem("function declared but not defined", self.loc(n)))
                 continue
             items.append(self.func(n, ns, internal))
+        for n, ns, internal, f, key in hfuncs:
+            with self.in_file(f):
+                fn = self.func(n, ns, internal)
+            hkeys[id(fn)] = key
+            items.append(fn)
         for sd in structs:
             items.append(self.struct_def(sd, items))
-        # keep source order
-        items.sort(key=lambda it: (it.loc.line, it.loc.col) if it.loc else (0, 0))
+        # keep source order; an imported header function sits right before
+        # the first main-file function that reaches it, callees first
+        items.sort(key=lambda it: hkeys.get(id(it)) or (
+            (it.loc.line, it.loc.col, 0, 0) if it.loc else (0, 0, 0, 0)))
         return K.Program(tuple(items))
+
+    # -------------------------------------------------------------- FR-254 R4
+    def in_file(self, f):
+        """Locate everything imported inside the ``with`` in header ``f``."""
+        imp = self
+
+        class _Ctx:
+            def __enter__(self):
+                if f not in imp.file_lines:
+                    with open(f, "rb") as fh:
+                        data = fh.read()
+                    imp.file_lines[f] = (_Loc(data, f), data)
+                self.old = (imp.lines, imp.source)
+                imp.lines, imp.source = imp.file_lines[f]
+
+            def __exit__(self, *a):
+                imp.lines, imp.source = self.old
+
+        return _Ctx()
+
+    def in_project_header(self, f):
+        if f is None or self.is_main(f):
+            return False
+        r = self.realcache.get(f)
+        if r is None:
+            r = self.realcache[f] = os.path.realpath(f)
+        return r.startswith(self.project_root + os.sep)
+
+    def canon(self, i):
+        seen = set()
+        while i in self.decl_info and i not in seen:
+            seen.add(i)
+            prev = self.decl_info[i].get("previousDecl")
+            if not prev:
+                break
+            i = prev
+        return i
+
+    @staticmethod
+    def fn_refs(n):
+        """Decl ids of the functions ``n`` names (DeclRefExpr), in print order."""
+        out = []
+        stack = [n]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, list):
+                stack.extend(reversed(x))
+                continue
+            if not isinstance(x, dict):
+                continue
+            if x.get("kind") == "DeclRefExpr":
+                rd = x.get("referencedDecl") or {}
+                if rd.get("kind") == "FunctionDecl" and rd.get("id"):
+                    out.append(rd["id"])
+            kids = [v for k, v in x.items()
+                    if k not in ("loc", "range", "type", "referencedDecl", "foundReferencedDecl")
+                    and isinstance(v, (list, dict))]
+            stack.extend(reversed(kids))
+        return out
+
+    def header_imports(self, top, mains, funcs, items, hkeys):
+        """FR-254 R4 header-inline: the project-header free functions
+        (``inline``, ``constexpr`` or ``static``, with a body; never a
+        template or a member) REACHABLE by calls from this file's
+        declarations, transitively -- lazily, because an eager import
+        regressed a TU in the FR-262 spike.  Each is judged by the ordinary
+        rules, located in its header.  Returns [(node, ns, internal, file,
+        sort key)] in post-order (callees first); a reachable function
+        that cannot be imported (an overload, a name the main file defines)
+        becomes a located ResidualItem in the header, and its calls refuse
+        at the call site (``self.hdr_bad``)."""
+        defs = {}  # canonical decl id -> (node, ns, internal, file)
+
+        def index(n, ns, internal):
+            k = n.get("kind")
+            if k == "NamespaceDecl":
+                name = n.get("name") or ""
+                ns2, int2 = (ns + (name,), internal) if name else (ns, True)
+                if n.get("isInline") or (name and internal):
+                    return  # refused namespaces (collect's rules): no import
+                for c in n.get("inner", []):
+                    index(c, ns2, int2)
+            elif k == "FunctionDecl" and not n.get("isImplicit") and self.has_body(n):
+                f = self.decl_file.get(n["id"])
+                if not self.in_project_header(f):
+                    return
+                if not (n.get("inline") or n.get("constexpr") or n.get("storageClass") == "static"):
+                    return
+                defs[self.canon(n["id"])] = (n, ns, internal, f)
+
+        for n in top:
+            index(n, (), False)
+        if not defs:
+            return []
+        order, anchor, seen = [], {}, set()
+
+        def visit(c, anc):
+            stack = [(c, iter(self.fn_refs(defs[c][0])))]
+            seen.add(c)
+            while stack:
+                cur, it = stack[-1]
+                for rid in it:
+                    c2 = self.canon(rid)
+                    if c2 in defs and c2 not in seen:
+                        seen.add(c2)
+                        stack.append((c2, iter(self.fn_refs(defs[c2][0]))))
+                        break
+                else:
+                    stack.pop()
+                    order.append(cur)
+                    anchor[cur] = anc
+
+        def roots(n, anc):
+            if not isinstance(n, dict):
+                return
+            if n.get("kind") in ("FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl",
+                                 "CXXDestructorDecl", "CXXConversionDecl") and self.has_body(n):
+                anc = self.lines.at(_off(n.get("loc"))) or anc
+                for rid in self.fn_refs(n):
+                    c = self.canon(rid)
+                    if c in defs and c not in seen:
+                        visit(c, anc)
+                return
+            for k, v in n.items():
+                if k in ("loc", "range", "type", "referencedDecl", "foundReferencedDecl"):
+                    continue
+                for x in (v if isinstance(v, list) else [v] if isinstance(v, dict) else []):
+                    if x.get("kind") in ("DeclRefExpr",):
+                        rd = x.get("referencedDecl") or {}
+                        c = self.canon(rd.get("id"))
+                        if c in defs and c not in seen:
+                            visit(c, anc)
+                    else:
+                        roots(x, anc)
+
+        for n in mains:
+            roots(n, self.lines.at(_off(n.get("loc"))))
+        if not order:
+            return []
+        main_paths = {}
+        for n, ns, internal in funcs:
+            main_paths.setdefault(K.path_of(ns, n.get("name")), []).append(self.canon(n["id"]))
+        by_path = {}
+        for c in order:
+            n, ns, internal, f = defs[c]
+            by_path.setdefault(K.path_of(ns, n.get("name")), []).append(c)
+        ids_of = {}
+        for i, x in self.decl_info.items():
+            if x.get("kind") == "FunctionDecl":
+                c = self.canon(i)
+                if c in anchor:
+                    ids_of.setdefault(c, []).append(i)
+        out = []
+        for k, c in enumerate(order):
+            n, ns, internal, f = defs[c]
+            name = n.get("name")
+            path = K.path_of(ns, name)
+            a = anchor[c]
+            key = (a.line, a.col, -1, k) if a else (0, 0, -1, k)
+            why = None
+            if len(by_path[path]) > 1:
+                why = HDR_OVERLOAD % name
+            elif any(mc != c for mc in main_paths.get(path, [])):
+                why = HDR_COLLIDE % name
+            with self.in_file(f):
+                hl = self.lines.at(_off(n.get("loc")))
+                rg = n.get("range") or {}
+                l0 = self.lines.at(_off(rg.get("begin"))) or hl
+                l1 = self.lines.at(_off(rg.get("end"))) or hl
+            if why is not None:
+                for i in ids_of.get(c, [c]):
+                    self.hdr_bad[i] = name
+                ri = K.ResidualItem(why, hl)
+                hkeys[id(ri)] = key
+                items.append(ri)
+                continue
+            for i in ids_of.get(c, [c]):
+                self.user_funcs[i] = path
+            self.hdr_spans[path] = (f, l0.line, l1.line)
+            self.notes.append((hl, "normalized: header-inline '%s' from %s" % (name, f)))
+            out.append((n, ns, internal, f, key))
+        return out
 
     def typedef_seen(self, x):
         """FR-259 (N20): a declaration named like a <cstdint>/<cstddef> type.
@@ -1793,6 +2005,8 @@ class CxxImporter:
             fname = self.user_funcs.get(rd.get("id"))
             if fname is None and rd.get("id") in self.bad_funcs:
                 return K.ResidualExpr("call of a rejected function template", L, cascade=True)
+            if fname is None and rd.get("id") in self.hdr_bad:
+                return self.rexpr(n, HDR_CALL % self.hdr_bad[rd["id"]])
             if fname is None:
                 alg = self.alg_value(n)  # FR-253
                 if alg is not None:
@@ -3190,17 +3404,23 @@ def _split_captures(text):
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
 
 
-def cxx_import(path, clang="clang++", normalize=False, notes=None):
+def cxx_import(path, clang="clang++", normalize=False, notes=None, project_root=None, headers=None):
     """Surface IR for the C++ file at ``path`` (may contain Residuals).
 
     FR-254: ``normalize`` applies normalize.RULES; each applied rule is
-    appended to ``notes`` as (loc, "normalized: <rule>")."""
+    appended to ``notes`` as (loc, "normalized: <rule>").  R4: with
+    ``project_root`` too, reachable project-header functions are imported;
+    ``headers`` (a dict) receives their path -> (file, first, last line)."""
     ast = run_clang(path, clang)
     with open(path, "rb") as f:
         source = f.read()
     imp = CxxImporter(path, ast, source)
     imp.normalize = normalize
+    if project_root is not None:
+        imp.project_root = os.path.realpath(project_root)
     prog = imp.run()
     if notes is not None:
         notes.extend(imp.notes)
+    if headers is not None:
+        headers.update(imp.hdr_spans)
     return prog
