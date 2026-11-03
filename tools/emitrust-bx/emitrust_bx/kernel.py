@@ -68,10 +68,15 @@ from typing import Optional, Tuple, Union
 
 @dataclass(frozen=True)
 class Loc:
-    """A 1-based source position. Never part of node equality."""
+    """A 1-based source position. Never part of node equality.
+
+    ``file`` is None for the main file (every position before FR-254 R4) and
+    the header's path (as clang spelled it) for a definition the normalizer
+    imported from a project header, so its residuals are located THERE."""
 
     line: int
     col: int
+    file: Optional[str] = None
 
     def __str__(self):
         return "%d:%d" % (self.line, self.col)

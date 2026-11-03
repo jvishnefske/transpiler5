@@ -325,6 +325,14 @@ RULES = [
     (r"^increment/decrement of '.*' used as a value in a statement that calls a closure",
      "normalize: incdec with indirect call", None),
     (r"^increment/decrement used as a value in a `return` of type '(.*)'", "normalize: incdec return type", "type"),
+    # FR-254 R4 header-inline (only under --normalize --project-root): the
+    # CALLER's residual names its header callee (sub libfn:NAME, like a library
+    # call); the header's own residuals are located in the header, which a
+    # per-main-file-function census does not attribute.
+    (r"^call of a rejected header function '(.*)'$", "normalize: header-inline callee rejected", "libfn"),
+    (r"^header function '.*' is overloaded \(normalize header-inline", "normalize: header-inline overload", None),
+    (r"^header function '.*' has the same name as a function of the main file",
+     "normalize: header-inline name collision", None),
     # FR-263
     (r"^two calls that may print in one statement", "sequencing: two printing calls (normalizer)", None),
     (r"^identifier '.*' is reserved by the canonical Rust spelling", "identifier: reserved by canonical spelling", None),
