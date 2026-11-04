@@ -1,0 +1,142 @@
+diff --git a/tools/emitrust-bx/emitrust_bx/cxx_import.py b/tools/emitrust-bx/emitrust_bx/cxx_import.py
+index d43b0d6..734f742 100644
+--- a/tools/emitrust-bx/emitrust_bx/cxx_import.py
++++ b/tools/emitrust-bx/emitrust_bx/cxx_import.py
+@@ -144,6 +144,7 @@ import json
+ import os
+ import re
+ import subprocess
++ENUM_SPIKE = os.environ.get('BX_ENUM_SPIKE') == '1'  # SPIKE instrument (enum row), never commit
+ 
+ from . import fmt
+ from . import kernel as K
+@@ -560,6 +561,13 @@ class CxxImporter:
+             c2 = c2 or c3
+         if kt is not None:
+             return kt, const or c2, q
++        if ENUM_SPIKE:
++            for cand in (d, s):
++                c = (cand or "").replace("enum ", "").strip()
++                if c.startswith("const "):
++                    c = c[6:]
++                if c in self.enum_names or c.split("::")[-1] in self.enum_short:
++                    return K.I32, const, q
+         return None, const, q
+ 
+     # -------------------------------------------------------------- FR-257
+@@ -622,6 +630,9 @@ class CxxImporter:
+             trk.node(rest, visit)
+             if in_main and not n.get("isImplicit"):
+                 mains.append(n)
++        self.enum_names, self.enum_short, self.enum_vals = set(), set(), {}
++        if ENUM_SPIKE:
++            self.spike_enums(top, ())
+         # FR-260: every namespace decl (any file) -> (path, internal)
+         self.ns_index = {}
+         for n in top:
+@@ -1001,6 +1012,49 @@ class CxxImporter:
+             out.append((n, ns, internal, f, key))
+         return out
+ 
++    def spike_enum_t(self, rs):
++        if not ENUM_SPIKE:
++            return None
++        c = (rs or "").replace("enum ", "").strip()
++        if c.startswith("const "):
++            c = c[6:]
++        if c in self.enum_names or c.split("::")[-1] in self.enum_short:
++            return K.I32
++        return None
++
++    def spike_enums(self, nodes, path):
++        for x in nodes:
++            if not isinstance(x, dict):
++                continue
++            k = x.get("kind")
++            nm = x.get("name") or ""
++            if k == "EnumDecl":
++                if nm:
++                    self.enum_names.add("::".join(path + (nm,)))
++                    self.enum_short.add(nm)
++                v = -1
++                for c in x.get("inner", []):
++                    if c.get("kind") == "EnumConstantDecl":
++                        ex = [y for y in c.get("inner", []) if isinstance(y, dict)]
++                        val = None
++                        while ex and "value" not in ex[0] and ex[0].get("inner"):
++                            ex = [z for z in ex[0]["inner"] if isinstance(z, dict)]
++                        for y in ex[:1]:
++                            if "value" in y:
++                                try:
++                                    val = int(y["value"])
++                                except (TypeError, ValueError):
++                                    pass
++                        v = val if val is not None else v + 1
++                        self.enum_vals[c["id"]] = v
++                continue
++            if k in ("TypedefDecl", "TypeAliasDecl") and "enum " in json.dumps(x.get("type", {})) + json.dumps(x.get("inner", [])[:1]):
++                if nm:
++                    self.enum_names.add("::".join(path + (nm,)))
++                    self.enum_short.add(nm)
++            if k in ("NamespaceDecl", "CXXRecordDecl", "LinkageSpecDecl", "ClassTemplateDecl"):
++                self.spike_enums(x.get("inner", []), path + ((nm,) if nm and k != "LinkageSpecDecl" else ()))
++
+     def typedef_seen(self, x):
+         """FR-259 (N20): a declaration named like a <cstdint>/<cstddef> type.
+         The real ones (global, std) are typedefs of the expected builtin; a
+@@ -1103,6 +1157,10 @@ class CxxImporter:
+                 items.append(K.ResidualItem(r, self.loc(n)))
+                 return
+             self.consts.append((n, ns, internal))
++        elif ENUM_SPIKE and k == "EnumDecl":
++            return
++        elif ENUM_SPIKE and k in ("TypedefDecl", "TypeAliasDecl") and (n.get("name") or "") in self.enum_short:
++            return
+         elif k == "NamespaceAliasDecl":
+             al = n.get("aliasedNamespace", {}).get("id")
+             if al in self.ns_index and self.decl_main.get(al):
+@@ -1331,7 +1389,7 @@ class CxxImporter:
+             rs = self.ret_type_str(m)
+             if rs.endswith("const"):
+                 rs = rs[:-len("const")].strip()
+-            ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0]
++            ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0] or self.spike_enum_t(rs)
+         self.sigs[mpath] = (tuple(ptys), ret)
+         self.sigs.recv[mpath] = recv
+ 
+@@ -1414,7 +1472,7 @@ class CxxImporter:
+                     continue
+                 ptys.append(self.map_type(p.get("type"))[0])
+         rs = self.ret_type_str(n)
+-        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0]
++        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0] or self.spike_enum_t(rs)
+         return tuple(ptys), ret
+ 
+     # -------------------------------------------------------------- funcs
+@@ -1484,7 +1542,7 @@ class CxxImporter:
+         rs = self.ret_type_str(n)
+         if rs.endswith(" const") and recv == "ref":
+             rs = rs[:-len(" const")]
+-        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0]
++        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0] or self.spike_enum_t(rs)
+         bs = self.rejected_struct(ret) if recv != "ctor" else None
+         if bs is not None:
+             pre.append(K.ResidualStmt(STRUCT_USE % bs, floc))
+@@ -2184,6 +2242,8 @@ class CxxImporter:
+             if rk == "VarDecl":
+                 return self.rexpr(n, "global variable")
+             if rk == "EnumConstantDecl":
++                if ENUM_SPIKE:
++                    return K.IntLit(self.enum_vals.get(rd.get("id"), 0), K.I32, L)
+                 return self.rexpr(n, "enumerator")
+             if rk == "FunctionDecl":
+                 return self.rexpr(n, "function used as a value")
+@@ -3156,7 +3216,7 @@ class CxxImporter:
+             rs = q.rsplit("->", 1)[1].strip()
+         else:
+             rs = q[:q.find("(")].strip() if "(" in q else q
+-        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0]
++        ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0] or self.spike_enum_t(rs)
+         ptys = [self.map_type(p.get("type")) for p in op.get("inner", []) if p.get("kind") == "ParmVarDecl"]
+         return ptys, ret, rs
+ 

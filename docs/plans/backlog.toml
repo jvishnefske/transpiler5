@@ -1855,3 +1855,13 @@ title = "Header-class import for out-of-line member functions (36 + 13 ctor/dtor
 summary = "SPIKED 2026-11-03: NO-GO ON YIELD. Full blocker sets for all 49: 0 of 15 header classes importable; no single row unlocks any function; arrays + subscript +2, + private +3, + DCHECK abort +5 (halved ~+2..+3). Only narrow GO: a [T; N] row if wanted for its own sake (~+1 halved)."
 blocked_by = []
 anchor = "FR-267 (opened and SPIKED 2026-11-03, from the FR-264 frontier): **HEADER-CLASS IMPORT"
+
+[[items]]
+id = "FR-268"
+kind = "feature"
+status = "no-go"
+size = "M"
+title = "BX enum row (unscoped/scoped enums, enumerators, enum-typed values)"
+summary = "SPIKED 2026-11-03: NO-GO ON YIELD. Accepting enums moves EMIT 35 -> 37 of 392 but both gains call a rejected brotli wrapper (+0 transitive, ~+1 halved). Representation settled: newtype struct + consts (repr enum fails on duplicate discriminants and int->enum casts). Build when a class row makes the state-machine enums reachable."
+blocked_by = ["FR-267"]
+anchor = "FR-268 (opened and SPIKED 2026-11-03, from the FR-264 frontier): **ENUM ROW: NO-GO ON"
