@@ -162,7 +162,7 @@ def generic(reason):
 
 
 # (regex on the reason with any leading "unsupported: " removed, TAG, SUB-KIND)
-# SUB-KIND: None | "type" (group 1 is a C++ type spelling) | "libfn" | "op" |
+# SUB-KIND: None | "type" (group 1 is a C++ type spelling) | "libfn" | "struct" | "op" |
 #           "cast" | "kty" | "init" | "generic" (sub = generic-normalized text)
 RULES = [
     # ---- importer (cxx_import.py) -----------------------------------------
@@ -228,22 +228,30 @@ RULES = [
     (r"^struct with members outside the subset$", "struct: has members outside the subset", None),
     (r"^member function of a struct with members outside the subset$", "struct: has members outside the subset", None),
     (r"^definition of a rejected member function$", "struct: definition of a rejected member", None),
-    (r"^(private or protected member|bit-field|default member initializer|mutable data member"
-     r"|unnamed data member|const data member|static data member|operator overload"
-     r"|virtual member function|defaulted or deleted member function|volatile member function"
-     r"|user-declared copy or move constructor|overloaded constructor|user-declared destructor"
-     r"|friend declaration|member function template|nested class|enum inside a class"
-     r"|member typedef|static_assert inside a class|using-declaration inside a class"
-     r"|anonymous union or struct member|conversion operator|member function declared but not defined"
-     r"|use of a rejected data member|use of a rejected member function|member function used as a value"
-     r"|member access on a temporary|member function call on a temporary"
-     r"|static member function called through an object"
-     r"|aggregate initialization that omits data members"
-     r"|aggregate initialization of a struct with rejected data members"
-     r"|struct variable without an initializer"
-     r"|delegating or base-class constructor initializer)\b", "struct: member", "generic"),
+    # FR-266: one tag per member reason (was one generic `struct: member`
+    # bucket, which the frontier could not rank).  A rejected MEMBER's use
+    # and an aggregate over rejected members are cascades of the member row.
+    *[(r"^%s\b" % re.escape(w), "struct: " + w, None) for w in (
+        "private or protected member", "bit-field", "default member initializer", "mutable data member",
+        "unnamed data member", "const data member", "static data member", "operator overload",
+        "virtual member function", "defaulted or deleted member function", "volatile member function",
+        "user-declared copy or move constructor", "overloaded constructor", "user-declared destructor",
+        "friend declaration", "member function template", "nested class", "enum inside a class",
+        "member typedef", "static_assert inside a class", "using-declaration inside a class",
+        "anonymous union or struct member", "conversion operator", "member function declared but not defined",
+        "member function used as a value", "member access on a temporary", "member function call on a temporary",
+        "static member function called through an object", "aggregate initialization that omits data members",
+        "delegating or base-class constructor initializer")],
+    (r"^use of a rejected data member$", "struct: use of a rejected data member (cascade)", None),
+    (r"^use of a rejected member function$", "struct: use of a rejected member function (cascade)", None),
+    (r"^aggregate initialization of a struct with rejected data members$",
+     "struct: aggregate initialization of a struct with rejected data members (cascade)", None),
+    (r"^struct variable without an initializer\b", "struct: struct variable without an initializer", None),
+    # FR-266: a USE of a rejected struct (parameter, local, return, member,
+    # call, construction, or a data member of another struct); sub names it
+    (r"^use of a rejected struct '(.*)'$", "struct: use of a rejected struct (cascade)", "struct"),
     (r"^data member of type '(.*)'$", "struct: data member of non-kernel type", "type"),
-    (r"^.* inside a class$", "struct: member", "generic"),
+    (r"^.* inside a class$", "struct: other member inside a class", "generic"),
     (r"^value-initialized or default-initialized struct", "struct: default/value initialization", None),
     (r"^(constructor whose body|constructor of '.*' whose body) is not a member-initializer",
      "struct: constructor body", None),
@@ -464,6 +472,8 @@ def classify(raw_reason):
             sub = type_sub(m.group(1))
         elif kind == "libfn":
             sub = "libfn:" + m.group(1)
+        elif kind == "struct":
+            sub = "struct:" + m.group(1)
         elif kind == "op":
             sub = "op:" + m.group(1)
         elif kind == "cast":

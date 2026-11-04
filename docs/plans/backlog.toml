@@ -1834,3 +1834,24 @@ title = "Hybrid wedge: LLM rewrites blocked functions into the bx subset, certif
 summary = "SPIKED 2026-11-03: NO-GO as a pipeline stage. 15/20 sampled blocked woff2/brunsli functions certified (75%, CI 51-91%), but 11 of 15 needed a signature change or a module-wide type redesign; the 4 drop-ins need no LLM (missing rows / normalizer rules). Byte-diff caught 17/17 injected mutants but certified a borrow->copy ownership change under the natural driver. Next: type rows (stored borrows/Option, private classes, vector erase/insert, const arrays, abort) or a type-first spike."
 blocked_by = []
 anchor = "FR-265 (opened and SPIKED 2026-11-03, from FR-256's kill criterion and the PMF"
+
+[[items]]
+id = "FR-266"
+kind = "feature"
+status = "landed"
+rank = 60
+size = "S"
+title = "BX phantom EMIT on uses: a use of a rejected struct is a located cascade residual"
+summary = "Uses of a rejected struct (params, returns, locals, member access/calls, aggregate init) and structs holding one by value were silently accepted, so the per-function census could count them as EMIT. Now an additive located cascade; census struct:member bucket split per reason. bx-frontier EMIT 35 -> 35, same set. TRACTOR +0."
+blocked_by = ["FR-262"]
+anchor = "FR-266 (opened 2026-11-03, from FR-267's spike): **BX PHANTOM EMIT ON USES"
+
+[[items]]
+id = "FR-267"
+kind = "feature"
+status = "no-go"
+size = "L"
+title = "Header-class import for out-of-line member functions (36 + 13 ctor/dtor single-tag functions)"
+summary = "SPIKED 2026-11-03: NO-GO ON YIELD. Full blocker sets for all 49: 0 of 15 header classes importable; no single row unlocks any function; arrays + subscript +2, + private +3, + DCHECK abort +5 (halved ~+2..+3). Only narrow GO: a [T; N] row if wanted for its own sake (~+1 halved)."
+blocked_by = []
+anchor = "FR-267 (opened and SPIKED 2026-11-03, from the FR-264 frontier): **HEADER-CLASS IMPORT"

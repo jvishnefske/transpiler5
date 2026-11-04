@@ -346,6 +346,10 @@ R6_NULL = "null pointer (the subset's pointers always point into an object)"
 
 # FR-254 R4 (normalize header-inline) refusals
 HDR_CALL = "call of a rejected header function '%s'"
+# FR-266: a USE of a struct that is itself rejected (in an otherwise accepted
+# function, or as a data member of another struct), located at the use so a
+# per-function census never counts the user as clean
+STRUCT_USE = "use of a rejected struct '%s'"
 HDR_OVERLOAD = ("header function '%s' is overloaded (normalize header-inline: the subset has one function per "
                 "name)")
 HDR_COLLIDE = ("header function '%s' has the same name as a function of the main file (normalize header-inline: "
@@ -445,6 +449,8 @@ class CxxImporter:
         self.records = []  # (node, ns, internal) main-file struct definitions
         self.bad_records = set()  # ids of records with a residual AT the class
         self.record_path = {}  # record decl id -> absolute path
+        self.bad_struct_paths = set()  # FR-266: absolute paths of the rejected structs
+        self.struct_uses = None  # FR-266: use residuals of the function being imported
         self.struct_canon = {}  # canonical clang spelling -> path
         self.struct_paths = set()
         self.field_ids = {}  # FieldDecl id -> (struct path, name)
@@ -663,6 +669,7 @@ class CxxImporter:
                     self.sigs.setdefault(path, (ptys, ret))
                 defined.add(path)
         structs = [self.struct_shell(n, ns, internal, items) for n, ns, internal in self.records]
+        self.reject_containing(structs, items)
         for n in self.out_of_line:
             items.extend(self.attach_definition(n))
         for n, ns, internal in funcs:
@@ -1177,6 +1184,71 @@ class CxxImporter:
         self.sigs.structs[path] = shell
         return sh
 
+    def reject_containing(self, structs, items):
+        """FR-266: a struct holding a rejected struct BY VALUE (directly or as
+        a std::vector element) cannot be emitted either: one located residual
+        at each such data member and one at the class (its members are
+        attributed by it, like any other member rejection).  A fixpoint, so a
+        struct holding such a struct is rejected in turn."""
+        changed = True
+        while changed:
+            changed = False
+            self.bad_struct_paths = {self.record_path[r] for r in self.bad_records if r in self.record_path}
+            for sh in structs:
+                if sh["node"]["id"] in self.bad_records:
+                    continue
+                hit = False
+                for f in sh["fields"]:
+                    bs = self.rejected_struct(f.ty, sh["path"])
+                    if bs is not None:
+                        items.append(K.ResidualItem(STRUCT_USE % bs, f.loc))
+                        hit = True
+                if hit:
+                    items.append(K.ResidualItem("struct with members outside the subset", sh["loc"]))
+                    self.bad_records.add(sh["node"]["id"])
+                    changed = True
+        self.bad_struct_paths = {self.record_path[r] for r in self.bad_records if r in self.record_path}
+
+    def rejected_struct(self, ty, own=False):
+        """FR-266: the path of a rejected struct that ``ty`` names (through a
+        reference, pointer, vector element or closure signature), or None.
+        ``own`` (default: the struct whose member function is being imported)
+        is never reported: its members are attributed at the class."""
+        if not self.bad_struct_paths:
+            return None
+        if own is False:
+            own = self.cur[0] if self.cur else None
+        stack = [ty]
+        while stack:
+            t = stack.pop()
+            if isinstance(t, (K.RefT, K.PtrT)):
+                stack.append(t.inner)
+            elif isinstance(t, K.VecT):
+                stack.append(t.elem)
+            elif isinstance(t, K.FnT):
+                stack.extend(t.params)
+                stack.append(t.ret)
+            elif isinstance(t, K.StructT) and t.path in self.bad_struct_paths and t.path != own:
+                return t.path
+        return None
+
+    def struct_use(self, bs, L):
+        """FR-266: record a use of rejected struct ``bs`` at ``L``.  ADDITIVE:
+        the expression is still imported exactly as before, so every residual
+        it had (a real blocker behind the cascade) is still reported; the use
+        becomes one more residual statement of the enclosing function.  None,
+        or a replacing residual outside any function (never silently lost)."""
+        if self.struct_uses is None:
+            return K.ResidualExpr(STRUCT_USE % bs, L)
+        self.struct_uses.append(K.ResidualStmt(STRUCT_USE % bs, L))
+        return None
+
+    def rejected_owner(self, mpath):
+        """FR-266: the rejected struct owning member function ``mpath``, or None."""
+        if not mpath or "::" not in mpath:
+            return None
+        return self.rejected_struct(K.StructT(mpath.rsplit("::", 1)[0]))
+
     def poison_member(self, m, path):
         if m.get("kind") == "FieldDecl":
             self.field_ids[m["id"]] = (path, None)
@@ -1350,6 +1422,7 @@ class CxxImporter:
         name = n.get("name")
         floc = self.lines.at(_off(n.get("loc")))
         pre = []
+        uses = self.struct_uses = []
         self.ctx_ns = ns
         self.cur = (owner["path"], recv) if owner else None
         if owner is not None:
@@ -1399,6 +1472,9 @@ class CxxImporter:
             if ty is None or ty == K.UNIT or (isinstance(K.deref(ty), K.VecT) and not K.elem_ok(K.deref(ty).elem)):
                 pre.append(K.ResidualStmt("parameter of type '%s'" % spelled, pl))
                 ty = K.I32
+            bs = self.rejected_struct(ty)
+            if bs is not None:
+                pre.append(K.ResidualStmt(STRUCT_USE % bs, pl))
             if p.get("init") or p.get("inner"):
                 pre.append(K.ResidualStmt("default argument", pl))
             mut = not const and not isinstance(ty, K.RefT)
@@ -1409,11 +1485,15 @@ class CxxImporter:
         if rs.endswith(" const") and recv == "ref":
             rs = rs[:-len(" const")]
         ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0]
+        bs = self.rejected_struct(ret) if recv != "ctor" else None
+        if bs is not None:
+            pre.append(K.ResidualStmt(STRUCT_USE % bs, floc))
         if recv == "ctor":
             ret = K.StructT(owner["path"])
             body = self.ctor_body(n, owner, floc)
             self.cur = None
-            return K.Func(name, tuple(params), ret, K.Block(tuple(pre) + (body,), self.loc(n)), floc,
+            self.struct_uses = None
+            return K.Func(name, tuple(params), ret, K.Block(tuple(pre + uses) + (body,), self.loc(n)), floc,
                           tuple(ns), False, owner["name"], recv)
         self.ret_ref = isinstance(ret, (K.RefT, K.PtrT))
         if isinstance(ret, K.RefT):
@@ -1444,6 +1524,8 @@ class CxxImporter:
         for s in inner:
             stmts.extend(self.stmt(s))
         self.cur = None
+        self.struct_uses = None
+        pre = pre + uses
         if owner is not None:
             return K.Func(name, tuple(params), ret, K.Block(tuple(pre + stmts), self.loc(body_node)), floc,
                           tuple(ns), False, owner["name"], recv)
@@ -1521,7 +1603,15 @@ class CxxImporter:
             if r is not None:
                 return r
         if k == "DeclStmt":
-            return [self.decl(d) for d in n.get("inner", []) if not self.spelling_only(d)]
+            out = []
+            for d in n.get("inner", []):
+                if self.spelling_only(d):
+                    continue
+                bs = self.rejected_struct(self.map_type(d.get("type"))[0]) if d.get("kind") == "VarDecl" else None
+                if bs is not None:
+                    out.append(K.ResidualStmt(STRUCT_USE % bs, self.loc(d)))
+                out.append(self.decl(d))
+            return out
         if k == "ReturnStmt":
             if self.in_main:
                 return [self.rstmt(n, "return inside main other than the final `return 0;`")]
@@ -2168,6 +2258,9 @@ class CxxImporter:
                 return self.rexpr(n, "call to library function '%s'" % rd.get("name"))
             if self.method_ids.get(rd.get("id"), "") is None:
                 return K.ResidualExpr("use of a rejected member function", L)
+            bs = self.rejected_owner(self.method_ids.get(rd.get("id")))
+            if bs is not None and self.struct_use(bs, L) is not None:
+                return K.ResidualExpr(STRUCT_USE % bs, L)
             if self.sigs.recv.get(fname) in ("ref", "mut"):
                 return self.rexpr(n, "member function call")
             args = self.import_args(fname, n["inner"][1:])
@@ -2381,6 +2474,9 @@ class CxxImporter:
         path, fname = info
         if fname is None:
             return K.ResidualExpr("use of a rejected data member", L)
+        bs = self.rejected_struct(K.StructT(path))
+        if bs is not None and self.struct_use(bs, L) is not None:
+            return K.ResidualExpr(STRUCT_USE % bs, L)
         base = self.strip(n["inner"][0])
         if n.get("isArrow"):
             if base.get("kind") == "CXXThisExpr" and self.cur is not None and self.cur[1] in ("ref", "mut"):
@@ -2405,6 +2501,9 @@ class CxxImporter:
         T = self.map_type(il.get("type"))[0]
         if not isinstance(T, K.StructT) or T.path not in self.sigs.structs:
             return self.rexpr(il, "initializer list")
+        bs = self.rejected_struct(T)
+        if bs is not None and self.struct_use(bs, L) is not None:
+            return K.ResidualExpr(STRUCT_USE % bs, L)
         sd = self.sigs.structs[T.path]
         elems = il.get("inner", []) or []
         if any(e.get("kind") == "ImplicitValueInitExpr" for e in elems) or "array_filler" in il:
@@ -2441,6 +2540,9 @@ class CxxImporter:
         cp = self.ctor_of_struct(T.path)
         if cp is None:
             return None
+        bs = self.rejected_struct(T)
+        if bs is not None and self.struct_use(bs, self.loc(n)) is not None:
+            return K.ResidualExpr(STRUCT_USE % bs, self.loc(n))
         args = self.import_args(cp, self.real_args(n))
         if isinstance(args, K.ResidualExpr):
             return args
@@ -2740,6 +2842,9 @@ class CxxImporter:
                 return K.ResidualExpr("use of a rejected member function", L)
             if not mpath:
                 return self.rexpr(n, "member function call")
+            bs = self.rejected_owner(mpath)
+            if bs is not None and self.struct_use(bs, L) is not None:
+                return K.ResidualExpr(STRUCT_USE % bs, L)
             if self.sigs.recv.get(mpath) not in ("ref", "mut"):
                 return self.rexpr(n, "static member function called through an object")
             if not TC.is_place(recv):
