@@ -1865,3 +1865,14 @@ title = "BX enum row (unscoped/scoped enums, enumerators, enum-typed values)"
 summary = "SPIKED 2026-11-03: NO-GO ON YIELD. Accepting enums moves EMIT 35 -> 37 of 392 but both gains call a rejected brotli wrapper (+0 transitive, ~+1 halved). Representation settled: newtype struct + consts (repr enum fails on duplicate discriminants and int->enum casts). Build when a class row makes the state-machine enums reachable."
 blocked_by = ["FR-267"]
 anchor = "FR-268 (opened and SPIKED 2026-11-03, from the FR-264 frontier): **ENUM ROW: NO-GO ON"
+
+[[items]]
+id = "FR-269"
+kind = "feature"
+status = "landed"
+rank = 60
+size = "S"
+title = "BX doc comments no longer reject the class, constant or namespace they document"
+summary = "clang's FullComment children were read as content; now dropped at AST load. Regression test fails on the old code. bx-frontier EMIT 35 -> 35, only 'struct: other member inside a class' 2 -> 0. TRACTOR +0."
+blocked_by = []
+anchor = "FR-269 (opened and LANDED 2026-11-03, found by FR-266's census split): **BX DOC"

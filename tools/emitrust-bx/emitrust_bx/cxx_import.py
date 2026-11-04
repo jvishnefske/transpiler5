@@ -291,7 +291,17 @@ def run_clang(path, clang="clang++"):
         raise ClangError("cannot run %s: %s" % (clang, ex))
     if p.returncode != 0:
         raise ClangError(p.stderr.decode("utf-8", "replace"))
-    return json.loads(p.stdout)
+    return json.loads(p.stdout, object_hook=_drop_comments)
+
+
+def _drop_comments(node):
+    """A `///` or `/** */` doc comment is a FullComment child of the decl it
+    documents (a class, a namespace, a variable); it is a comment, dropped like
+    any `//` comment, not a member or an initializer."""
+    inner = node.get("inner")
+    if inner:
+        node["inner"] = [c for c in inner if c.get("kind") != "FullComment"]
+    return node
 
 
 TYPE_MAP = {
