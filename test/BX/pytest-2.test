@@ -1,0 +1,9 @@
+# FR-250: runs emitrust-bx's pytest suite inside the fast lit tier. It pins
+# the bijection laws as PROPERTIES (>= 500 generated Kernel functions, law 1
+# and law 2 on the Rust side in pure python and on the C++ side through real
+# clang), plus per-module unit tests. Bytecode/cache writes are disabled so a
+# test run never dirties the source tree.
+# The suite is split into 4 shards (pytest-0..3.test, --bx-shard=K/4 in
+# tests/conftest.py) so no single lit test nears the 600s per-test cap; the
+# shards partition the suite by collection index mod 4.
+# RUN: env PYTHONDONTWRITEBYTECODE=1 %python -m pytest -q -p no:cacheprovider %bx_src/tests --bx-shard=2/4
