@@ -291,7 +291,17 @@ def run_clang(path, clang="clang++"):
         raise ClangError("cannot run %s: %s" % (clang, ex))
     if p.returncode != 0:
         raise ClangError(p.stderr.decode("utf-8", "replace"))
-    return json.loads(p.stdout)
+    return json.loads(p.stdout, object_hook=_drop_comments)
+
+
+def _drop_comments(node):
+    """A `///` or `/** */` doc comment is a FullComment child of the decl it
+    documents (a class, a namespace, a variable); it is a comment, dropped like
+    any `//` comment, not a member or an initializer."""
+    inner = node.get("inner")
+    if inner:
+        node["inner"] = [c for c in inner if c.get("kind") != "FullComment"]
+    return node
 
 
 TYPE_MAP = {
@@ -346,6 +356,10 @@ R6_NULL = "null pointer (the subset's pointers always point into an object)"
 
 # FR-254 R4 (normalize header-inline) refusals
 HDR_CALL = "call of a rejected header function '%s'"
+# FR-266: a USE of a struct that is itself rejected (in an otherwise accepted
+# function, or as a data member of another struct), located at the use so a
+# per-function census never counts the user as clean
+STRUCT_USE = "use of a rejected struct '%s'"
 HDR_OVERLOAD = ("header function '%s' is overloaded (normalize header-inline: the subset has one function per "
                 "name)")
 HDR_COLLIDE = ("header function '%s' has the same name as a function of the main file (normalize header-inline: "
@@ -445,6 +459,8 @@ class CxxImporter:
         self.records = []  # (node, ns, internal) main-file struct definitions
         self.bad_records = set()  # ids of records with a residual AT the class
         self.record_path = {}  # record decl id -> absolute path
+        self.bad_struct_paths = set()  # FR-266: absolute paths of the rejected structs
+        self.struct_uses = None  # FR-266: use residuals of the function being imported
         self.struct_canon = {}  # canonical clang spelling -> path
         self.struct_paths = set()
         self.field_ids = {}  # FieldDecl id -> (struct path, name)
@@ -470,8 +486,12 @@ class CxxImporter:
         self.project_root = None  # realpath of --project-root
         self.decl_file = {}  # FunctionDecl id -> clang's file spelling
         self.hdr_bad = {}  # decl id -> name of a reachable header function refused whole
-        self.hdr_spans = {}  # imported header function path -> (file, first line, last line)
+        self.hdr_spans = {}  # imported header function / constant path -> (file, first line, last line)
         self.file_lines = {}  # header file -> (_Loc, bytes)
+        # FR-264: namespace-scope scalar constants
+        self.consts = []  # (node, ns, internal) main-file const VarDecls
+        self.const_ids = {}  # VarDecl id -> absolute path
+        self.const_tys = {}  # absolute path -> Prim
 
     # -------------------------------------------------------------- utils
     def is_main(self, f):
@@ -601,7 +621,7 @@ class CxxImporter:
                 if x.get("kind", "").endswith("Decl"):
                     self.decl_main[x["id"]] = in_main
                     self.decl_info[x["id"]] = x
-                    if x.get("kind") == "FunctionDecl":
+                    if x.get("kind") in ("FunctionDecl", "VarDecl"):
                         self.decl_file[x["id"]] = f
                     if not in_main and x.get("kind") == "FunctionDecl" and x.get("name") == "printf":
                         self.libc_printf.add(x["id"])
@@ -638,8 +658,17 @@ class CxxImporter:
         hfuncs, hkeys = [], {}
         if self.normalize and self.project_root is not None:
             hfuncs = self.header_imports(top, mains, funcs, items, hkeys)
+        # FR-264: project-header constants reachable from this file
+        hconsts = []
+        if self.normalize and self.project_root is not None:
+            hconsts = self.header_consts(top, mains, hfuncs, items, hkeys)
+        for n, ns, internal in self.consts:
+            self.const_ids[n["id"]] = K.path_of(ns, n["name"])
         # signatures (for typing calls)
         self.sigs = TC.Sigs()
+        self.sigs.consts = self.const_tys
+        for n, ns, internal in self.consts + [(h[0], h[1], h[2]) for h in hconsts]:
+            self.const_tys[K.path_of(ns, n["name"])] = self.map_type(n.get("type"))[0]
         defined = set()
         for n, ns, internal in funcs + [(h[0], h[1], h[2]) for h in hfuncs]:
             if self.has_body(n):
@@ -650,6 +679,7 @@ class CxxImporter:
                     self.sigs.setdefault(path, (ptys, ret))
                 defined.add(path)
         structs = [self.struct_shell(n, ns, internal, items) for n, ns, internal in self.records]
+        self.reject_containing(structs, items)
         for n in self.out_of_line:
             items.extend(self.attach_definition(n))
         for n, ns, internal in funcs:
@@ -663,6 +693,13 @@ class CxxImporter:
                 fn = self.func(n, ns, internal)
             hkeys[id(fn)] = key
             items.append(fn)
+        for n, ns, internal in self.consts:
+            items.append(self.const_item(n, ns, internal))
+        for n, ns, internal, f, key in hconsts:
+            with self.in_file(f):
+                ci = self.const_item(n, ns, internal)
+            hkeys[id(ci)] = key
+            items.append(ci)
         for sd in structs:
             items.append(self.struct_def(sd, items))
         # keep source order; an imported header function sits right before
@@ -853,6 +890,127 @@ class CxxImporter:
             out.append((n, ns, internal, f, key))
         return out
 
+    # -------------------------------------------------------------- FR-264
+    def const_problem(self, n):
+        """None when namespace-scope VarDecl ``n`` is a Kernel constant
+        `const T k = e;` (also spelled `static const` / `constexpr` /
+        `inline constexpr`: at namespace scope a const object already has
+        internal linkage, so the specifier carries nothing), else the
+        located refusal's text."""
+        T, const, spelled = self.map_type(n.get("type"))
+        if not const or n.get("storageClass") == "extern" or "volatile" in (spelled or ""):
+            return "global variable"
+        if not isinstance(T, K.Prim) or T == K.UNIT:
+            return "constant of non-kernel type '%s'" % spelled
+        if not n.get("init") or not n.get("inner"):
+            return "global variable"
+        if n.get("tls"):
+            return "global variable"
+        return None
+
+    def const_item(self, n, ns, internal):
+        T, _, _ = self.map_type(n.get("type"))
+        self.ctx_ns = ns
+        self.cur = None
+        self.locals = {}
+        self.scope = TC.Scope()
+        init = [c for c in n.get("inner", []) if isinstance(c, dict) and not c.get("kind", "").endswith("Attr")]
+        e = self.expr(init[-1])
+        t = self.ty_of(e)
+        if t is not None and t != T:
+            e = K.Cast(T, e, self.loc(init[-1]))
+        return K.ConstItem(n["name"], T, e, self.lines.at(_off(n.get("loc"))), ns, internal)
+
+    @staticmethod
+    def var_refs(n):
+        """Decl ids of the VarDecls ``n`` names (DeclRefExpr), in print order."""
+        out = []
+        stack = [n]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, list):
+                stack.extend(reversed(x))
+                continue
+            if not isinstance(x, dict):
+                continue
+            if x.get("kind") == "DeclRefExpr":
+                rd = x.get("referencedDecl") or {}
+                if rd.get("kind") == "VarDecl" and rd.get("id"):
+                    out.append(rd["id"])
+            kids = [v for k, v in x.items()
+                    if k not in ("loc", "range", "type", "referencedDecl", "foundReferencedDecl")
+                    and isinstance(v, (list, dict))]
+            stack.extend(reversed(kids))
+        return out
+
+    def header_consts(self, top, mains, hfuncs, items, hkeys):
+        """FR-264 + R4: the project-header namespace-scope constants named
+        by this file's declarations or by an imported header function,
+        transitively through their initializers, dependencies first.
+        Returns [(node, ns, internal, file, sort key)]."""
+        defs = {}
+
+        def index(n, ns, internal):
+            k = n.get("kind")
+            if k == "NamespaceDecl":
+                name = n.get("name") or ""
+                ns2, int2 = (ns + (name,), internal) if name else (ns, True)
+                if n.get("isInline") or (name and internal):
+                    return
+                for c in n.get("inner", []):
+                    index(c, ns2, int2)
+            elif k == "VarDecl":
+                f = self.decl_file.get(n["id"])
+                if self.in_project_header(f) and self.const_problem(n) is None:
+                    defs[n["id"]] = (n, ns, internal, f)
+
+        for n in top:
+            index(n, (), False)
+        if not defs:
+            return []
+        order, seen = [], set()
+        anchor = {}
+
+        def visit(c, anc):
+            seen.add(c)
+            for r in self.var_refs(defs[c][0].get("inner", [])):
+                if r in defs and r not in seen:
+                    visit(r, anc)
+            order.append(c)
+            anchor[c] = anc
+
+        roots = [(n, self.lines.at(_off(n.get("loc")))) for n in mains]
+        roots += [(h[0], h[4]) for h in hfuncs]
+        for n, anc in roots:
+            for r in self.var_refs(n):
+                if r in defs and r not in seen:
+                    visit(r, anc)
+        main_paths = {K.path_of(ns, n["name"]) for n, ns, internal in self.consts}
+        out = []
+        for k, c in enumerate(order):
+            n, ns, internal, f = defs[c]
+            path = K.path_of(ns, n["name"])
+            a = anchor[c]
+            key = a if isinstance(a, tuple) else ((a.line, a.col, -2, k) if a else (0, 0, -2, k))
+            with self.in_file(f):
+                hl = self.lines.at(_off(n.get("loc")))
+            if path in main_paths:
+                ri = K.ResidualItem("normalize: header constant '%s' collides with a main-file name" % n["name"], hl)
+                hkeys[id(ri)] = key
+                items.append(ri)
+                continue
+            self.const_ids[c] = path
+            with self.in_file(f):
+                rg = n.get("range") or {}
+                l0 = self.lines.at(_off(rg.get("begin"))) or hl
+                l1 = self.lines.at(_off(rg.get("end"))) or hl
+            # a use of a header constant whose definition has an error is a
+            # located refusal at the use (cli.header_cascade)
+            self.hdr_spans[path] = (f, l0.line, l1.line)
+            self.notes.append((hl, "normalized: header constant '%s' from %s" % (n["name"], f)))
+            out.append((n, ns, internal, f, key))
+        return out
+
     def typedef_seen(self, x):
         """FR-259 (N20): a declaration named like a <cstdint>/<cstddef> type.
         The real ones (global, std) are typedefs of the expected builtin; a
@@ -949,6 +1107,12 @@ class CxxImporter:
                 items.append(K.ResidualItem(r, self.loc(n)))
                 # its calls are cascades of this one report
                 self.bad_funcs |= {c.get("id") for c in n.get("inner", []) if c.get("kind") == "FunctionDecl"}
+        elif k == "VarDecl":
+            r = self.const_problem(n)
+            if r is not None:
+                items.append(K.ResidualItem(r, self.loc(n)))
+                return
+            self.consts.append((n, ns, internal))
         elif k == "NamespaceAliasDecl":
             al = n.get("aliasedNamespace", {}).get("id")
             if al in self.ns_index and self.decl_main.get(al):
@@ -1029,6 +1193,71 @@ class CxxImporter:
         shell = K.StructDef(sh["name"], tuple(sh["fields"]), (), L, ns, internal)
         self.sigs.structs[path] = shell
         return sh
+
+    def reject_containing(self, structs, items):
+        """FR-266: a struct holding a rejected struct BY VALUE (directly or as
+        a std::vector element) cannot be emitted either: one located residual
+        at each such data member and one at the class (its members are
+        attributed by it, like any other member rejection).  A fixpoint, so a
+        struct holding such a struct is rejected in turn."""
+        changed = True
+        while changed:
+            changed = False
+            self.bad_struct_paths = {self.record_path[r] for r in self.bad_records if r in self.record_path}
+            for sh in structs:
+                if sh["node"]["id"] in self.bad_records:
+                    continue
+                hit = False
+                for f in sh["fields"]:
+                    bs = self.rejected_struct(f.ty, sh["path"])
+                    if bs is not None:
+                        items.append(K.ResidualItem(STRUCT_USE % bs, f.loc))
+                        hit = True
+                if hit:
+                    items.append(K.ResidualItem("struct with members outside the subset", sh["loc"]))
+                    self.bad_records.add(sh["node"]["id"])
+                    changed = True
+        self.bad_struct_paths = {self.record_path[r] for r in self.bad_records if r in self.record_path}
+
+    def rejected_struct(self, ty, own=False):
+        """FR-266: the path of a rejected struct that ``ty`` names (through a
+        reference, pointer, vector element or closure signature), or None.
+        ``own`` (default: the struct whose member function is being imported)
+        is never reported: its members are attributed at the class."""
+        if not self.bad_struct_paths:
+            return None
+        if own is False:
+            own = self.cur[0] if self.cur else None
+        stack = [ty]
+        while stack:
+            t = stack.pop()
+            if isinstance(t, (K.RefT, K.PtrT)):
+                stack.append(t.inner)
+            elif isinstance(t, K.VecT):
+                stack.append(t.elem)
+            elif isinstance(t, K.FnT):
+                stack.extend(t.params)
+                stack.append(t.ret)
+            elif isinstance(t, K.StructT) and t.path in self.bad_struct_paths and t.path != own:
+                return t.path
+        return None
+
+    def struct_use(self, bs, L):
+        """FR-266: record a use of rejected struct ``bs`` at ``L``.  ADDITIVE:
+        the expression is still imported exactly as before, so every residual
+        it had (a real blocker behind the cascade) is still reported; the use
+        becomes one more residual statement of the enclosing function.  None,
+        or a replacing residual outside any function (never silently lost)."""
+        if self.struct_uses is None:
+            return K.ResidualExpr(STRUCT_USE % bs, L)
+        self.struct_uses.append(K.ResidualStmt(STRUCT_USE % bs, L))
+        return None
+
+    def rejected_owner(self, mpath):
+        """FR-266: the rejected struct owning member function ``mpath``, or None."""
+        if not mpath or "::" not in mpath:
+            return None
+        return self.rejected_struct(K.StructT(mpath.rsplit("::", 1)[0]))
 
     def poison_member(self, m, path):
         if m.get("kind") == "FieldDecl":
@@ -1203,6 +1432,7 @@ class CxxImporter:
         name = n.get("name")
         floc = self.lines.at(_off(n.get("loc")))
         pre = []
+        uses = self.struct_uses = []
         self.ctx_ns = ns
         self.cur = (owner["path"], recv) if owner else None
         if owner is not None:
@@ -1252,6 +1482,9 @@ class CxxImporter:
             if ty is None or ty == K.UNIT or (isinstance(K.deref(ty), K.VecT) and not K.elem_ok(K.deref(ty).elem)):
                 pre.append(K.ResidualStmt("parameter of type '%s'" % spelled, pl))
                 ty = K.I32
+            bs = self.rejected_struct(ty)
+            if bs is not None:
+                pre.append(K.ResidualStmt(STRUCT_USE % bs, pl))
             if p.get("init") or p.get("inner"):
                 pre.append(K.ResidualStmt("default argument", pl))
             mut = not const and not isinstance(ty, K.RefT)
@@ -1262,11 +1495,15 @@ class CxxImporter:
         if rs.endswith(" const") and recv == "ref":
             rs = rs[:-len(" const")]
         ret = TYPE_MAP.get(rs) or parse_cxx_type(rs, self.struct_written, self.td_ok)[0]
+        bs = self.rejected_struct(ret) if recv != "ctor" else None
+        if bs is not None:
+            pre.append(K.ResidualStmt(STRUCT_USE % bs, floc))
         if recv == "ctor":
             ret = K.StructT(owner["path"])
             body = self.ctor_body(n, owner, floc)
             self.cur = None
-            return K.Func(name, tuple(params), ret, K.Block(tuple(pre) + (body,), self.loc(n)), floc,
+            self.struct_uses = None
+            return K.Func(name, tuple(params), ret, K.Block(tuple(pre + uses) + (body,), self.loc(n)), floc,
                           tuple(ns), False, owner["name"], recv)
         self.ret_ref = isinstance(ret, (K.RefT, K.PtrT))
         if isinstance(ret, K.RefT):
@@ -1297,6 +1534,8 @@ class CxxImporter:
         for s in inner:
             stmts.extend(self.stmt(s))
         self.cur = None
+        self.struct_uses = None
+        pre = pre + uses
         if owner is not None:
             return K.Func(name, tuple(params), ret, K.Block(tuple(pre + stmts), self.loc(body_node)), floc,
                           tuple(ns), False, owner["name"], recv)
@@ -1374,7 +1613,15 @@ class CxxImporter:
             if r is not None:
                 return r
         if k == "DeclStmt":
-            return [self.decl(d) for d in n.get("inner", []) if not self.spelling_only(d)]
+            out = []
+            for d in n.get("inner", []):
+                if self.spelling_only(d):
+                    continue
+                bs = self.rejected_struct(self.map_type(d.get("type"))[0]) if d.get("kind") == "VarDecl" else None
+                if bs is not None:
+                    out.append(K.ResidualStmt(STRUCT_USE % bs, self.loc(d)))
+                out.append(self.decl(d))
+            return out
         if k == "ReturnStmt":
             if self.in_main:
                 return [self.rstmt(n, "return inside main other than the final `return 0;`")]
@@ -1942,6 +2189,8 @@ class CxxImporter:
             if rd.get("id") in self.poisoned:
                 return K.ResidualExpr("use of a rejected declaration", L, cascade=True)
             rk = rd.get("kind")
+            if rk == "VarDecl" and rd.get("id") in self.const_ids:
+                return K.ConstRef(self.const_ids[rd["id"]], L)
             if rk == "VarDecl":
                 return self.rexpr(n, "global variable")
             if rk == "EnumConstantDecl":
@@ -2019,6 +2268,9 @@ class CxxImporter:
                 return self.rexpr(n, "call to library function '%s'" % rd.get("name"))
             if self.method_ids.get(rd.get("id"), "") is None:
                 return K.ResidualExpr("use of a rejected member function", L)
+            bs = self.rejected_owner(self.method_ids.get(rd.get("id")))
+            if bs is not None and self.struct_use(bs, L) is not None:
+                return K.ResidualExpr(STRUCT_USE % bs, L)
             if self.sigs.recv.get(fname) in ("ref", "mut"):
                 return self.rexpr(n, "member function call")
             args = self.import_args(fname, n["inner"][1:])
@@ -2232,6 +2484,9 @@ class CxxImporter:
         path, fname = info
         if fname is None:
             return K.ResidualExpr("use of a rejected data member", L)
+        bs = self.rejected_struct(K.StructT(path))
+        if bs is not None and self.struct_use(bs, L) is not None:
+            return K.ResidualExpr(STRUCT_USE % bs, L)
         base = self.strip(n["inner"][0])
         if n.get("isArrow"):
             if base.get("kind") == "CXXThisExpr" and self.cur is not None and self.cur[1] in ("ref", "mut"):
@@ -2256,6 +2511,9 @@ class CxxImporter:
         T = self.map_type(il.get("type"))[0]
         if not isinstance(T, K.StructT) or T.path not in self.sigs.structs:
             return self.rexpr(il, "initializer list")
+        bs = self.rejected_struct(T)
+        if bs is not None and self.struct_use(bs, L) is not None:
+            return K.ResidualExpr(STRUCT_USE % bs, L)
         sd = self.sigs.structs[T.path]
         elems = il.get("inner", []) or []
         if any(e.get("kind") == "ImplicitValueInitExpr" for e in elems) or "array_filler" in il:
@@ -2292,6 +2550,9 @@ class CxxImporter:
         cp = self.ctor_of_struct(T.path)
         if cp is None:
             return None
+        bs = self.rejected_struct(T)
+        if bs is not None and self.struct_use(bs, self.loc(n)) is not None:
+            return K.ResidualExpr(STRUCT_USE % bs, self.loc(n))
         args = self.import_args(cp, self.real_args(n))
         if isinstance(args, K.ResidualExpr):
             return args
@@ -2591,6 +2852,9 @@ class CxxImporter:
                 return K.ResidualExpr("use of a rejected member function", L)
             if not mpath:
                 return self.rexpr(n, "member function call")
+            bs = self.rejected_owner(mpath)
+            if bs is not None and self.struct_use(bs, L) is not None:
+                return K.ResidualExpr(STRUCT_USE % bs, L)
             if self.sigs.recv.get(mpath) not in ("ref", "mut"):
                 return self.rexpr(n, "static member function called through an object")
             if not TC.is_place(recv):

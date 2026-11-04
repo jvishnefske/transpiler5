@@ -83,6 +83,10 @@
                 ps.requests
                 ps.httpx
                 ps.pytest
+                # BX/pytest.test runs the emitrust-bx suite as ONE lit test
+                # under lit's 600s timeout; serially it is ~460s locally and
+                # timed out on CI (PR #7). xdist spreads it across cores.
+                ps.pytest-xdist
               ]))
 
               # Rust toolchain for the differential end-to-end tests:

@@ -162,7 +162,7 @@ def generic(reason):
 
 
 # (regex on the reason with any leading "unsupported: " removed, TAG, SUB-KIND)
-# SUB-KIND: None | "type" (group 1 is a C++ type spelling) | "libfn" | "op" |
+# SUB-KIND: None | "type" (group 1 is a C++ type spelling) | "libfn" | "struct" | "op" |
 #           "cast" | "kty" | "init" | "generic" (sub = generic-normalized text)
 RULES = [
     # ---- importer (cxx_import.py) -----------------------------------------
@@ -228,22 +228,30 @@ RULES = [
     (r"^struct with members outside the subset$", "struct: has members outside the subset", None),
     (r"^member function of a struct with members outside the subset$", "struct: has members outside the subset", None),
     (r"^definition of a rejected member function$", "struct: definition of a rejected member", None),
-    (r"^(private or protected member|bit-field|default member initializer|mutable data member"
-     r"|unnamed data member|const data member|static data member|operator overload"
-     r"|virtual member function|defaulted or deleted member function|volatile member function"
-     r"|user-declared copy or move constructor|overloaded constructor|user-declared destructor"
-     r"|friend declaration|member function template|nested class|enum inside a class"
-     r"|member typedef|static_assert inside a class|using-declaration inside a class"
-     r"|anonymous union or struct member|conversion operator|member function declared but not defined"
-     r"|use of a rejected data member|use of a rejected member function|member function used as a value"
-     r"|member access on a temporary|member function call on a temporary"
-     r"|static member function called through an object"
-     r"|aggregate initialization that omits data members"
-     r"|aggregate initialization of a struct with rejected data members"
-     r"|struct variable without an initializer"
-     r"|delegating or base-class constructor initializer)\b", "struct: member", "generic"),
+    # FR-266: one tag per member reason (was one generic `struct: member`
+    # bucket, which the frontier could not rank).  A rejected MEMBER's use
+    # and an aggregate over rejected members are cascades of the member row.
+    *[(r"^%s\b" % re.escape(w), "struct: " + w, None) for w in (
+        "private or protected member", "bit-field", "default member initializer", "mutable data member",
+        "unnamed data member", "const data member", "static data member", "operator overload",
+        "virtual member function", "defaulted or deleted member function", "volatile member function",
+        "user-declared copy or move constructor", "overloaded constructor", "user-declared destructor",
+        "friend declaration", "member function template", "nested class", "enum inside a class",
+        "member typedef", "static_assert inside a class", "using-declaration inside a class",
+        "anonymous union or struct member", "conversion operator", "member function declared but not defined",
+        "member function used as a value", "member access on a temporary", "member function call on a temporary",
+        "static member function called through an object", "aggregate initialization that omits data members",
+        "delegating or base-class constructor initializer")],
+    (r"^use of a rejected data member$", "struct: use of a rejected data member (cascade)", None),
+    (r"^use of a rejected member function$", "struct: use of a rejected member function (cascade)", None),
+    (r"^aggregate initialization of a struct with rejected data members$",
+     "struct: aggregate initialization of a struct with rejected data members (cascade)", None),
+    (r"^struct variable without an initializer\b", "struct: struct variable without an initializer", None),
+    # FR-266: a USE of a rejected struct (parameter, local, return, member,
+    # call, construction, or a data member of another struct); sub names it
+    (r"^use of a rejected struct '(.*)'$", "struct: use of a rejected struct (cascade)", "struct"),
     (r"^data member of type '(.*)'$", "struct: data member of non-kernel type", "type"),
-    (r"^.* inside a class$", "struct: member", "generic"),
+    (r"^.* inside a class$", "struct: other member inside a class", "generic"),
     (r"^value-initialized or default-initialized struct", "struct: default/value initialization", None),
     (r"^(constructor whose body|constructor of '.*' whose body) is not a member-initializer",
      "struct: constructor body", None),
@@ -333,6 +341,10 @@ RULES = [
     (r"^header function '.*' is overloaded \(normalize header-inline", "normalize: header-inline overload", None),
     (r"^header function '.*' has the same name as a function of the main file",
      "normalize: header-inline name collision", None),
+    # FR-264 header constants (same R4 path): the USE of a header constant whose
+    # definition has an error, and a header constant colliding with a main-file one
+    (r"^use of a rejected header constant '(.*)'$", "normalize: header constant rejected", None),
+    (r"^normalize: header constant '.*' collides", "normalize: header constant collision", None),
     # FR-263
     (r"^two calls that may print in one statement", "sequencing: two printing calls (normalizer)", None),
     (r"^identifier '.*' is reserved by the canonical Rust spelling", "identifier: reserved by canonical spelling", None),
@@ -380,6 +392,17 @@ RULES = [
     (r"^function '.*' may reach its end without returning", "typing: may fall off end of non-void function", None),
     (r"^redeclaration of '.*' in the same scope$", "typing: shadowing redeclaration in same scope", None),
     (r"^variable '.*' has the name of a function$", "typing: variable named like a function", None),
+    # FR-264 namespace-scope constants ("global variable" stays the mutable /
+    # extern / volatile / thread_local tag; internal-constant visibility reuses
+    # the FR-260 "is internal to namespace" needle)
+    (r"^variable '.*' has the name of a constant$", "typing: variable named like a constant", None),
+    (r"^constant of non-kernel type '(.*)'$", "constant of non-kernel type", "type"),
+    (r"^constant initializer is not a constant expression$", "constant: non-constant initializer", None),
+    (r"^constant '.*' used before its definition", "constant: used before definition", None),
+    (r"^constant '.*' (defined twice|has the name of a (function|namespace|struct))", "constant: name collision",
+     None),
+    (r"^internal constant at the root", "constant: internal at the root (N14)", None),
+    (r"^use of undeclared constant", "typing: use of undeclared constant (cascade)", None),
     (r"^initializer of '.*' refers to a variable of the same name$", "typing: self-referential initializer name", None),
     (r"^use of undeclared variable", "typing: use of undeclared variable (cascade)", None),
     (r"^call to undeclared function", "typing: call to undeclared function (cascade)", None),
@@ -449,6 +472,8 @@ def classify(raw_reason):
             sub = type_sub(m.group(1))
         elif kind == "libfn":
             sub = "libfn:" + m.group(1)
+        elif kind == "struct":
+            sub = "struct:" + m.group(1)
         elif kind == "op":
             sub = "op:" + m.group(1)
         elif kind == "cast":

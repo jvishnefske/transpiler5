@@ -18,9 +18,13 @@ struct S {
 S::~S() { std::printf("bye\n"); }
 // CHECK-NEXT: out-of-line-rejected.cpp:[[@LINE+1]]:1: error: unsupported: member function of a struct with members outside the subset
 int S::get() const { return x; }
-// CHECK-NOT: error
 int main() {
+  // FR-266: main USES the rejected struct, so it is not a phantom EMIT either
+  // CHECK-NEXT: out-of-line-rejected.cpp:[[@LINE+2]]:3: error: unsupported: use of a rejected struct 'S'
+  // CHECK-NEXT: out-of-line-rejected.cpp:[[@LINE+1]]:9: error: unsupported: use of a rejected struct 'S'
   S s = {1};
+  // CHECK-NEXT: out-of-line-rejected.cpp:[[@LINE+1]]:23: error: unsupported: use of a rejected struct 'S'
   std::printf("%d\n", s.get());
+  // CHECK-NOT: error
   return 0;
 }

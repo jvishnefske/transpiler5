@@ -1,0 +1,260 @@
+diff --git a/tools/emitrust-bx/emitrust_bx/cxx_import.py b/tools/emitrust-bx/emitrust_bx/cxx_import.py
+index 8c2646c..10629f2 100644
+--- a/tools/emitrust-bx/emitrust_bx/cxx_import.py
++++ b/tools/emitrust-bx/emitrust_bx/cxx_import.py
+@@ -144,6 +144,8 @@ import json
+ import os
+ import re
+ import subprocess
++HC = os.environ.get('BX_HC_SPIKE') == '1'
++CASCADE = os.environ.get('BX_CASCADE_SPIKE') == '1'  # SPIKE: phantom-EMIT probe  # SPIKE instrument (header-class import), never commit
+ 
+ from . import fmt
+ from . import kernel as K
+@@ -605,7 +607,7 @@ class CxxImporter:
+                 if x.get("kind", "").endswith("Decl"):
+                     self.decl_main[x["id"]] = in_main
+                     self.decl_info[x["id"]] = x
+-                    if x.get("kind") in ("FunctionDecl", "VarDecl"):
++                    if x.get("kind") in ("FunctionDecl", "VarDecl") or (HC and x.get("kind") == "CXXRecordDecl" and x.get("completeDefinition")):
+                         self.decl_file[x["id"]] = f
+                     if not in_main and x.get("kind") == "FunctionDecl" and x.get("name") == "printf":
+                         self.libc_printf.add(x["id"])
+@@ -625,6 +627,9 @@ class CxxImporter:
+         self.out_of_line = []
+         for n in mains:
+             self.collect(n, (), False, items, funcs)
++        self.hc_file = {}
++        if HC and self.project_root is not None:
++            self.hc_import_records(top)
+         # FR-257: index the structs BEFORE any type is read
+         for n, ns, internal in self.records:
+             path = K.path_of(ns, n["name"])
+@@ -662,7 +667,15 @@ class CxxImporter:
+                 if path != "main":
+                     self.sigs.setdefault(path, (ptys, ret))
+                 defined.add(path)
+-        structs = [self.struct_shell(n, ns, internal, items) for n, ns, internal in self.records]
++        structs = []
++        for n, ns, internal in self.records:
++            if n["id"] in self.hc_file:
++                with self.in_file(self.hc_file[n["id"]]):
++                    structs.append(self.struct_shell(n, ns, internal, items))
++                    self.notes.append((self.loc(n), "HC class %s '%s' range %s" % (
++                        n["id"], n["name"], self.hc_range(n))))
++            else:
++                structs.append(self.struct_shell(n, ns, internal, items))
+         for n in self.out_of_line:
+             items.extend(self.attach_definition(n))
+         for n, ns, internal in funcs:
+@@ -684,7 +697,10 @@ class CxxImporter:
+             hkeys[id(ci)] = key
+             items.append(ci)
+         for sd in structs:
+-            items.append(self.struct_def(sd, items))
++            if sd["node"]["id"] in self.hc_file:
++                items.append(self.struct_def(sd, items, self.hc_file[sd["node"]["id"]]))
++            else:
++                items.append(self.struct_def(sd, items))
+         # keep source order; an imported header function sits right before
+         # the first main-file function that reaches it, callees first
+         items.sort(key=lambda it: hkeys.get(id(it)) or (
+@@ -1151,8 +1167,9 @@ class CxxImporter:
+             if access != "public" and k in ("FieldDecl", "CXXMethodDecl", "CXXConstructorDecl",
+                                             "CXXDestructorDecl", "VarDecl"):
+                 items.append(K.ResidualItem("private or protected member", ML))
+-                self.poison_member(m, path)
+-                continue
++                if not (HC and n["id"] in self.hc_file):
++                    self.poison_member(m, path)
++                    continue
+             if k == "FieldDecl":
+                 self.shell_field(m, sh, items, ML)
+             elif k == "VarDecl":
+@@ -1161,7 +1178,10 @@ class CxxImporter:
+                 self.shell_method(m, sh, items, ML)
+             elif k == "CXXDestructorDecl":
+                 items.append(K.ResidualItem("user-declared destructor", ML))
+-                self.poison_member(m, path)
++                if HC and n["id"] in self.hc_file:
++                    self.shell_method(m, sh, items, ML)
++                else:
++                    self.poison_member(m, path)
+             else:
+                 items.append(K.ResidualItem(self.MEMBER_KINDS.get(k, "%s inside a class" % friendly(k)), ML))
+                 self.poison_member(m, path)
+@@ -1177,6 +1197,48 @@ class CxxImporter:
+         self.sigs.structs[path] = shell
+         return sh
+ 
++    def bad_paths(self):
++        return {self.record_path[r] for r in self.bad_records if r in self.record_path}
++
++    def hc_range(self, n):
++        rg = n.get("range") or {}
++        a = self.lines.at(_off(rg.get("begin")))
++        b = self.lines.at(_off(rg.get("end")))
++        return "%s-%s" % (a.line if a else "?", b.line if b else "?")
++
++    def hc_import_records(self, top):
++        """SPIKE: lazily import each project-header record that is the parent
++        of a main-file out-of-line member definition."""
++        recs = {}
++
++        def index(n, ns, internal, cp):
++            k = n.get("kind")
++            if k == "NamespaceDecl":
++                name = n.get("name") or ""
++                ns2, int2 = (ns + (name,), internal) if name else (ns, True)
++                for c in n.get("inner", []):
++                    index(c, ns2, int2, cp + [name or "(anonymous namespace)"])
++            elif k == "CXXRecordDecl" and n.get("completeDefinition") and n.get("name"):
++                f = self.decl_file.get(n["id"])
++                if self.in_project_header(f):
++                    recs[n["id"]] = (n, ns, internal, f, cp)
++                    for c in n.get("inner", []):
++                        if c.get("kind") == "CXXRecordDecl" and c.get("completeDefinition") and c.get("name"):
++                            self.hc_nested[c["id"]] = n["id"]
++
++        self.hc_nested = {}
++        for n in top:
++            index(n, (), False, [])
++        for d in self.out_of_line:
++            rid = d.get("parentDeclContextId")
++            if rid in self.hc_nested:
++                self.notes.append((self.loc(d), "HC nested-class member (outer %s)" % self.hc_nested[rid]))
++            if rid in recs and rid not in self.hc_file:
++                n, ns, internal, f, cp = recs[rid]
++                self.hc_file[rid] = f
++                self.records.append((n, ns, internal))
++                self.record_cpath[rid] = cp
++
+     def poison_member(self, m, path):
+         if m.get("kind") == "FieldDecl":
+             self.field_ids[m["id"]] = (path, None)
+@@ -1203,6 +1265,22 @@ class CxxImporter:
+                 bad = "data member of type '%s'" % spelled
+             elif isinstance(ty, K.VecT) and not K.elem_ok(ty.elem):
+                 bad = "data member of type '%s'" % spelled
++        if HC and sh["node"]["id"] in self.hc_file:
++            # SPIKE: report EVERY problem of the field, not the first
++            allb = []
++            if m.get("isBitfield"): allb.append("bit-field")
++            if m.get("hasInClassInitializer"): allb.append("default member initializer")
++            if m.get("mutable"): allb.append("mutable data member")
++            ty2, const2, spelled2 = self.map_type(m.get("type"))
++            if const2: allb.append("const data member")
++            if ty2 is None or ty2 == K.UNIT or isinstance(ty2, (K.RefT, K.PtrT)) or (
++                    isinstance(ty2, K.VecT) and not K.elem_ok(ty2.elem)):
++                allb.append("data member of type '%s'" % spelled2)
++            for b in allb:
++                items.append(K.ResidualItem(b, ML))
++            if allb:
++                self.field_ids[m["id"]] = (sh["path"], None)
++                return
+         if bad is not None:
+             items.append(K.ResidualItem(bad, ML))
+             self.field_ids[m["id"]] = (sh["path"], None)
+@@ -1243,7 +1321,7 @@ class CxxImporter:
+         else:
+             recv = "static" if m.get("storageClass") == "static" else (
+                 "ref" if qt.rstrip().endswith("const") else "mut")
+-            mpath = sh["path"] + "::" + name
++            mpath = sh["path"] + "::" + (name if k != "CXXDestructorDecl" else "drop_")
+         self.method_ids[m["id"]] = mpath
+         self.user_funcs[m["id"]] = mpath
+         sh["methods"].append((m, recv))
+@@ -1269,6 +1347,8 @@ class CxxImporter:
+         if rid not in self.record_path:
+             return [K.ResidualItem(friendly(n.get("kind")), self.loc(n))]
+         prev = n.get("previousDecl")
++        if HC and rid in self.hc_file and self.has_body(n):
++            self.notes.append((self.loc(n), "HC def of class %s" % rid))
+         if prev in self.method_ids and self.has_body(n):
+             # The definition is a separate item from its in-class declaration,
+             # so a rejection of the declaration or of its class is repeated
+@@ -1279,7 +1359,7 @@ class CxxImporter:
+             self.defs[prev] = n
+             self.method_ids[n["id"]] = self.method_ids[prev]
+             self.user_funcs[n["id"]] = self.method_ids[prev]
+-            if rid in self.bad_records:
++            if rid in self.bad_records and not (HC and rid in self.hc_file):
+                 return [K.ResidualItem("member function of a struct with members outside the subset",
+                                        self.loc(n))]
+             return []
+@@ -1287,13 +1367,21 @@ class CxxImporter:
+             return []  # a redeclaration without a body
+         return [K.ResidualItem(friendly(n.get("kind")), self.loc(n))]
+ 
+-    def struct_def(self, sh, items):
++    def struct_def(self, sh, items, hfile=None):
+         methods = []
+         for decl, recv in sh["methods"]:
+             body = decl if self.has_body(decl) else self.defs.get(decl["id"])
+             if body is None:
++                if hfile:
++                    with self.in_file(hfile):
++                        items.append(K.ResidualItem("member function declared but not defined", self.loc(decl)))
++                    continue
+                 items.append(K.ResidualItem("member function declared but not defined", self.loc(decl)))
+                 continue
++            if hfile and body is decl:
++                with self.in_file(hfile):
++                    methods.append(self.func(body, sh["ns"], False, owner=sh, recv=recv, decl=decl))
++                continue
+             methods.append(self.func(body, sh["ns"], False, owner=sh, recv=recv, decl=decl))
+         return K.StructDef(sh["name"], tuple(self.sigs.structs[sh["path"]].fields), tuple(methods), sh["loc"],
+                            sh["ns"], sh["internal"])
+@@ -1458,6 +1546,23 @@ class CxxImporter:
+         inits = [c for c in n.get("inner", []) if c.get("kind") == "CXXCtorInitializer"]
+         fields = self.sigs.structs[owner["path"]].fields
+         bad = "constructor whose body is not a member-initializer list of every data member"
++        if HC and (not body or body[-1].get("inner") or [i.get("anyInit", {}).get("name") for i in inits]
++                   != [f.name for f in fields]):
++            out = [K.ResidualStmt(bad, floc)]
++            self.ret = K.UNIT
++            self.ret_ref = False
++            self.in_main = False
++            for i in inits:
++                if "anyInit" not in i:
++                    out.append(K.ResidualStmt("delegating or base-class constructor initializer", floc))
++                    continue
++                for e in i.get("inner", [])[:1]:
++                    if e.get("kind") in ("CXXDefaultInitExpr",):
++                        continue
++                    out.append(K.ExprStmt(self.expr(e), floc) if hasattr(K, "ExprStmt") else K.ResidualStmt("?", floc))
++            for s in (body[-1].get("inner", []) if body else []):
++                out.extend(self.stmt(s))
++            return K.Block(tuple(out), floc)
+         if not body or body[-1].get("inner"):
+             return K.ResidualStmt(bad, floc)
+         if any("anyInit" not in i for i in inits):
+@@ -2168,6 +2273,9 @@ class CxxImporter:
+                 return self.rexpr(n, "call to library function '%s'" % rd.get("name"))
+             if self.method_ids.get(rd.get("id"), "") is None:
+                 return K.ResidualExpr("use of a rejected member function", L)
++            if CASCADE and (self.method_ids.get(rd.get("id")) or "").rsplit("::", 1)[0] in self.bad_paths() \
++                    and not (self.cur and self.cur[0] == self.method_ids[rd["id"]].rsplit("::", 1)[0]):
++                return K.ResidualExpr("use of a member of a rejected struct", L)
+             if self.sigs.recv.get(fname) in ("ref", "mut"):
+                 return self.rexpr(n, "member function call")
+             args = self.import_args(fname, n["inner"][1:])
+@@ -2381,6 +2489,8 @@ class CxxImporter:
+         path, fname = info
+         if fname is None:
+             return K.ResidualExpr("use of a rejected data member", L)
++        if CASCADE and path in self.bad_paths() and not (self.cur and self.cur[0] == path):
++            return K.ResidualExpr("use of a member of a rejected struct", L)
+         base = self.strip(n["inner"][0])
+         if n.get("isArrow"):
+             if base.get("kind") == "CXXThisExpr" and self.cur is not None and self.cur[1] in ("ref", "mut"):
+@@ -2740,6 +2850,9 @@ class CxxImporter:
+                 return K.ResidualExpr("use of a rejected member function", L)
+             if not mpath:
+                 return self.rexpr(n, "member function call")
++            if CASCADE and mpath.rsplit("::", 1)[0] in self.bad_paths() and not (
++                    self.cur and self.cur[0] == mpath.rsplit("::", 1)[0]):
++                return K.ResidualExpr("use of a member of a rejected struct", L)
+             if self.sigs.recv.get(mpath) not in ("ref", "mut"):
+                 return self.rexpr(n, "static member function called through an object")
+             if not TC.is_place(recv):

@@ -398,6 +398,16 @@ class Call:
 
 
 @dataclass(frozen=True)
+class ConstRef:
+    """FR-264: a use of a namespace-scope scalar constant, by its
+    absolute Kernel path (resolved on import, like ``Call.name``).  NOT a
+    Var: it is no place, never captured, never moved."""
+
+    path: str
+    loc: Optional[Loc] = _loc()
+
+
+@dataclass(frozen=True)
 class ResidualExpr:
     """An expression outside the subset (Surface IR only).
 
@@ -1075,6 +1085,24 @@ def split_path(path):
 
 
 @dataclass(frozen=True)
+class ConstItem:
+    """FR-264: `const T k = e;` <=> `const k: T = e;` at namespace
+    scope; T a scalar Prim, e a constant expression (literals, ConstRefs,
+    Unary, Binary, Cast, Cond)."""
+
+    name: str
+    ty: Prim
+    value: "Expr"
+    loc: Optional[Loc] = _loc()
+    ns: Tuple[str, ...] = ()
+    internal: bool = False
+
+    @property
+    def path(self):
+        return path_of(self.ns, self.name)
+
+
+@dataclass(frozen=True)
 class ResidualItem:
     reason: str
     loc: Optional[Loc] = _loc()
@@ -1090,6 +1118,9 @@ class Program:
 
     def structs(self):
         return [s for s in self.items if isinstance(s, StructDef)]
+
+    def consts(self):
+        return [c for c in self.items if isinstance(c, ConstItem)]
 
     def all_funcs(self):
         """Free functions and member functions, in item order."""
@@ -1188,6 +1219,9 @@ def dump(node, indent=0):
         s = "%sstruct %s%s\n" % (pad, "internal " if node.internal else "", node.path)
         s += "".join("%s  field %s: %s\n" % (pad, f.name, f.ty) for f in node.fields)
         return s + "".join(dump(m, indent + 1) for m in node.methods)
+    if isinstance(node, ConstItem):
+        return "%sconst %s%s: %s = %s\n" % (pad, "internal " if node.internal else "", node.path, node.ty,
+                                           dump_expr(node.value))
     if isinstance(node, Block):
         return pad + "block\n" + "".join(dump(s, indent + 1) for s in node.stmts)
     if isinstance(node, Let):
@@ -1266,6 +1300,8 @@ def dump_expr(e):
         return repr(e.value)
     if isinstance(e, Var):
         return e.name
+    if isinstance(e, ConstRef):
+        return "(const %s)" % e.path
     if isinstance(e, Unary):
         return "(%s %s)" % (e.op, dump_expr(e.operand))
     if isinstance(e, Binary):

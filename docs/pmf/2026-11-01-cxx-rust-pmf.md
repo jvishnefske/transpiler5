@@ -268,3 +268,23 @@ members). The hybrid spike (an LLM rewrites blocked functions into the subset, c
 differential execution of the extracted original under sanitizers) is the measurement that
 decides whether the wedge closes that gap; it is blocked on a tool-permission decision, not
 on design.
+
+### 2026-11-03 -- namespace constants (FR-264): EMIT 32 -> 35 of 392 functions
+
+`global variable` was step 1 of the set cover. Making scalar namespace constants a Kernel row
+moved exactly the three predicted brunsli functions (8.2% -> 8.9%), 0 lost, and dropped the tag
+from 87 functions to 1. The other 84 functions it touched are still blocked by parameter /
+local of non-kernel type and member access, which are now the gate on further movement; the
+criterion-1 gap (30%) is unchanged in kind. The hybrid LLM-rewrite spike is still blocked on the
+tool-permission decision.
+
+### 2026-11-03 -- hybrid spike (FR-265): NO-GO for per-function LLM rewrite
+
+The decisive measurement ran. An LLM rewrite certified by five-leg byte-diff lifted 15 of 20
+sampled blocked functions (75%, CI 51-91%), but 11 of those 15 only by changing a signature or
+redesigning a module-wide type, so the result is a port of the data model that a per-function
+certificate does not cover; the 4 drop-ins need no LLM. The certifier is real but driver-bound:
+17/17 injected mutants caught, while a borrow->copy ownership change certified under the natural
+driver. Reading for the wedge: the subset's missing TYPE rows (stored borrows / Option, private
+classes, vector erase/insert, const arrays, abort) are the gate, not the rewriter. A type-first
+variant is the remaining untested form of the wedge.

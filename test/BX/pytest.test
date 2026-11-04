@@ -2,5 +2,6 @@
 # the bijection laws as PROPERTIES (>= 500 generated Kernel functions, law 1
 # and law 2 on the Rust side in pure python and on the C++ side through real
 # clang), plus per-module unit tests. Bytecode/cache writes are disabled so a
-# test run never dirties the source tree.
-# RUN: env PYTHONDONTWRITEBYTECODE=1 %python -m pytest -q -p no:cacheprovider %bx_src/tests
+# test run never dirties the source tree. `-n auto` (pytest-xdist): run
+# serially the suite outgrew lit's 600s per-test timeout on CI.
+# RUN: env PYTHONDONTWRITEBYTECODE=1 %python -m pytest -q -p no:cacheprovider -n auto %bx_src/tests

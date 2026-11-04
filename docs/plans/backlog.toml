@@ -1813,3 +1813,66 @@ title = "BX print order: unsequenced printing calls refused"
 summary = "Two calls that may print, unsequenced in one statement, have two legal C++ outputs (g++ vs clang); refused, located, both directions. Expected TRACTOR +0."
 blocked_by = ["FR-252"]
 anchor = "FR-263 (opened 2026-11-01, from FR-252's verification): **BX PRINT ORDER"
+
+[[items]]
+id = "FR-264"
+kind = "feature"
+status = "landed"
+rank = 60
+size = "M"
+title = "BX namespace constants: const T k = e; <=> const k: T = e;"
+summary = "Namespace-scope scalar constants (const/static const/constexpr) as Kernel ConstItem + ConstRef, header constants via R4 reachability, located refusals for arrays, non-constant initializers, shadowing and forward references. bx-frontier EMIT 32 -> 35 of 392. Expected TRACTOR +0."
+blocked_by = ["FR-254"]
+anchor = "FR-264 (opened 2026-11-03, from the FR-254 R4 frontier): **BX NAMESPACE CONSTANTS"
+
+[[items]]
+id = "FR-265"
+kind = "feature"
+status = "no-go"
+size = "M"
+title = "Hybrid wedge: LLM rewrites blocked functions into the bx subset, certified by differential execution"
+summary = "SPIKED 2026-11-03: NO-GO as a pipeline stage. 15/20 sampled blocked woff2/brunsli functions certified (75%, CI 51-91%), but 11 of 15 needed a signature change or a module-wide type redesign; the 4 drop-ins need no LLM (missing rows / normalizer rules). Byte-diff caught 17/17 injected mutants but certified a borrow->copy ownership change under the natural driver. Next: type rows (stored borrows/Option, private classes, vector erase/insert, const arrays, abort) or a type-first spike."
+blocked_by = []
+anchor = "FR-265 (opened and SPIKED 2026-11-03, from FR-256's kill criterion and the PMF"
+
+[[items]]
+id = "FR-266"
+kind = "feature"
+status = "landed"
+rank = 60
+size = "S"
+title = "BX phantom EMIT on uses: a use of a rejected struct is a located cascade residual"
+summary = "Uses of a rejected struct (params, returns, locals, member access/calls, aggregate init) and structs holding one by value were silently accepted, so the per-function census could count them as EMIT. Now an additive located cascade; census struct:member bucket split per reason. bx-frontier EMIT 35 -> 35, same set. TRACTOR +0."
+blocked_by = ["FR-262"]
+anchor = "FR-266 (opened 2026-11-03, from FR-267's spike): **BX PHANTOM EMIT ON USES"
+
+[[items]]
+id = "FR-267"
+kind = "feature"
+status = "no-go"
+size = "L"
+title = "Header-class import for out-of-line member functions (36 + 13 ctor/dtor single-tag functions)"
+summary = "SPIKED 2026-11-03: NO-GO ON YIELD. Full blocker sets for all 49: 0 of 15 header classes importable; no single row unlocks any function; arrays + subscript +2, + private +3, + DCHECK abort +5 (halved ~+2..+3). Only narrow GO: a [T; N] row if wanted for its own sake (~+1 halved)."
+blocked_by = []
+anchor = "FR-267 (opened and SPIKED 2026-11-03, from the FR-264 frontier): **HEADER-CLASS IMPORT"
+
+[[items]]
+id = "FR-268"
+kind = "feature"
+status = "no-go"
+size = "M"
+title = "BX enum row (unscoped/scoped enums, enumerators, enum-typed values)"
+summary = "SPIKED 2026-11-03: NO-GO ON YIELD. Accepting enums moves EMIT 35 -> 37 of 392 but both gains call a rejected brotli wrapper (+0 transitive, ~+1 halved). Representation settled: newtype struct + consts (repr enum fails on duplicate discriminants and int->enum casts). Build when a class row makes the state-machine enums reachable."
+blocked_by = ["FR-267"]
+anchor = "FR-268 (opened and SPIKED 2026-11-03, from the FR-264 frontier): **ENUM ROW: NO-GO ON"
+
+[[items]]
+id = "FR-269"
+kind = "feature"
+status = "landed"
+rank = 60
+size = "S"
+title = "BX doc comments no longer reject the class, constant or namespace they document"
+summary = "clang's FullComment children were read as content; now dropped at AST load. Regression test fails on the old code. bx-frontier EMIT 35 -> 35, only 'struct: other member inside a class' 2 -> 0. TRACTOR +0."
+blocked_by = []
+anchor = "FR-269 (opened and LANDED 2026-11-03, found by FR-266's census split): **BX DOC"
